@@ -1,0 +1,8 @@
+/target
+**/*.wal
+*.pyc
+__pycache__/
+.DS_Store
+.claude
+.claude-flow
+Cargo.lock

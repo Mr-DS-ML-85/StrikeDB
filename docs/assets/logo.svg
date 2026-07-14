@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="DB-Strike logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0c1018"/>
+      <stop offset="1" stop-color="#05060a"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff7ae0"/>
+      <stop offset="1" stop-color="#ff2bbf"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.42" r="0.6">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="256" height="256" rx="56" fill="url(#bg)"/>
+  <rect x="0" y="0" width="256" height="256" rx="56" fill="none" stroke="#1b2233" stroke-width="1.5"/>
+  <rect x="34" y="22" width="188" height="188" rx="60" fill="url(#halo)"/>
+
+  <!-- database cylinder -->
+  <g filter="url(#glow)" fill="none" stroke="#22d3ee" stroke-width="4.5" stroke-linecap="round">
+    <ellipse cx="128" cy="86" rx="58" ry="18"/>
+    <path d="M70 86 V176"/>
+    <path d="M186 86 V176"/>
+    <ellipse cx="128" cy="176" rx="58" ry="18"/>
+    <path d="M70 131 H186" opacity="0.55"/>
+  </g>
+  <!-- cylinder glass fill -->
+  <path d="M70 86 V176 A58 18 0 0 0 186 176 V86 Z" fill="#22d3ee" opacity="0.06"/>
+
+  <!-- lightning bolt -->
+  <path filter="url(#glow)" fill="url(#bolt)"
+        d="M140 40 L92 152 L122 152 L104 222 L174 104 L142 104 Z"/>
+  <!-- bolt inner highlight -->
+  <path fill="#ffffff" opacity="0.18"
+        d="M132 56 L104 140 L118 140 L112 188 L150 110 L132 110 Z"/>
+
+  <!-- glass highlight -->
+  <ellipse cx="92" cy="64" rx="34" ry="14" fill="#ffffff" opacity="0.06"/>
+</svg>

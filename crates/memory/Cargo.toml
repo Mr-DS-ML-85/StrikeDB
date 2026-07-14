@@ -1,0 +1,9 @@
+[package]
+name = "memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+storage = { path = "../storage" }
+views = { path = "../views" }

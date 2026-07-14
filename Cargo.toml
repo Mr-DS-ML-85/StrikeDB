@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/storage",
+    "crates/views",
+    "crates/reactive",
+    "crates/consensus",
+    "crates/compute",
+    "crates/router",
+    "crates/memory",
+    "crates/mitm",
+    "crates/rag",
+    "crates/protocol",
+    "crates/server",
+    "crates/bench",
+    "crates/demos",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["DB-Strike"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

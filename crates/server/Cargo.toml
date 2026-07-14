@@ -1,0 +1,21 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dbstrike"
+path = "src/main.rs"
+
+[dependencies]
+storage = { path = "../storage" }
+views = { path = "../views" }
+reactive = { path = "../reactive" }
+consensus = { path = "../consensus" }
+compute = { path = "../compute" }
+router = { path = "../router" }
+memory = { path = "../memory" }
+mitm = { path = "../mitm" }
+rag = { path = "../rag" }
+protocol = { path = "../protocol" }

@@ -1,0 +1,21 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dbstrike-bench"
+path = "src/main.rs"
+
+[dependencies]
+storage = { path = "../storage" }
+views = { path = "../views" }
+memory = { path = "../memory" }
+rag = { path = "../rag" }
+compute = { path = "../compute" }
+reactive = { path = "../reactive" }
+router = { path = "../router" }
+mitm = { path = "../mitm" }
+protocol = { path = "../protocol" }
