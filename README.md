@@ -353,7 +353,7 @@ The single-digit-ms tail is simply the cost of deep pipelining amortizing
 one fsync across a 1024-command burst at 16M+ ops/s — not a stall. Shallower
 pipelines (`-P64`) drop p50 to well under 1 ms.
 
-**DB-Strike beats Redis on every op at every pipeline depth**, in both
+**StrikeDB beats Redis on every op at every pipeline depth**, in both
 durable and non-durable mode — and with lower tail latency in durable mode.
 A burst of 1024 pipelined SETs pays exactly one fsync. Before this refactor
 durable SET was 65 k/s (a **220× regression** from what you see here at
@@ -362,7 +362,7 @@ durable SET was 65 k/s (a **220× regression** from what you see here at
 **Redis-compat command coverage** (all pipelined-coalesced when applicable):
 `PING · SET · GET · MSET · MGET · DEL · INCR · INCRBY · KEYS · DBSIZE ·
 SELECT · COMMAND · FLUSHALL · FLUSHDB · SUBSCRIBE · PUBLISH · QUIT`
-plus DB-Strike-native: `VADD · VSEARCH · VSEARCH.MANY · TSADD · TSADD.F ·
+plus StrikeDB-native: `VADD · VSEARCH · VSEARCH.MANY · TSADD · TSADD.F ·
 TSRANGE · TSRANGE.LATEST · MEM.* · RAG.* · CACHE.* · REDUCE · CHECKPOINT`.
 
 **Env knobs:**
