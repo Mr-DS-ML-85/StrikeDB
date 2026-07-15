@@ -19,7 +19,7 @@ use std::env;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use demos::{Client, Reply};
+use demos::{pctl, rss_mb, Client, Reply};
 
 const SERIES: &[&str] = &["cpu", "mem", "rps"];
 
@@ -100,7 +100,68 @@ fn read_window(client: &mut Client, name: &str, from: u64, to: u64) -> std::io::
     Ok(arr.chunks(2).filter_map(|c| c.get(1).and_then(|v| v.as_int())).collect())
 }
 
+fn run_bench(addr: &str, n_points: usize, n_queries: usize) -> std::io::Result<()> {
+    let rss0 = rss_mb().unwrap_or(0);
+    println!("\x1b[1mtsdash --bench\x1b[0m → {addr}   n_points={n_points}  n_queries={n_queries}");
+    println!("  starting RSS = {rss0} MB");
+    let mut c = Client::connect(addr)?;
+
+    // Ingest phase — one series, N points
+    let mut ins = Vec::with_capacity(n_points);
+    let t0 = Instant::now();
+    for i in 0..n_points {
+        let start = Instant::now();
+        c.cmd(&[
+            b"TSADD",
+            b"bench-series",
+            i.to_string().as_bytes(),
+            (i as i64 * 3).to_string().as_bytes(),
+        ])?;
+        ins.push(start.elapsed().as_micros() as u64);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let p50 = pctl(&mut ins.clone(), 50.0);
+    let p99 = pctl(&mut ins.clone(), 99.0);
+    let rate = n_points as f64 / dt;
+    println!("  TSADD   × {n_points:>6}  p50={p50:>4}µs  p99={p99:>5}µs  → {rate:>7.0} ops/s");
+
+    // Query phase — TSRANGE over 1000-sample windows
+    let mut qs = Vec::with_capacity(n_queries);
+    let t0 = Instant::now();
+    for i in 0..n_queries {
+        let from = (i * 100) as u64 % (n_points as u64 - 1000).max(1);
+        let to = from + 1000;
+        let start = Instant::now();
+        c.cmd(&[
+            b"TSRANGE",
+            b"bench-series",
+            from.to_string().as_bytes(),
+            to.to_string().as_bytes(),
+        ])?;
+        qs.push(start.elapsed().as_micros() as u64);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let p50 = pctl(&mut qs.clone(), 50.0);
+    let p99 = pctl(&mut qs.clone(), 99.0);
+    let rate = n_queries as f64 / dt;
+    println!("  TSRANGE × {n_queries:>6}  p50={p50:>4}µs  p99={p99:>5}µs  → {rate:>7.0} ops/s");
+
+    let rss1 = rss_mb().unwrap_or(0);
+    println!("  ending RSS = {rss1} MB  (Δ = {} MB)", rss1 as i64 - rss0 as i64);
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--bench") {
+        let addr = args.iter().position(|a| a == "--addr")
+            .and_then(|i| args.get(i + 1)).cloned()
+            .unwrap_or_else(|| "127.0.0.1:6380".to_string());
+        let n_p: usize = args.iter().position(|a| a == "--n")
+            .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok())
+            .unwrap_or(20_000);
+        return run_bench(&addr, n_p, 500);
+    }
     let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:6380".to_string());
     let duration_s: u64 = env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(30);
     let mut writer = Client::connect(&addr)?;

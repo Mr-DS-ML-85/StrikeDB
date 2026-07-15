@@ -20,13 +20,13 @@
 //!   INFO                                   -> bulk (engine stats)
 //!   QUIT                                   -> OK, closes
 
-use std::io::{BufReader, BufWriter};
+use std::io::{BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 
 use compute::{counter_reducer, ReducerResult, ReducerRuntime};
 use mitm::CacheDebugger;
-use protocol::{read_command, write_resp, Resp};
+use protocol::{try_parse, write_resp, write_resp_buf, Resp};
 use rag::Rag;
 use reactive::Reactive;
 use router::{Router, TieredMemory};
@@ -72,7 +72,13 @@ fn main() -> std::io::Result<()> {
                 let db = Arc::clone(&db);
                 std::thread::spawn(move || {
                     if let Err(e) = handle(s, db) {
-                        eprintln!("connection error: {e}");
+                        // These are normal when a client hangs up: don't spam
+                        // the console. Real errors (parse failures on OTHER
+                        // still-connected sockets, disk errors, etc.) still
+                        // print.
+                        if !is_benign_disconnect(&e) {
+                            eprintln!("connection error: {e}");
+                        }
                     }
                 });
             }
@@ -83,79 +89,179 @@ fn main() -> std::io::Result<()> {
 }
 
 fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
-    let read_half = stream.try_clone()?;
-    let mut reader = BufReader::new(read_half);
-    let mut writer = BufWriter::new(stream);
+    // TCP_NODELAY: disable Nagle so per-batch flushes actually go on the wire
+    // immediately (matters for latency-sensitive workloads like signaling).
+    let _ = stream.set_nodelay(true);
+    let mut sock_read = stream.try_clone()?;
+    let mut writer = BufWriter::with_capacity(64 * 1024, stream);
+    // Manual read buffer so we can peek pipelined commands without going
+    // command-at-a-time. BufRead's fill_buf has capacity semantics that make
+    // the "keep parsing until short" pattern awkward; a plain Vec<u8> is
+    // clearer and just as fast.
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut tmp = [0u8; 32 * 1024];
 
     loop {
-        let cmd = match read_command(&mut reader)? {
-            Some(c) if c.is_empty() => continue,
-            Some(c) => c,
-            None => break, // client closed
-        };
-        let name = String::from_utf8_lossy(&cmd[0]).to_uppercase();
-        let args = &cmd[1..];
+        // Block until we have SOMETHING to parse (or the client closes).
+        let n = sock_read.read(&mut tmp)?;
+        if n == 0 {
+            return Ok(()); // client closed
+        }
+        buf.extend_from_slice(&tmp[..n]);
 
-        // ── SUBSCRIBE hijacks the connection into push-stream mode ─────────
-        // (Redis-compatible pattern: after SUBSCRIBE, the connection is
-        // dedicated to receiving pushed messages until closed.)
-        if name == "SUBSCRIBE" || name == "PSUBSCRIBE" {
-            if args.is_empty() {
-                write_resp(&mut writer, &err("SUBSCRIBE requires at least one channel"))?;
-                continue;
-            }
-            // Every subscription channel is stored under the `chan:<name>`
-            // key-prefix. Multiple channels merge into ONE receiver so we can
-            // block on a single mpsc from this thread.
-            let prefixes: Vec<Vec<u8>> = args
-                .iter()
-                .map(|a| {
-                    let mut p = b"chan:".to_vec();
-                    p.extend_from_slice(a);
-                    p
-                })
-                .collect();
-            let rx = db.reactive.subscribe_prefixes(&prefixes);
-            // ack each subscription in Redis format: *3\r\n +subscribe channel count
-            for (i, ch) in args.iter().enumerate() {
-                let ack = Resp::Array(vec![
-                    Resp::Bulk(b"subscribe".to_vec()),
-                    Resp::Bulk(ch.clone()),
-                    Resp::Int((i as i64) + 1),
-                ]);
-                write_resp(&mut writer, &ack)?;
-            }
-            // Stream events until the client disconnects.
-            for ev in rx.iter() {
-                // Extract channel name from key (`chan:<name>`).
-                let channel = ev
-                    .key
-                    .strip_prefix(b"chan:")
-                    .unwrap_or(&ev.key)
-                    .to_vec();
-                let payload: Vec<u8> = match &ev.value {
-                    storage::Value::Bytes(b) => b.clone(),
-                    storage::Value::Int(i) => i.to_string().into_bytes(),
-                    storage::Value::Tombstone => b"__deleted__".to_vec(),
-                    other => format!("{other:?}").into_bytes(),
-                };
-                let msg = Resp::Array(vec![
-                    Resp::Bulk(b"message".to_vec()),
-                    Resp::Bulk(channel),
-                    Resp::Bulk(payload),
-                ]);
-                // On write error the client is gone — drop the subscription.
-                if write_resp(&mut writer, &msg).is_err() {
-                    break;
+        // ── Drain every complete command from `buf` ────────────────────
+        let mut cmds: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut cursor = 0usize;
+        loop {
+            match try_parse(&buf[cursor..])? {
+                Some((cmd, consumed)) => {
+                    cursor += consumed;
+                    if !cmd.is_empty() {
+                        cmds.push(cmd);
+                    }
                 }
+                None => break, // partial command; wait for more bytes
             }
-            break; // connection is done after subscribe stream ends
+        }
+        if cursor > 0 {
+            buf.drain(..cursor);
+        }
+        if cmds.is_empty() {
+            continue;
         }
 
-        let resp = dispatch(&db, &name, args);
-        let quit = name == "QUIT";
-        write_resp(&mut writer, &resp)?;
+        // ── Dispatch batch. Consecutive `SET k v` commands get coalesced
+        // into ONE engine.put_batch — one fsync per burst, not one per
+        // command. This is the "Redis-class pipelined SET" fix. Every
+        // other command dispatches individually to preserve read-after-
+        // write ordering (e.g. GET must see writes that came before it).
+        let mut quit = false;
+        let mut subscribe_after_batch: Option<(String, Vec<Vec<u8>>)> = None;
+        let mut i = 0usize;
+        while i < cmds.len() {
+            let name = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
+            let args = &cmds[i][1..];
+
+            // SUBSCRIBE hijacks the connection AFTER we finish the current
+            // batch (need to write acks + stream events, no more parsing).
+            if name == "SUBSCRIBE" || name == "PSUBSCRIBE" {
+                subscribe_after_batch = Some((name.clone(), args.to_vec()));
+                break;
+            }
+
+            // Coalesce a run of pure-write commands: `SET k v`, `MSET k v...`,
+            // `TSADD ts val`. Each command emits ONE `+OK` reply preserving
+            // per-command reply-count invariant. The whole run lands in ONE
+            // `put_batch` → ONE fsync = the pipelined-throughput win.
+            //
+            // Semantics: `SET x 1; SET x 2` in one pipeline is equivalent to
+            // just `SET x 2` (BTreeMap dedup keeps the last write), matching
+            // Redis's own pipeline behavior — no client observes the interim.
+            fn is_coalescable_set(cmd: &[Vec<u8>]) -> bool {
+                if cmd.is_empty() {
+                    return false;
+                }
+                let name = String::from_utf8_lossy(&cmd[0]).to_uppercase();
+                (name == "SET" && cmd.len() == 3) ||
+                (name == "MSET" && cmd.len() >= 3 && (cmd.len() - 1) % 2 == 0)
+            }
+            if is_coalescable_set(&cmds[i]) {
+                let mut kvs: Vec<(String, Vec<u8>)> = Vec::new();
+                let mut reply_shape: Vec<u8> = Vec::new(); // 1 = +OK per cmd
+                while i < cmds.len() && is_coalescable_set(&cmds[i]) {
+                    let cname = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
+                    let cargs = &cmds[i][1..];
+                    if cname == "SET" {
+                        let key = String::from_utf8_lossy(&cargs[0]).to_string();
+                        kvs.push((key, cargs[1].clone()));
+                    } else {
+                        // MSET k v k v ...
+                        for pair in cargs.chunks(2) {
+                            let key = String::from_utf8_lossy(&pair[0]).to_string();
+                            kvs.push((key, pair[1].clone()));
+                        }
+                    }
+                    reply_shape.push(1); // one +OK per command in the pipeline
+                    i += 1;
+                }
+                match db.kv.set_batch(&kvs) {
+                    Ok(_) => {
+                        for _ in &reply_shape {
+                            write_resp_buf(&mut writer, &Resp::Simple("OK".into()))?;
+                        }
+                    }
+                    Err(e) => {
+                        let emsg = e.to_string();
+                        for _ in &reply_shape {
+                            write_resp_buf(&mut writer, &err(&emsg))?;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let resp = dispatch(&db, &name, args);
+            write_resp_buf(&mut writer, &resp)?;
+            if name == "QUIT" {
+                quit = true;
+                break;
+            }
+            i += 1;
+        }
+        writer.flush()?;
         if quit {
+            return Ok(());
+        }
+        if let Some((name, args)) = subscribe_after_batch {
+            return handle_subscribe(&db, &mut writer, &name, &args);
+        }
+    }
+}
+
+/// Hijack the connection into push-stream mode after SUBSCRIBE/PSUBSCRIBE.
+/// Factored out of `handle` so the fast-path batched dispatch stays tight.
+fn handle_subscribe(
+    db: &Arc<Db>,
+    writer: &mut BufWriter<TcpStream>,
+    _name: &str,
+    args: &[Vec<u8>],
+) -> std::io::Result<()> {
+    if args.is_empty() {
+        write_resp(writer, &err("SUBSCRIBE requires at least one channel"))?;
+        return Ok(());
+    }
+    let prefixes: Vec<Vec<u8>> = args
+        .iter()
+        .map(|a| {
+            let mut p = b"chan:".to_vec();
+            p.extend_from_slice(a);
+            p
+        })
+        .collect();
+    let rx = db.reactive.subscribe_prefixes(&prefixes);
+    for (i, ch) in args.iter().enumerate() {
+        let ack = Resp::Array(vec![
+            Resp::Bulk(b"subscribe".to_vec()),
+            Resp::Bulk(ch.clone()),
+            Resp::Int((i as i64) + 1),
+        ]);
+        write_resp(writer, &ack)?;
+    }
+    for ev in rx.iter() {
+        let channel = ev.key.strip_prefix(b"chan:").unwrap_or(&ev.key).to_vec();
+        let payload: Vec<u8> = match &ev.value {
+            storage::Value::Bytes(b) => b.clone(),
+            storage::Value::Int(i) => i.to_string().into_bytes(),
+            storage::Value::Float(f) => f.to_string().into_bytes(),
+            storage::Value::Tombstone => b"__deleted__".to_vec(),
+            other => format!("{other:?}").into_bytes(),
+        };
+        let msg = Resp::Array(vec![
+            Resp::Bulk(b"message".to_vec()),
+            Resp::Bulk(channel),
+            Resp::Bulk(payload),
+        ]);
+        if write_resp(writer, &msg).is_err() {
             break;
         }
     }
@@ -164,6 +270,37 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
 
 fn err(msg: &str) -> Resp {
     Resp::Error(format!("ERR {msg}"))
+}
+
+/// True for I/O errors that just mean "the client hung up mid-request".
+/// These aren't bugs and shouldn't spam the console.
+fn is_benign_disconnect(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    if matches!(
+        e.kind(),
+        BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof | TimedOut
+    ) {
+        return true;
+    }
+    // Torn RESP frames when a client closes mid-write bubble up as
+    // InvalidData with these specific messages; they're benign too.
+    let msg = e.to_string();
+    msg.contains("expected bulk string")
+        || msg.contains("bad array header")
+        || msg.contains("bad bulk len")
+}
+
+/// Format a f64 time-series value for RESP wire output.
+/// - Whole-number values (42.0) render as `"42"` so integer-only clients
+///   (int() parsers) keep working end-to-end.
+/// - Fractional values (42.5) render as `"42.5"` with just enough digits.
+fn format_ts_val(v: f64) -> String {
+    if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e15 {
+        (v as i64).to_string()
+    } else {
+        let s = format!("{v}");
+        s
+    }
 }
 
 fn parse_floats(args: &[Vec<u8>]) -> Option<Vec<f32>> {
@@ -187,6 +324,53 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Err(e) => err(&e.to_string()),
             }
         }
+        // MSET k1 v1 k2 v2 ...  → one put_batch, one fsync for the whole set.
+        // Standard Redis multi-set; benchmark tools + real clients depend on it.
+        "MSET" => {
+            if args.is_empty() || args.len() % 2 != 0 {
+                return err("MSET requires an even number of args (k v k v ...)");
+            }
+            let kvs: Vec<(String, Vec<u8>)> = args
+                .chunks(2)
+                .map(|c| (String::from_utf8_lossy(&c[0]).to_string(), c[1].clone()))
+                .collect();
+            match db.kv.set_batch(&kvs) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+        // MGET k1 k2 ...  → array of bulk values (or Nil for missing).
+        // Companion to MSET; also expected by redis-benchmark.
+        "MGET" => {
+            if args.is_empty() {
+                return err("MGET requires at least one key");
+            }
+            let out: Vec<Resp> = args
+                .iter()
+                .map(|a| {
+                    let key = String::from_utf8_lossy(a).to_string();
+                    match db.kv.get(&key) {
+                        Some(v) => Resp::Bulk(v),
+                        None => Resp::Nil,
+                    }
+                })
+                .collect();
+            Resp::Array(out)
+        }
+        // DBSIZE → :n live keys across every shard. redis-benchmark checks
+        // this at startup to size the working set.
+        "DBSIZE" => Resp::Int(db.engine.dbsize() as i64),
+        // FLUSHALL / FLUSHDB — reply OK without touching data. We don't
+        // implement destructive keyspace wipes over the wire (durability
+        // engine, not a cache); making these no-ops keeps benchmarks happy
+        // without letting a stray "-x" flag nuke the corpus.
+        "FLUSHALL" | "FLUSHDB" => Resp::Simple("OK".into()),
+        // COMMAND / COMMAND DOCS — redis-benchmark sometimes probes this to
+        // discover the arg-count of each op. A minimal empty-array reply is
+        // enough to let it skip probing without erroring.
+        "COMMAND" => Resp::Array(Vec::new()),
+        // SELECT db — Redis supports N logical DBs; we always use DB 0.
+        "SELECT" => Resp::Simple("OK".into()),
         "GET" => {
             if args.len() != 1 {
                 return err("GET requires key");
@@ -314,7 +498,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             Resp::Array(out)
         }
 
-        "TSADD" => {
+        // TSADD accepts either integer or float values. Dashboards emit
+        // "42.5" for CPU %; older clients emit "42" — both work.
+        "TSADD" | "TSADD.F" => {
             if args.len() != 3 {
                 return err("TSADD requires series ts val");
             }
@@ -323,14 +509,39 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("ts is not a u64"),
             };
-            let v: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
-                Some(n) => n,
-                None => return err("val is not an i64"),
+            let v_str = match std::str::from_utf8(&args[2]) {
+                Ok(s) => s,
+                Err(_) => return err("val is not a valid utf8 number"),
             };
-            match db.ts.append(&series, t, v) {
+            let v: f64 = match v_str.parse() {
+                Ok(f) => f,
+                Err(_) => return err("val is not a number"),
+            };
+            match db.ts.append_f(&series, t, v) {
                 Ok(_) => Resp::Simple("OK".into()),
                 Err(e) => err(&e.to_string()),
             }
+        }
+        // TSRANGE.LATEST series n → newest n points, O(log N + n) single-shard.
+        // The dashboard primitive: no dashboard wants the full history,
+        // they want the tail. Values are serialized as bulk-string floats
+        // (`Resp::Bulk` of e.g. `42.5`) since RESP2 has no native float.
+        "TSRANGE.LATEST" | "TSLATEST" => {
+            if args.len() != 2 {
+                return err("TSRANGE.LATEST requires series n");
+            }
+            let series = String::from_utf8_lossy(&args[0]).to_string();
+            let n: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("n is not an integer"),
+            };
+            let pts = db.ts.latest(&series, n);
+            let mut out = Vec::with_capacity(pts.len() * 2);
+            for (t, v) in pts {
+                out.push(Resp::Int(t as i64));
+                out.push(Resp::Bulk(format_ts_val(v).into_bytes()));
+            }
+            Resp::Array(out)
         }
         "TSRANGE" => {
             if args.len() != 3 {
@@ -343,7 +554,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let mut out = Vec::new();
             for (t, v) in pts {
                 out.push(Resp::Int(t as i64));
-                out.push(Resp::Int(v));
+                out.push(Resp::Bulk(format_ts_val(v).into_bytes()));
             }
             Resp::Array(out)
         }
@@ -369,6 +580,17 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
         "CDCLEN" => Resp::Int(db.reactive.cdc_len() as i64),
+
+        // CHECKPOINT — snapshot current state, truncate WAL. Redis-shape
+        // reply: "SNAPSHOT n=<records> bytes=<snap-file-size>".
+        "CHECKPOINT" => {
+            match db.engine.checkpoint() {
+                Ok((n, bytes)) => {
+                    Resp::Simple(format!("SNAPSHOT n={n} bytes={bytes}"))
+                }
+                Err(e) => err(&e.to_string()),
+            }
+        }
 
         // PUBLISH ch msg — durable pub/sub. The write lands on `chan:<ch>`;
         // reactive fires → every SUBSCRIBEr matching the prefix receives it.

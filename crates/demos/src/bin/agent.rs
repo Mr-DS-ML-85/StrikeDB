@@ -26,8 +26,9 @@
 
 use std::env;
 use std::io::{self, BufRead, Write};
+use std::time::Instant;
 
-use demos::{Client, Reply};
+use demos::{pctl, rss_mb, Client, Reply};
 
 fn embed(text: &str, dim: usize) -> Vec<f32> {
     let mut v = vec![0f32; dim];
@@ -62,7 +63,91 @@ fn banner(agent: &str, addr: &str) {
     println!();
 }
 
+fn run_bench(addr: &str, agent: &str, n: usize) -> std::io::Result<()> {
+    let rss0 = rss_mb().unwrap_or(0);
+    println!("\x1b[1magent-cli --bench\x1b[0m → {addr}  agent={agent}  n={n}");
+    println!("  starting RSS = {rss0} MB");
+    let mut c = Client::connect(addr)?;
+
+    // Warmup
+    for i in 0..50 {
+        let text = format!("warmup entry {i}");
+        let v = embed(&text, 32);
+        let mut args: Vec<Vec<u8>> = vec![
+            b"MEM.REMEMBER".to_vec(),
+            text.as_bytes().to_vec(),
+            agent.as_bytes().to_vec(),
+            b"0.5".to_vec(),
+        ];
+        for f in fvec_args(&v) { args.push(f); }
+        c.cmd(&as_bytes_all(&args))?;
+    }
+
+    // Phase 1: N :remember ops
+    let mut rem = Vec::with_capacity(n);
+    let t0 = Instant::now();
+    for i in 0..n {
+        let text = format!("Fact number {i}: the cluster has {i} nodes and it is deployed in region eu-west-{}", i % 4);
+        let v = embed(&text, 32);
+        let mut args: Vec<Vec<u8>> = vec![
+            b"MEM.REMEMBER".to_vec(),
+            text.as_bytes().to_vec(),
+            agent.as_bytes().to_vec(),
+            b"0.7".to_vec(),
+        ];
+        for f in fvec_args(&v) { args.push(f); }
+        let start = Instant::now();
+        c.cmd(&as_bytes_all(&args))?;
+        rem.push(start.elapsed().as_micros() as u64);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let p50 = pctl(&mut rem.clone(), 50.0);
+    let p99 = pctl(&mut rem.clone(), 99.0);
+    let rate = n as f64 / dt;
+    println!("  MEM.REMEMBER × {n:>5}   p50={p50:>4}µs  p99={p99:>5}µs  → {rate:>6.0} ops/s");
+
+    // Phase 2: N :recall ops
+    let mut rec = Vec::with_capacity(n);
+    let queries = ["cluster region", "deployed nodes", "eu-west", "warmup", "how many"];
+    let t0 = Instant::now();
+    for i in 0..n {
+        let q = queries[i % queries.len()];
+        let v = embed(q, 32);
+        let mut args: Vec<Vec<u8>> = vec![
+            b"MEM.RECALL".to_vec(),
+            b"5".to_vec(),
+            q.as_bytes().to_vec(),
+        ];
+        for f in fvec_args(&v) { args.push(f); }
+        let start = Instant::now();
+        c.cmd(&as_bytes_all(&args))?;
+        rec.push(start.elapsed().as_micros() as u64);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let p50 = pctl(&mut rec.clone(), 50.0);
+    let p99 = pctl(&mut rec.clone(), 99.0);
+    let rate = n as f64 / dt;
+    println!("  MEM.RECALL   × {n:>5}   p50={p50:>4}µs  p99={p99:>5}µs  → {rate:>6.0} ops/s");
+
+    let rss1 = rss_mb().unwrap_or(0);
+    println!("  ending RSS = {rss1} MB  (Δ = {} MB)", rss1 as i64 - rss0 as i64);
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--bench") {
+        let addr = args.iter().position(|a| a == "--addr")
+            .and_then(|i| args.get(i + 1)).cloned()
+            .unwrap_or_else(|| "127.0.0.1:6380".to_string());
+        let agent = args.iter().position(|a| a == "--agent")
+            .and_then(|i| args.get(i + 1)).cloned()
+            .unwrap_or_else(|| "bench".to_string());
+        let n: usize = args.iter().position(|a| a == "--n")
+            .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok())
+            .unwrap_or(2000);
+        return run_bench(&addr, &agent, n);
+    }
     let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:6380".to_string());
     let agent = env::args().nth(2).unwrap_or_else(|| "user".to_string());
     let mut c = Client::connect(&addr)?;

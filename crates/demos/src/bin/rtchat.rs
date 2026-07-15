@@ -54,6 +54,7 @@ fn spawn_receiver(
     stop: Arc<AtomicBool>,
     recv_count: Arc<AtomicU64>,
     last_rt_recv_us: Arc<AtomicU64>,
+    quiet: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut c = match Client::connect(&addr) {
@@ -103,9 +104,11 @@ fn spawn_receiver(
                             let delta = now_micros().saturating_sub(send_us);
                             last_rt_recv_us.store(delta, Ordering::SeqCst);
                             recv_count.fetch_add(1, Ordering::SeqCst);
-                            println!("  \x1b[35m{u}\x1b[0m ({delta} µs push): {text}");
-                            print!("\x1b[36mme>\x1b[0m ");
-                            let _ = io::stdout().flush();
+                            if !quiet {
+                                println!("  \x1b[35m{u}\x1b[0m ({delta} µs push): {text}");
+                                print!("\x1b[36mme>\x1b[0m ");
+                                let _ = io::stdout().flush();
+                            }
                         }
                     }
                 }
@@ -166,6 +169,7 @@ fn run_latency_probe(addr: &str) -> std::io::Result<()> {
     let jh = spawn_receiver(
         addr.into(), "probe".into(), "peer".into(),
         stop.clone(), count.clone(), last.clone(),
+        true, // quiet: probe mode prints only the summary
     );
     // Give the subscriber a moment to register.
     thread::sleep(Duration::from_millis(120));
@@ -222,6 +226,7 @@ fn main() -> std::io::Result<()> {
     let jh = spawn_receiver(
         addr.clone(), room.clone(), me.clone(),
         stop.clone(), count.clone(), last.clone(),
+        false, // interactive mode prints every incoming message
     );
     let pj = spawn_presence(addr.clone(), room.clone(), me.clone(), stop.clone());
     // Announce join.

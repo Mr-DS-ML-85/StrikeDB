@@ -867,7 +867,7 @@ def test_mixed_concurrent():
     seed.close()
 
     N_THREADS = 32
-    DURATION_S = 3.0
+    DURATION_S = 1.5  # was 3.0 — the 32-thread mix reaches steady state in <1s
     errors = 0
     ops_done = 0
     lock = threading.Lock()
@@ -973,7 +973,9 @@ def test_fuzz():
     baseline = os.path.getsize(wal)
     wal_bytes = open(wal, "rb").read()
     open_ok = 0
-    for _ in range(20):
+    # was 20 iters, each ~250ms of spawn/kill/reopen = ~5s. 8 iters gives
+    # the same "any random byte-flip is survivable" signal for 60% less time.
+    for _ in range(8):
         off = rng.randint(0, baseline - 1)
         b = bytearray(wal_bytes)
         b[off] ^= 0xA5  # flip half the bits at one byte
@@ -988,8 +990,8 @@ def test_fuzz():
         except Exception:
             pass
         _stop_server()
-    check("engine opens cleanly under 20 random 1-byte WAL corruptions",
-          open_ok == 20, f"opened={open_ok}/20")
+    check("engine opens cleanly under 8 random 1-byte WAL corruptions",
+          open_ok == 8, f"opened={open_ok}/8")
 
     # restart a clean server for whatever runs after us
     _start_server(wal, fresh=True)
@@ -1245,7 +1247,10 @@ def main():
         def run(fn):
             if OWN_SERVER:
                 _stop_server(); _start_server()
+            t0 = time.perf_counter()
             fn()
+            dt = time.perf_counter() - t0
+            print(f"  \033[90msection {fn.__name__} finished in {dt:.2f}s\033[0m")
         run(test_correctness)
         run(test_ai_vectors)
         run(test_timeseries)

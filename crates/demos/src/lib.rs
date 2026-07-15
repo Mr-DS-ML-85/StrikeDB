@@ -4,6 +4,26 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+/// VmRSS from /proc/self/status, in MB. None on non-Linux.
+pub fn rss_mb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+/// Percentile from a slice of microsecond samples (sorts in place).
+pub fn pctl(samples: &mut [u64], p: f64) -> u64 {
+    if samples.is_empty() { return 0; }
+    samples.sort_unstable();
+    let k = ((p / 100.0) * (samples.len() as f64 - 1.0)).round() as usize;
+    samples[k.min(samples.len() - 1)]
+}
+
 pub enum Reply {
     Simple(Vec<u8>),
     Error(Vec<u8>),

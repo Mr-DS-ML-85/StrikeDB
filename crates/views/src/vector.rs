@@ -704,6 +704,25 @@ impl VectorIndex {
         }
     }
 
+    /// Iterate all live (id, normalized-f32-slice) pairs held by the HNSW
+    /// mirror. Zero-copy — the closure gets a borrow into the existing
+    /// `all_f32` arena, so callers doing brute-force ground truth don't
+    /// have to allocate a second 6 GB copy at 1M×1536d scale.
+    pub fn for_each_normalized<F: FnMut(u64, &[f32])>(&self, mut f: F) {
+        let g = self.hnsw.read().unwrap();
+        for (idx, node) in g.nodes.iter().enumerate() {
+            if !node.deleted {
+                f(node.id, g.vec_at_f32(idx));
+            }
+        }
+    }
+
+    /// Total live vectors in the HNSW graph.
+    pub fn len(&self) -> usize {
+        let g = self.hnsw.read().unwrap();
+        g.nodes.iter().filter(|n| !n.deleted).count()
+    }
+
     /// Debug: (max_level, per-level node count, avg neighbors at level 0).
     /// Used by bench to catch degenerate graph construction.
     pub fn debug_shape(&self) -> (usize, Vec<usize>, f64) {

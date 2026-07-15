@@ -23,6 +23,22 @@ impl Kv {
         self.engine.put(k(key), Value::Bytes(val.to_vec())).map(|_| ())
     }
 
+    /// Coalesced multi-SET: land N (key, value) pairs under ONE commit ts,
+    /// ONE WAL append, ONE fsync. Used by the server's pipelined dispatch
+    /// path to amortize fsync across a burst of pipelined SETs — takes
+    /// durable SET throughput from ~65k/s (per-command fsync) to a fully
+    /// batched fsync rate limited only by the disk / group-commit window.
+    pub fn set_batch(&self, kvs: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+        if kvs.is_empty() {
+            return Ok(());
+        }
+        let entries: Vec<(Vec<u8>, Value)> = kvs
+            .iter()
+            .map(|(key, val)| (k(key), Value::Bytes(val.clone())))
+            .collect();
+        self.engine.put_batch(entries).map(|_| ())
+    }
+
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         match self.engine.get(&k(key)) {
             Some(Value::Bytes(b)) => Some(b),

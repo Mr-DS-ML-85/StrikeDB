@@ -9,8 +9,12 @@ use std::collections::BTreeMap;
 pub enum Value {
     /// Opaque bytes (KV strings, blobs).
     Bytes(Vec<u8>),
-    /// 64-bit signed integer (counters, TS values).
+    /// 64-bit signed integer (counters).
     Int(i64),
+    /// 64-bit float (time-series metrics: cpu%, temperature, rps rates).
+    /// Added because dashboards need decimals — `TSADD cpu 100 42.5` used
+    /// to error with "val is not an i64".
+    Float(f64),
     /// Dense f32 vector (embeddings).
     Vector(Vec<f32>),
     /// A row: ordered map of column -> value.
@@ -24,6 +28,7 @@ const T_INT: u8 = 2;
 const T_VECTOR: u8 = 3;
 const T_ROW: u8 = 4;
 const T_TOMB: u8 = 5;
+const T_FLOAT: u8 = 6;
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -48,6 +53,10 @@ impl Value {
             Value::Int(i) => {
                 out.push(T_INT);
                 out.extend_from_slice(&i.to_le_bytes());
+            }
+            Value::Float(f) => {
+                out.push(T_FLOAT);
+                out.extend_from_slice(&f.to_le_bytes());
             }
             Value::Vector(v) => {
                 out.push(T_VECTOR);
@@ -86,6 +95,12 @@ impl Value {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(b);
                 Some(Value::Int(i64::from_le_bytes(a)))
+            }
+            T_FLOAT => {
+                let b = buf.get(pos..pos + 8)?;
+                let mut a = [0u8; 8];
+                a.copy_from_slice(b);
+                Some(Value::Float(f64::from_le_bytes(a)))
             }
             T_VECTOR => {
                 let n = get_u32(buf, &mut pos)? as usize;

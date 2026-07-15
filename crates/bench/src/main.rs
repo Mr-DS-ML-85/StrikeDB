@@ -63,6 +63,28 @@ fn pctl(samples: &mut [u64], p: f64) -> u64 {
     samples[k.min(samples.len() - 1)]
 }
 
+/// Read /proc/self/status VmRSS. Returns the RSS in MB, or None on non-Linux.
+fn rss_mb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+fn print_rss(tag: &str) {
+    if let Some(mb) = rss_mb() {
+        println!("  \x1b[90mRSS[{tag}] = {mb} MB\x1b[0m");
+    }
+}
+
 fn latency_report(name: &str, mut samples: Vec<u64>) {
     if samples.is_empty() {
         return;
@@ -1274,12 +1296,160 @@ unsafe fn libc_kill(pid: i32, sig: i32) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// 18. Fair same-dim comparison — 1M at 384d AND 1536d (--xlarge)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// One 1M run at a given dim. Reports ingest rate, VSEARCH p50/p99, recall
+/// vs full brute force (only 10 queries at 1536d for time), 8-thread QPS.
+fn xlarge_run_one(dim: usize, tag: &str) {
+    println!("\n\x1b[1m── 1M × {dim}d ({tag}) ──\x1b[0m");
+    let e = Engine::open(fresh_wal(&format!("xlarge_{dim}"))).unwrap();
+    let idx = Arc::new(VectorIndex::open(Arc::clone(&e)));
+    const N: u64 = 1_000_000;
+    const N_CLUSTERS: u64 = 1000;
+
+    println!("  ingesting {N} × {dim}d clustered vectors ...");
+    let t0 = Instant::now();
+    let mut last_print = t0;
+    for i in 0..N {
+        idx.insert(i, clustered_vec(i, dim, N_CLUSTERS)).unwrap();
+        if last_print.elapsed() > Duration::from_secs(30) {
+            let done = i + 1;
+            let rate = done as f64 / t0.elapsed().as_secs_f64();
+            let eta = (N - done) as f64 / rate;
+            println!("    ...{done:>7}/{N} ({rate:.0} vec/s, ETA {eta:.0}s)");
+            last_print = Instant::now();
+        }
+    }
+    let dt_ingest = t0.elapsed().as_secs_f64();
+    let ingest_rate = N as f64 / dt_ingest;
+    println!("  ingest: {ingest_rate:.0} vec/s ({dt_ingest:.1}s total)");
+    print_rss("post-ingest");
+    check(&format!("1M×{dim}d ingest > 500 vec/s"),
+          ingest_rate > 500.0, &format!("{ingest_rate:.0} vec/s"));
+
+    // Latency @ default ef
+    for _ in 0..50 {
+        idx.search(&clustered_vec(999_999_999, dim, N_CLUSTERS), 10);
+    }
+    let mut lats = Vec::with_capacity(500);
+    for i in 0..500u64 {
+        let q = clustered_vec(700_000_000 + i, dim, N_CLUSTERS);
+        let t0 = Instant::now();
+        idx.search(&q, 10);
+        lats.push(t0.elapsed().as_micros() as u64);
+    }
+    latency_report(&format!("VSEARCH k=10 (1M × {dim}d)"), lats.clone());
+    let p50 = pctl(&mut lats.clone(), 50.0);
+    let p99 = pctl(&mut lats.clone(), 99.0);
+    // Loosen bar for 1536d — Qdrant themselves publish ~3.5 ms p50 there.
+    let p99_bar = if dim >= 1024 { 5_000 } else { 3_000 };
+    check(&format!("1M×{dim}d VSEARCH p99 < {}µs", p99_bar), p99 < p99_bar,
+          &format!("p99 = {p99} µs"));
+
+    // Recall vs full brute force. Zero-copy: we iterate the HNSW's OWN f32
+    // mirror via `for_each_normalized`, so peak RAM is 1× the index size
+    // (int8 + f32) — not 2× as the previous version. At 1M×1536d this saves
+    // ~6 GB of duplicate allocation.
+    let n_queries = if dim >= 1024 { 10 } else { 20 };
+    println!("  Recall@10 vs full 1M brute-force ({n_queries} queries, zero-copy) ...");
+    let t_r = Instant::now();
+    let mut recall_sum = 0.0f64;
+    for qi in 0..n_queries {
+        let q_raw = clustered_vec(800_000_000 + qi as u64, dim, N_CLUSTERS);
+        let mut q = q_raw.clone();
+        let nn = q.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        q.iter_mut().for_each(|x| *x /= nn);
+        // Streaming top-10 selection: maintain a small max-heap so we never
+        // materialize a Vec<(u64,f32)> of size N (avoids ~16 MB alloc per
+        // query at 1M vectors on top of the RAM saved above).
+        use std::collections::BinaryHeap;
+        #[derive(Copy, Clone, PartialEq)]
+        struct Slot { d: f32, id: u64 }
+        impl Eq for Slot {}
+        impl PartialOrd for Slot {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                self.d.partial_cmp(&o.d)
+            }
+        }
+        impl Ord for Slot {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                self.d.partial_cmp(&o.d).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+        let mut heap: BinaryHeap<Slot> = BinaryHeap::with_capacity(11);
+        idx.for_each_normalized(|id, v| {
+            let dot: f32 = q.iter().zip(v).map(|(a, b)| a * b).sum();
+            let d = 1.0 - dot;
+            if heap.len() < 10 {
+                heap.push(Slot { d, id });
+            } else if heap.peek().map(|s| d < s.d).unwrap_or(false) {
+                heap.pop();
+                heap.push(Slot { d, id });
+            }
+        });
+        let mut gt_sorted: Vec<Slot> = heap.into_sorted_vec();
+        gt_sorted.reverse();
+        let gt: Vec<u64> = gt_sorted.iter().map(|s| s.id).collect();
+        let hits = idx.search(&q_raw, 10);
+        let got: Vec<u64> = hits.iter().map(|(id, _)| *id).collect();
+        let overlap = gt.iter().filter(|id| got.contains(id)).count();
+        recall_sum += overlap as f64 / 10.0;
+    }
+    let recall = recall_sum / n_queries as f64;
+    println!("  Recall@10: {:.3} (in {:.1}s)", recall, t_r.elapsed().as_secs_f64());
+    print_rss("post-recall");
+    check(&format!("1M×{dim}d Recall@10 ≥ 0.85"), recall >= 0.85,
+          &format!("recall={:.3}", recall));
+
+    let n_threads = 8usize;
+    let per = 150usize;
+    let t0 = Instant::now();
+    let handles: Vec<_> = (0..n_threads)
+        .map(|tid| {
+            let idx = Arc::clone(&idx);
+            thread::spawn(move || {
+                for i in 0..per {
+                    let q = clustered_vec((tid * 100_000 + i) as u64, dim, N_CLUSTERS);
+                    idx.search_ef(&q, 10, 128);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let qps = (n_threads * per) as f64 / dt;
+    println!("  {n_threads}-thread concurrent VSEARCH: {qps:.0} QPS");
+    check(&format!("1M×{dim}d concurrent QPS > 1000"), qps > 1_000.0,
+          &format!("{qps:.0} QPS"));
+
+    println!(
+        "\n  \x1b[1msummary — 1M × {dim}d\x1b[0m: ingest {ingest_rate:.0} vec/s · \
+         p50 {p50} µs · p99 {p99} µs · Recall@10 {:.3} · 8-thread QPS {qps:.0}",
+        recall
+    );
+}
+
+fn s18_xlarge_vectors() {
+    section("18. Fair same-dim comparison — 1M at 384d AND 1536d (--xlarge)");
+    println!(
+        "  Qdrant published numbers (1M×1536d): median ~3.54 ms, p99 ~8.62 ms.\n  \
+         DB-Strike will run 384d and 1536d at 1M so the comparison is honest per-dim."
+    );
+    xlarge_run_one(384, "typical BGE / e5-small");
+    xlarge_run_one(1536, "OpenAI ada-002 / text-embedding-3-large");
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let tcp_addr = args.iter().position(|a| a == "--tcp").and_then(|i| args.get(i + 1).cloned());
     let ycsb_addr = args.iter().position(|a| a == "--ycsb").and_then(|i| args.get(i + 1).cloned());
     let run_large = args.iter().any(|a| a == "--large");
+    let run_xlarge = args.iter().any(|a| a == "--xlarge");
     let run_chaos = args.iter().any(|a| a == "--chaos");
 
     println!("DB-Strike native Rust bench");
@@ -1322,6 +1492,12 @@ fn main() {
     } else {
         println!("\n\x1b[1m=== 17. Jepsen-style chaos (skipped) ===\x1b[0m");
         println!("  (pass `--chaos` to run repeated SIGKILL+recover — needs `dbstrike` binary next to bench)");
+    }
+    if run_xlarge {
+        s18_xlarge_vectors();
+    } else {
+        println!("\n\x1b[1m=== 18. Fair same-dim comparison — 1M × 384d + 1536d (skipped) ===\x1b[0m");
+        println!("  (pass `--xlarge` — takes ~20 min, needs ~14 GB RAM)");
     }
 
     let dt = t_start.elapsed().as_secs_f64();
