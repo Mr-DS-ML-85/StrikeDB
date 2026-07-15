@@ -366,8 +366,11 @@ plus StrikeDB-native: `VADD · VSEARCH · VSEARCH.MANY · TSADD · TSADD.F ·
 TSRANGE · TSRANGE.LATEST · MEM.* · RAG.* · CACHE.* · REDUCE · CHECKPOINT`.
 
 **Env knobs:**
-- `DBSTRIKE_WAL=<path>` — WAL file location
-- `DBSTRIKE_SYNC=0` — skip WAL fsync entirely (Redis-default; sessions/cache/tests)
+- `DBSTRIKE_WAL=<path>` — WAL file location (default: `dbstrike.wal`)
+- `DBSTRIKE_SYNC=0` — skip WAL entirely; writes apply directly to sharded maps with no
+  fsync, no flusher round-trip. Reads still see the write (same process), but crash
+  durability is dropped. Default is `true` (fsync every batch). Ideal for sessions,
+  presence, caches, and test rigs — matches Redis's default (no AOF fsync per write).
 
 ### Vector search at 100k scale (100k × 384-d, INT8 + f32 rerank)
 
@@ -480,7 +483,7 @@ SIGKILL'd, then reopened, then every acked key is verified.
 ├────────────────────────────────┤
 │ TIERED MEMORY                   │  RAM → NVMe → object store
 ├────────────────────────────────┤
-│ DISTRIBUTION / CONSENSUS        │  Raft · HLC · CRDTs (tunable)
+│ DISTRIBUTION / CONSENSUS        │  HLC · CRDTs (tunable) · Raft (planned)
 └────────────────────────────────┘
 ```
 

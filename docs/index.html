@@ -3,425 +3,1116 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>StrikeDB Docs — One Engine. Every Data Model.</title>
+<title>StrikeDB — One Engine. Every Data Model.</title>
 <style>
-  :root{--cyan:#22d3ee;--mag:#ff4fd8;--bg:#05060a;--panel:#0c0f17;--ink:#e8edf6;--muted:#8b93a7;--green:#3ddc97;--line:#1b2233;--amber:#ffb86b}
-  *{box-sizing:border-box;margin:0;padding:0}
-  html{scroll-behavior:smooth}
-  body{background:var(--bg);color:var(--ink);font:16px/1.65 ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;overflow-x:hidden}
-  a{color:var(--cyan);text-decoration:none}
-  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#07090f;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13.5px;color:#bfe3ff}
-  .wrap{max-width:1080px;margin:0 auto;padding:0 22px}
-  header.hd{position:sticky;top:0;z-index:30;backdrop-filter:blur(12px);background:rgba(5,6,10,.78);border-bottom:1px solid var(--line)}
-  .hd .wrap{display:flex;align-items:center;justify-content:space-between;height:62px;gap:18px}
-  .brand{display:flex;align-items:center;gap:11px;font-weight:800;letter-spacing:.5px}
-  .brand img{width:32px;height:32px}
-  .brand span{font-size:19px}
-  .search{position:relative;flex:1;max-width:420px}
-  .search input{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:10px;color:var(--ink);
-    padding:9px 14px 9px 38px;font-size:14px;outline:none}
-  .search input:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(34,211,238,.12)}
-  .search svg{position:absolute;left:12px;top:11px;width:16px;height:16px;fill:var(--muted)}
-  .search kbd{position:absolute;right:10px;top:8px;font:11px ui-monospace,monospace;color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:2px 6px}
-  .results{position:absolute;top:46px;left:0;right:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;
-    max-height:60vh;overflow:auto;display:none;z-index:40;box-shadow:0 18px 50px rgba(0,0,0,.5)}
-  .results.show{display:block}
-  .res{padding:11px 14px;border-bottom:1px solid var(--line);cursor:pointer}
-  .res:last-child{border-bottom:none}
-  .res:hover{background:rgba(34,211,238,.06)}
-  .res b{color:var(--ink);font-size:14px}
-  .res p{color:var(--muted);font-size:12.5px;margin-top:2px}
-  .res .tg{display:inline-block;font:10.5px ui-monospace,monospace;color:var(--cyan);border:1px solid var(--line);border-radius:5px;padding:0 6px;margin-right:6px}
-  .hero{padding:54px 0 30px;text-align:center}
-  h1{font-size:clamp(30px,5.5vw,56px);letter-spacing:-1px;line-height:1.05}
-  h1 .grad{background:linear-gradient(90deg,var(--cyan),var(--mag));-webkit-background-clip:text;background-clip:text;color:transparent}
-  .sub{color:var(--muted);max-width:680px;margin:14px auto 0;font-size:17px}
-  .pill{display:inline-block;margin:4px;padding:5px 13px;border:1px solid var(--line);border-radius:999px;background:var(--panel);color:var(--muted);font-size:13px;font-weight:600}
-  section.doc{padding:38px 0;border-top:1px solid var(--line)}
-  .grid{display:grid;grid-template-columns:260px 1fr;gap:34px;align-items:start}
-  nav.toc{position:sticky;top:82px;font-size:14px}
-  nav.toc a{display:block;color:var(--muted);padding:5px 0;border-left:2px solid transparent;padding-left:12px}
-  nav.toc a:hover,nav.toc a.active{color:var(--ink);border-left-color:var(--cyan)}
-  nav.toc .grp{color:var(--cyan);font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin:16px 0 4px}
-  h2{font-size:27px;letter-spacing:-.5px;margin:30px 0 10px;scroll-margin-top:80px}
-  h2:first-child{margin-top:0}
-  h3{font-size:19px;margin:22px 0 8px;color:#dfe7f5}
-  p{color:#c3cadd;margin:10px 0}
-  ul,ol{color:#c3cadd;margin:10px 0 10px 22px}
-  li{margin:5px 0}
-  pre{background:#07090f;border:1px solid var(--line);border-radius:12px;padding:16px;overflow:auto;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfe3ff;margin:12px 0}
-  .callout{border:1px solid var(--line);border-left:3px solid var(--cyan);background:var(--panel);border-radius:10px;padding:14px 16px;margin:14px 0;color:#c3cadd}
-  .callout.warn{border-left-color:var(--amber)}
-  .callout.good{border-left-color:var(--green)}
-  table{width:100%;border-collapse:collapse;font-size:14px;margin:14px 0}
-  th,td{border:1px solid var(--line);padding:9px 12px;text-align:center}
-  th{background:var(--panel);color:var(--ink);font-weight:700}
-  td:first-child,th:first-child{text-align:left;color:var(--muted)}
-  td.us{background:rgba(34,211,238,.10);color:var(--cyan);font-weight:700}
-  .tag{display:inline-block;font:11px ui-monospace,monospace;padding:2px 8px;border-radius:6px;border:1px solid var(--line);color:var(--muted);margin-right:6px}
-  .tag.feat{color:var(--cyan);border-color:rgba(34,211,238,.4)}
-  .tag.fix{color:var(--mag);border-color:rgba(255,79,216,.4)}
-  footer{border-top:1px solid var(--line);padding:30px 0;text-align:center;color:var(--muted);font-size:13.5px}
-  @media(max-width:820px){.grid{grid-template-columns:1fr}nav.toc{display:none}.search{max-width:none}}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  --cyan: #06d6a0;
+  --magenta: #ef476f;
+  --blue: #118ab2;
+  --purple: #7b2ff7;
+  --gold: #ffd166;
+  --bg: #050510;
+  --glass: rgba(255,255,255,0.03);
+  --glass-border: rgba(255,255,255,0.08);
+  --glass-hover: rgba(255,255,255,0.06);
+  --ink: #f0f0f5;
+  --muted: #6b7280;
+  --green: #06d6a0;
+  --line: rgba(255,255,255,0.06);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.7 'Inter', -apple-system, system-ui, sans-serif;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ===== ANIMATED BACKGROUND ===== */
+.bg-canvas {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
+}
+.orb {
+  position: absolute; border-radius: 50%; filter: blur(120px); opacity: 0.35;
+  animation: orbFloat 20s ease-in-out infinite alternate;
+}
+.orb-1 { width: 700px; height: 700px; background: var(--purple); top: -15%; left: -10%; animation-duration: 25s; }
+.orb-2 { width: 500px; height: 500px; background: var(--cyan); bottom: -10%; right: -5%; animation-duration: 18s; animation-delay: -5s; }
+.orb-3 { width: 400px; height: 400px; background: var(--magenta); top: 40%; left: 50%; animation-duration: 22s; animation-delay: -10s; }
+@keyframes orbFloat {
+  0% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(60px, -40px) scale(1.1); }
+  66% { transform: translate(-30px, 50px) scale(0.95); }
+  100% { transform: translate(40px, -20px) scale(1.05); }
+}
+
+/* ===== 3D SCENE ===== */
+.scene-3d {
+  position: absolute; top: 120px; right: 5%; width: 320px; height: 320px;
+  perspective: 900px; z-index: 1; pointer-events: none;
+}
+.cube-wrapper {
+  width: 100%; height: 100%; position: relative;
+  transform-style: preserve-3d;
+  animation: cubeRotate 20s linear infinite;
+}
+@keyframes cubeRotate {
+  0% { transform: rotateX(0deg) rotateY(0deg) rotateZ(0deg); }
+  100% { transform: rotateX(360deg) rotateY(360deg) rotateZ(180deg); }
+}
+.cube-face {
+  position: absolute; width: 160px; height: 160px;
+  top: 50%; left: 50%; margin: -80px 0 0 -80px;
+  border: 1.5px solid rgba(6,214,160,0.3);
+  background: rgba(6,214,160,0.04);
+  backdrop-filter: blur(4px);
+  border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: 'JetBrains Mono', monospace; font-size: 12px; color: rgba(6,214,160,0.6);
+  box-shadow: inset 0 0 40px rgba(6,214,160,0.05);
+}
+.cube-face:nth-child(1) { transform: rotateY(0deg) translateZ(80px); }
+.cube-face:nth-child(2) { transform: rotateY(180deg) translateZ(80px); }
+.cube-face:nth-child(3) { transform: rotateY(90deg) translateZ(80px); }
+.cube-face:nth-child(4) { transform: rotateY(-90deg) translateZ(80px); }
+.cube-face:nth-child(5) { transform: rotateX(90deg) translateZ(80px); }
+.cube-face:nth-child(6) { transform: rotateX(-90deg) translateZ(80px); }
+
+/* Second 3D: spinning torus ring */
+.ring-3d {
+  position: absolute; top: 180px; left: 8%; width: 200px; height: 200px;
+  perspective: 600px; z-index: 1; pointer-events: none;
+}
+.torus {
+  width: 100%; height: 100%; border-radius: 50%;
+  border: 3px solid rgba(239,71,111,0.25);
+  transform-style: preserve-3d;
+  animation: torusSpin 12s linear infinite;
+  box-shadow: 0 0 60px rgba(239,71,111,0.1), inset 0 0 60px rgba(239,71,111,0.05);
+}
+.torus::after {
+  content: ''; position: absolute; inset: 20px; border-radius: 50%;
+  border: 2px solid rgba(123,47,247,0.2);
+  animation: torusSpin 8s linear infinite reverse;
+}
+@keyframes torusSpin {
+  0% { transform: rotateX(70deg) rotateZ(0deg); }
+  100% { transform: rotateX(70deg) rotateZ(360deg); }
+}
+
+/* ===== 3D FLOATING PARTICLES ===== */
+.particles { position: absolute; inset: 0; z-index: 1; pointer-events: none; overflow: hidden; }
+.particle {
+  position: absolute; width: 4px; height: 4px; border-radius: 50%;
+  background: var(--cyan); opacity: 0;
+  animation: particleFloat 8s ease-in-out infinite;
+}
+.particle:nth-child(odd) { background: var(--magenta); }
+@keyframes particleFloat {
+  0%, 100% { opacity: 0; transform: translateY(100vh) scale(0); }
+  10% { opacity: 0.6; }
+  90% { opacity: 0.6; }
+  50% { transform: translateY(-20vh) scale(1.5) translateX(30px); }
+}
+
+/* ===== GLASS PANELS ===== */
+.glass {
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: 20px;
+  backdrop-filter: blur(20px) saturate(1.4);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.glass:hover {
+  background: var(--glass-hover);
+  border-color: rgba(255,255,255,0.12);
+  box-shadow: 0 8px 40px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.05);
+  transform: translateY(-2px);
+}
+
+/* ===== LAYOUT ===== */
+.wrap { max-width: 1200px; margin: 0 auto; padding: 0 28px; position: relative; z-index: 2; }
+.content-wrap { position: relative; z-index: 2; }
+
+/* ===== HEADER ===== */
+header {
+  position: sticky; top: 0; z-index: 100;
+  background: rgba(5,5,16,0.7);
+  backdrop-filter: blur(24px) saturate(1.6);
+  -webkit-backdrop-filter: blur(24px) saturate(1.6);
+  border-bottom: 1px solid var(--glass-border);
+}
+header .wrap {
+  display: flex; align-items: center; justify-content: space-between;
+  height: 64px; gap: 20px;
+}
+.brand { display: flex; align-items: center; gap: 12px; font-weight: 800; letter-spacing: 0.5px; }
+.brand img { width: 34px; height: 34px; }
+.brand span { font-size: 20px; }
+.brand small { color: var(--muted); font-weight: 500; font-size: 13px; margin-left: 2px; }
+.nav-links { display: flex; gap: 8px; }
+.nav-links a {
+  color: var(--muted); font-size: 13px; font-weight: 500; padding: 6px 14px;
+  border-radius: 10px; transition: all 0.25s;
+}
+.nav-links a:hover { color: var(--ink); background: rgba(255,255,255,0.06); }
+.search-box {
+  position: relative; flex: 1; max-width: 380px;
+}
+.search-box input {
+  width: 100%; background: rgba(255,255,255,0.04); border: 1px solid var(--glass-border);
+  border-radius: 12px; color: var(--ink); padding: 10px 16px 10px 40px;
+  font-size: 14px; font-family: inherit; outline: none; transition: all 0.3s;
+}
+.search-box input:focus {
+  border-color: var(--cyan); background: rgba(255,255,255,0.06);
+  box-shadow: 0 0 0 3px rgba(6,214,160,0.1);
+}
+.search-box svg { position: absolute; left: 14px; top: 11px; width: 16px; height: 16px; fill: var(--muted); }
+.search-box kbd {
+  position: absolute; right: 12px; top: 9px; font: 11px 'JetBrains Mono', monospace;
+  color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px;
+  background: rgba(255,255,255,0.03);
+}
+.search-results {
+  position: absolute; top: 50px; left: 0; right: 0;
+  background: rgba(15,15,30,0.95); border: 1px solid var(--glass-border);
+  border-radius: 14px; max-height: 50vh; overflow: auto; display: none;
+  z-index: 200; backdrop-filter: blur(30px);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+}
+.search-results.show { display: block; }
+.sr-item {
+  padding: 12px 16px; border-bottom: 1px solid var(--line); cursor: pointer;
+  transition: background 0.2s;
+}
+.sr-item:last-child { border-bottom: none; }
+.sr-item:hover { background: rgba(6,214,160,0.06); }
+.sr-item b { color: var(--ink); font-size: 14px; display: block; }
+.sr-item span { color: var(--muted); font-size: 12px; }
+.sr-item .sr-tag {
+  display: inline-block; font: 10px 'JetBrains Mono', monospace; color: var(--cyan);
+  border: 1px solid rgba(6,214,160,0.3); border-radius: 5px; padding: 1px 7px; margin-right: 6px;
+}
+
+/* ===== HERO ===== */
+.hero {
+  padding: 100px 0 60px; text-align: center; position: relative; overflow: hidden;
+}
+.hero-grid {
+  position: absolute; inset: 0; opacity: 0.04;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.1) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.1) 1px, transparent 1px);
+  background-size: 60px 60px;
+  mask-image: radial-gradient(ellipse at center, black 30%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 70%);
+}
+.hero h1 {
+  font-size: clamp(40px, 7vw, 80px); font-weight: 900; letter-spacing: -2px;
+  line-height: 1.0; margin-bottom: 24px;
+}
+.hero h1 .line2 {
+  display: block;
+  background: linear-gradient(135deg, var(--cyan), var(--blue), var(--purple), var(--magenta));
+  background-size: 300% 300%;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: gradientShift 6s ease-in-out infinite;
+}
+@keyframes gradientShift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+.hero-sub {
+  color: var(--muted); max-width: 640px; margin: 0 auto 40px; font-size: 18px; line-height: 1.7;
+  font-weight: 400;
+}
+.hero-sub strong { color: var(--ink); font-weight: 600; }
+.hero-pills { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-bottom: 50px; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 18px; border-radius: 999px; font-size: 13px; font-weight: 600;
+  background: rgba(255,255,255,0.04); border: 1px solid var(--glass-border);
+  color: var(--muted); transition: all 0.3s;
+}
+.pill:hover { background: rgba(255,255,255,0.08); color: var(--ink); transform: translateY(-1px); }
+.pill .num { color: var(--cyan); font-family: 'JetBrains Mono', monospace; }
+
+/* 3D stat cards */
+.hero-stats {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+  max-width: 800px; margin: 0 auto;
+}
+.stat-card {
+  padding: 24px 16px; text-align: center;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  transform-style: preserve-3d;
+  perspective: 600px;
+}
+.stat-card:hover {
+  transform: translateY(-4px) rotateX(2deg);
+  border-color: rgba(6,214,160,0.3);
+  box-shadow: 0 12px 40px rgba(6,214,160,0.1);
+}
+.stat-card .stat-num {
+  font-size: 28px; font-weight: 900; letter-spacing: -1px;
+  font-family: 'JetBrains Mono', monospace;
+  background: linear-gradient(135deg, var(--cyan), var(--blue));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.stat-card .stat-label { font-size: 12px; color: var(--muted); margin-top: 4px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* ===== MAIN GRID ===== */
+.main-grid {
+  display: grid; grid-template-columns: 240px 1fr; gap: 40px;
+  align-items: start; padding: 0 0 80px;
+}
+
+/* ===== TOC ===== */
+nav.toc {
+  position: sticky; top: 90px; padding: 8px 0;
+}
+nav.toc .toc-group {
+  color: var(--cyan); font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 1.2px; margin: 24px 0 8px; padding-left: 16px;
+}
+nav.toc .toc-group:first-child { margin-top: 0; }
+nav.toc a {
+  display: block; color: var(--muted); font-size: 13px; font-weight: 500;
+  padding: 7px 16px; border-radius: 10px; border-left: 2px solid transparent;
+  transition: all 0.25s; text-decoration: none;
+}
+nav.toc a:hover { color: var(--ink); background: rgba(255,255,255,0.03); }
+nav.toc a.active {
+  color: var(--ink); border-left-color: var(--cyan);
+  background: rgba(6,214,160,0.05);
+}
+
+/* ===== SECTIONS ===== */
+section.doc {
+  padding: 48px 0; border-top: 1px solid var(--line);
+}
+section.doc:first-child { border-top: none; }
+section.doc h2 {
+  font-size: 32px; font-weight: 800; letter-spacing: -0.8px;
+  margin-bottom: 16px; scroll-margin-top: 90px;
+}
+section.doc h3 {
+  font-size: 18px; font-weight: 700; margin: 28px 0 12px; color: var(--ink);
+}
+section.doc p { color: #9ca3af; margin: 12px 0; line-height: 1.8; }
+section.doc p strong { color: var(--ink); font-weight: 600; }
+section.doc ul, section.doc ol { color: #9ca3af; margin: 12px 0 12px 20px; }
+section.doc li { margin: 8px 0; line-height: 1.7; }
+section.doc li strong { color: var(--ink); }
+
+a { color: var(--cyan); text-decoration: none; transition: color 0.2s; }
+a:hover { color: #34d399; }
+
+code {
+  font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  background: rgba(6,214,160,0.08); border: 1px solid rgba(6,214,160,0.15);
+  border-radius: 6px; padding: 2px 8px; color: #6ee7b7;
+}
+pre {
+  background: rgba(0,0,0,0.4); border: 1px solid var(--glass-border);
+  border-radius: 16px; padding: 20px; overflow: auto;
+  font: 13px/1.6 'JetBrains Mono', monospace; color: #d1fae5;
+  margin: 16px 0; backdrop-filter: blur(10px);
+  box-shadow: inset 0 2px 10px rgba(0,0,0,0.3);
+}
+pre code { background: none; border: none; padding: 0; color: inherit; font-size: inherit; }
+
+/* Glass callout */
+.callout {
+  background: rgba(6,214,160,0.04);
+  border: 1px solid rgba(6,214,160,0.15);
+  border-left: 3px solid var(--cyan);
+  border-radius: 14px; padding: 18px 22px; margin: 18px 0;
+  color: #9ca3af; backdrop-filter: blur(10px);
+}
+.callout strong { color: var(--ink); }
+.callout.warn {
+  background: rgba(255,209,102,0.04);
+  border-color: rgba(255,209,102,0.15);
+  border-left-color: var(--gold);
+}
+.callout.danger {
+  background: rgba(239,71,111,0.04);
+  border-color: rgba(239,71,111,0.15);
+  border-left-color: var(--magenta);
+}
+
+/* ===== TABLES ===== */
+.table-wrap { overflow-x: auto; margin: 16px 0; border-radius: 14px; border: 1px solid var(--glass-border); }
+table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+th, td {
+  padding: 12px 16px; text-align: center; border-bottom: 1px solid var(--line);
+}
+th {
+  background: rgba(255,255,255,0.03); color: var(--ink); font-weight: 700;
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+  position: sticky; top: 0;
+}
+td:first-child, th:first-child { text-align: left; color: var(--muted); font-weight: 500; }
+td.hl {
+  background: rgba(6,214,160,0.06); color: var(--cyan); font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+}
+tr:hover td { background: rgba(255,255,255,0.02); }
+
+/* Tags */
+.tag {
+  display: inline-block; font: 10px 'JetBrains Mono', monospace; padding: 3px 10px;
+  border-radius: 6px; font-weight: 600; margin-right: 6px;
+}
+.tag-green { background: rgba(6,214,160,0.12); color: var(--cyan); border: 1px solid rgba(6,214,160,0.25); }
+.tag-pink { background: rgba(239,71,111,0.12); color: var(--magenta); border: 1px solid rgba(239,71,111,0.25); }
+.tag-blue { background: rgba(17,138,178,0.12); color: #38bdf8; border: 1px solid rgba(17,138,178,0.25); }
+.tag-purple { background: rgba(123,47,247,0.12); color: #a78bfa; border: 1px solid rgba(123,47,247,0.25); }
+
+/* ===== FEATURE CARDS (glass grid) ===== */
+.feat-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px; margin: 20px 0;
+}
+.feat-card {
+  padding: 24px; border-radius: 16px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--glass-border);
+  transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  transform-style: preserve-3d;
+}
+.feat-card:hover {
+  transform: translateY(-4px) rotateX(1deg) rotateY(-1deg);
+  border-color: rgba(6,214,160,0.25);
+  box-shadow: 0 16px 48px rgba(0,0,0,0.3), 0 0 40px rgba(6,214,160,0.05);
+}
+.feat-card .feat-icon {
+  font-size: 28px; margin-bottom: 12px; display: block;
+}
+.feat-card h4 { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+.feat-card p { font-size: 13px; color: var(--muted); line-height: 1.6; margin: 0; }
+
+/* ===== COMPARE TABLE GLASS ===== */
+.compare-scroll { overflow-x: auto; }
+
+/* ===== ROADMAP CHECKLIST ===== */
+.roadmap-list { list-style: none; margin: 0; padding: 0; }
+.roadmap-list li {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px; border-radius: 10px; margin: 4px 0;
+  transition: background 0.2s;
+}
+.roadmap-list li:hover { background: rgba(255,255,255,0.02); }
+.roadmap-list .rm-done {
+  width: 22px; height: 22px; border-radius: 50%;
+  background: rgba(6,214,160,0.12); border: 1.5px solid rgba(6,214,160,0.4);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--cyan); font-size: 12px; flex-shrink: 0;
+}
+.roadmap-list .rm-todo {
+  width: 22px; height: 22px; border-radius: 50%;
+  background: rgba(255,255,255,0.03); border: 1.5px solid var(--glass-border);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 10px; flex-shrink: 0;
+}
+.roadmap-list .rm-text { font-size: 14px; color: #9ca3af; }
+.roadmap-list .rm-text.done { color: var(--ink); }
+.roadmap-list .rm-text .rm-note { color: var(--muted); font-size: 12px; }
+
+/* ===== FOOTER ===== */
+footer {
+  border-top: 1px solid var(--glass-border); padding: 40px 0; text-align: center;
+  color: var(--muted); font-size: 13px; position: relative; z-index: 2;
+  background: rgba(5,5,16,0.5); backdrop-filter: blur(20px);
+}
+footer a { color: var(--cyan); }
+
+/* ===== RESPONSIVE ===== */
+@media (max-width: 900px) {
+  .main-grid { grid-template-columns: 1fr; }
+  nav.toc { display: none; }
+  .hero-stats { grid-template-columns: repeat(2, 1fr); }
+  .scene-3d, .ring-3d { display: none; }
+  .nav-links { display: none; }
+}
+@media (max-width: 600px) {
+  .hero h1 { font-size: 36px; letter-spacing: -1px; }
+  .hero-stats { grid-template-columns: 1fr 1fr; }
+  .feat-grid { grid-template-columns: 1fr; }
+}
+
+/* ===== SCROLL ANIMATIONS ===== */
+.fade-up {
+  opacity: 0; transform: translateY(30px);
+  transition: opacity 0.7s ease, transform 0.7s ease;
+}
+.fade-up.visible { opacity: 1; transform: translateY(0); }
 </style>
 </head>
 <body>
 
-<header class="hd">
+<!-- Animated Background -->
+<div class="bg-canvas">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+</div>
+
+<!-- 3D Floating Particles -->
+<div class="particles" id="particles"></div>
+
+<!-- Header -->
+<header>
   <div class="wrap">
     <div class="brand">
       <img src="assets/logo.svg" alt="logo" onerror="this.style.display='none'"/>
-      <span>DB·Strike <small style="color:var(--muted);font-weight:600">Docs</small></span>
+      <span>StrikeDB <small>Docs</small></span>
     </div>
-    <div class="search">
+    <div class="nav-links">
+      <a href="#intro">Overview</a>
+      <a href="#install">Quick Start</a>
+      <a href="#memory">AI Memory</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#roadmap">Roadmap</a>
+    </div>
+    <div class="search-box">
       <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg>
-      <input id="q" placeholder="Search the docs (real-time)…" autocomplete="off" />
+      <input id="q" placeholder="Search docs..." autocomplete="off" />
       <kbd>/</kbd>
-      <div id="results" class="results"></div>
+      <div id="results" class="search-results"></div>
     </div>
   </div>
 </header>
 
-<div class="hero wrap">
-  <h1>One engine. <span class="grad">Every data model.</span></h1>
-  <p class="sub">StrikeDB is a single unified data engine where KV, vectors, time-series, pub/sub,
-    AI agent memory, and RAG are <i>views over one storage substrate</i> — not five bolted systems.</p>
-  <div>
-    <span class="pill">⚡ p99 PING 21µs</span>
-    <span class="pill">🧠 lineage-native memory</span>
-    <span class="pill">🔍 MITM cache debugger</span>
-    <span class="pill">📦 zero external crates</span>
-    <span class="pill">⚖️ Apache-2.0</span>
-  </div>
-</div>
+<!-- Hero -->
+<div class="content-wrap">
+<section class="hero wrap">
+  <div class="hero-grid"></div>
 
-<div class="wrap"><div class="grid">
+  <!-- 3D Rotating Cube -->
+  <div class="scene-3d">
+    <div class="cube-wrapper">
+      <div class="cube-face">SET</div>
+      <div class="cube-face">GET</div>
+      <div class="cube-face">VADD</div>
+      <div class="cube-face">MEM</div>
+      <div class="cube-face">RAG</div>
+      <div class="cube-face">TS</div>
+    </div>
+  </div>
+
+  <!-- 3D Spinning Ring -->
+  <div class="ring-3d">
+    <div class="torus"></div>
+  </div>
+
+  <h1>
+    One engine.
+    <span class="line2">Every data model.</span>
+  </h1>
+  <p class="hero-sub">
+    <strong>StrikeDB</strong> unifies KV, vectors, time-series, pub/sub, AI agent memory, and RAG
+    into <strong>one storage substrate</strong>. No bolt-ons. No drift. No five licenses.
+  </p>
+  <div class="hero-pills">
+    <span class="pill"><span class="num">17M</span> durable SET/s</span>
+    <span class="pill"><span class="num">7</span> memory primitives</span>
+    <span class="pill"><span class="num">0</span> external crates</span>
+    <span class="pill"><span class="num">69</span> p50 vector search</span>
+    <span class="pill">Apache-2.0</span>
+  </div>
+  <div class="hero-stats">
+    <div class="stat-card glass">
+      <div class="stat-num">5.88M</div>
+      <div class="stat-label">SET ops/s</div>
+    </div>
+    <div class="stat-card glass">
+      <div class="stat-num">45.5</div>
+      <div class="stat-label">REDUCE p99 us</div>
+    </div>
+    <div class="stat-card glass">
+      <div class="stat-num">0</div>
+      <div class="stat-label">Lost under SIGKILL</div>
+    </div>
+    <div class="stat-card glass">
+      <div class="stat-num">31</div>
+      <div class="stat-label">PUB->SUB p50 us</div>
+    </div>
+  </div>
+</section>
+
+<!-- Main Content -->
+<section class="wrap">
+<div class="main-grid">
   <nav class="toc" id="toc">
-    <div class="grp">Start</div>
+    <div class="toc-group">Start</div>
     <a href="#intro">Introduction</a>
-    <a href="#install">Install & Run</a>
-    <a href="#wire">The RESP wire</a>
-    <div class="grp">Engine</div>
-    <a href="#substrate">Unified substrate</a>
-    <a href="#views">Views: KV/Table/Vector/TS</a>
-    <a href="#reducers">Fuel-metered reducers</a>
-    <a href="#reactive">Reactive & CDC</a>
-    <div class="grp">AI</div>
-    <a href="#memory">Agent memory</a>
-    <a href="#rag">RAG as a query</a>
-    <a href="#mitm">MITM cache debugger</a>
-    <div class="grp">Ops</div>
+    <a href="#install">Quick Start</a>
+    <a href="#wire">RESP Wire</a>
+    <div class="toc-group">Engine</div>
+    <a href="#substrate">Unified Substrate</a>
+    <a href="#views">Views: KV / Vec / TS</a>
+    <a href="#speed">Speed of Light</a>
+    <a href="#reducers">Fuel-Metered Reducers</a>
+    <a href="#reactive">SUBSCRIBE / PUBLISH</a>
+    <div class="toc-group">AI</div>
+    <a href="#memory">Agent Memory</a>
+    <a href="#rag">RAG as a Query</a>
+    <a href="#mitm">MITM Cache Debugger</a>
+    <div class="toc-group">Ops</div>
     <a href="#benchmarks">Benchmarks</a>
-    <a href="#demos">Example apps</a>
-    <a href="#compare">Market comparison</a>
+    <a href="#demos">Live Demos</a>
+    <a href="#compare">Market Map</a>
     <a href="#roadmap">Roadmap</a>
   </nav>
 
   <main>
-    <section class="doc" id="intro">
-      <h2>Introduction</h2>
-      <p>Every existing system treats its "modern" capability as a bolt-on owned by someone else, on a
-        different license and release cadence. StrikeDB's design philosophy is the opposite: it's a
-        general-purpose data engine where relational, KV, vector, time-series, and pub/sub are all
-        <b>views over one storage substrate</b>. AI/RAG is one first-class citizen among several, not the
-        organizing principle.</p>
-      <div class="callout good"><b>Combined-Apple approach:</b> take each category leader's <i>advantage</i>
-        (Redis' speed, Postgres' relational rigor, Milvus' scale, Mem0's memory, SpacetimeDB's in-DB
-        logic) and fulfill the <i>database gaps</i> with novel in-house approaches — one license, one
-        consistency model.</div>
-      <p>The engine is <b>pure Rust, zero external crates</b>. The storage layer, HNSW vector index,
-        agent memory, RAG pipeline, MITM cache debugger, reducers, RESP wire, reactive CDC, and HLC/CRDT
-        consensus primitives are all implemented from scratch in the standard library.</p>
+
+    <!-- Introduction -->
+    <section class="doc fade-up" id="intro">
+      <h2>Why StrikeDB exists</h2>
+      <p>Every "modern" database treats its best feature as a bolt-on owned by someone else —
+        different license, different release cadence, different place for drift to hide.
+        <strong>StrikeDB is the opposite.</strong></p>
+      <p>Relational tables, key-value, vectors, time-series, pub/sub, AI agent memory, and RAG
+        are all <strong>views over one storage substrate</strong>. One engine. One consistency model.
+        One license. Zero gaps.</p>
+      <div class="callout">
+        <strong>The Combined-Apple approach:</strong> take each category leader's <em>advantage</em>
+        (Redis' speed, Postgres' rigor, Milvus' scale, Mem0's memory, SpacetimeDB's in-DB logic)
+        and close the gaps with novel in-house engineering.
+      </div>
+      <p>Built in <strong>pure Rust with zero external crates</strong>. Every line — storage, HNSW,
+        agent memory, RAG, MITM debugger, reducers, RESP wire, CDC, HLC, CRDTs — is hand-rolled
+        in the standard library.</p>
     </section>
 
-    <section class="doc" id="install">
-      <h2>Install & Run</h2>
-      <pre><code># build the release binary (no external crates)
+    <!-- Quick Start -->
+    <section class="doc fade-up" id="install">
+      <h2>Quick Start</h2>
+      <pre><code># build — zero deps, pure stdlib Rust
 cargo build --release
 
-# serve the RESP wire on 127.0.0.1:6380
+# launch on the RESP wire
 DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380</code></pre>
-      <p>Talk to it with any Redis client, plain <code>nc</code>, or the bundled harness:</p>
+      <p>Use any Redis client, <code>nc</code>, or the bundled harnesses:</p>
       <pre><code>redis-cli -p 6380 PING            # -> PONG
 redis-cli -p 6380 SET user:1 ada
 redis-cli -p 6380 VADD 1 1.0 0.0 0.0
 redis-cli -p 6380 VSEARCH 5 1.0 0.0 0.0
+redis-cli -p 6380 SUBSCRIBE trades &
+redis-cli -p 6380 PUBLISH trades "hello"
+redis-cli -p 6380 CHECKPOINT       # snapshot + WAL truncate
 
-# full production test + benchmark suite (self-spawns the binary)
+# native Rust bench — 18 sections, in-process
+cargo run --release -p bench
+
+# wire-level pub/sub check
+./target/release/dbstrike-bench --tcp 127.0.0.1:6380
+
+# Python integration + fuzz + crash recovery
 python3 tests/test_dbstrike.py</code></pre>
-      <div class="callout">The suite runs 8 groups — correctness, AI/vectors, time-series, reducers, CDC,
-        latency, throughput, and a real-time agent-memory scenario — and reports p50/p90/p99 latency and
-        ops/sec. Exit code 0 = all green.</div>
-    </section>
-
-    <section class="doc" id="wire">
-      <h2>The RESP wire</h2>
-      <p>StrikeDB speaks the Redis <b>RESP</b> protocol, so any Redis client works unchanged. A
-        PG-wire and gRPC shim are on the roadmap. Commands are case-insensitive.</p>
-      <table>
-        <tr><th>Command</th><th>Args</th><th>Returns</th></tr>
-        <tr><td><code>PING</code></td><td>—</td><td><code>PONG</code></td></tr>
-        <tr><td><code>SET/GET/DEL</code></td><td>key [value]</td><td>OK / bulk / nil / 0·1</td></tr>
-        <tr><td><code>INCR / INCRBY</code></td><td>key [n]</td><td>new integer</td></tr>
-        <tr><td><code>KEYS</code></td><td>prefix</td><td>array of matching keys</td></tr>
-        <tr><td><code>VADD</code></td><td>id f1 f2 …</td><td>OK</td></tr>
-        <tr><td><code>VSEARCH</code></td><td>k f1 f2 …</td><td>id/dist pairs (k-NN)</td></tr>
-        <tr><td><code>TSADD / TSRANGE</code></td><td>series ts val / series from to</td><td>OK / ts·val pairs</td></tr>
-        <tr><td><code>REDUCE</code></td><td>name shardkey key by</td><td>new counter value</td></tr>
-        <tr><td><code>CDCLEN</code></td><td>—</td><td>change-log length</td></tr>
-        <tr><td><code>MEM.REMEMBER</code></td><td>text source salience f1 f2 …</td><td>:id</td></tr>
-        <tr><td><code>MEM.RECALL</code></td><td>k query f1 f2 …</td><td>id/score/source/text</td></tr>
-        <tr><td><code>MEM.FORGET</code></td><td>id</td><td>OK</td></tr>
-        <tr><td><code>RAG.INGEST</code></td><td>text source f1 f2 …</td><td>:id</td></tr>
-        <tr><td><code>RAG.SEARCH</code></td><td>k query f1 f2 …</td><td>cached/fresh + hits</td></tr>
-        <tr><td><code>CACHE.*</code></td><td>see debugger</td><td>verdict / report</td></tr>
-      </table>
-    </section>
-
-    <section class="doc" id="substrate">
-      <h2>Unified substrate</h2>
-      <p>At the core is an <b>MVCC + WAL</b> engine. Every key maps to a version chain ordered by commit
-        timestamp. Readers take a snapshot and see the newest version ≤ snapshot; writers buffer in a
-        transaction and commit atomically — the WAL record is fsynced <i>first</i>, then the in-memory
-        version chains update. This gives snapshot isolation and crash recovery by replay.</p>
-      <div class="callout"><b>Tables, KV, vectors, time-series, and the CDC log are key conventions over this one
-        substrate.</b> There is no second engine to drift from, no dual-write, no separate consistency model.</div>
-      <p>Transactions use <b>optimistic concurrency control</b>: a commit aborts (with a clean rollback)
-        if any key it read was modified after its snapshot. See <code>crates/storage</code>.</p>
-    </section>
-
-    <section class="doc" id="views">
-      <h2>Views: KV / Table / Vector / Time-series</h2>
-      <p>All four are thin schemas over the substrate:</p>
-      <ul>
-        <li><b>KV</b> — opaque byte values, TTL-capable, prefix scans.</li>
-        <li><b>Tables</b> — rows addressed by string PK, columns as a small map. The router joins these with vectors.</li>
-        <li><b>Vector (HNSW)</b> — cosine-distance ANN index rebuilt from durable <code>vec:</code> keys on
-          open. Filtered search (post-filter over a widened candidate set) supports the planner's
-          selectivity decisions.</li>
-        <li><b>Time-series</b> — append-only <code>(series, ts, val)</code>, inclusive range queries.</li>
-      </ul>
-      <p><b>Filtered ANN planner.</b> pgvector's specific gap is that the planner doesn't treat vector
-        distance as a cost-aware operator, so filtered similarity search is bolted on. StrikeDB's router
-        estimates predicate selectivity and chooses <code>PreFilter</code> (filter-then-scan, for very
-        selective predicates ≤5%) vs <code>PostFilter</code> (index-then-filter). One query does
-        <i>"10 most similar tickets, only paying customers, still open"</i> under one plan and one snapshot.</p>
-    </section>
-
-    <section class="doc" id="reducers">
-      <h2>Fuel-metered reducers</h2>
-      <p>Following SpacetimeDB's "logic in the database" idea — but fixing its <b>reducer-stall problem</b>:
-        every reducer ran in one global critical section, so a single bad reducer degraded the whole DB.
-        Three in-house fixes:</p>
-      <ol>
-        <li><span class="tag fix">fix</span><b>Bulkhead by shard</b> — a reducer locks only its key-range, not the world.</li>
-        <li><span class="tag fix">fix</span><b>Fuel metering</b> — every instruction is charged against a per-reducer
-          budget via a tiny stack VM; overrun aborts and rolls back cleanly.</li>
-        <li><span class="tag fix">fix</span><b>Circuit breaker</b> — a reducer erroring above a threshold is
-          auto-quarantined until manually re-enabled.</li>
-      </ol>
-      <pre><code># a fuel-metered counter reducer (invoked over a shard)
-REDUCE hit shardA kv:hits 5    # -> 5
-REDUCE hit shardA kv:hits 5    # -> 10
-REDUCE hit shardA kv:hits 3    # -> 13</code></pre>
-      <div class="callout good">Under 16-way contention the reducer loses <b>zero</b> updates (the bulkhead
-        serializes the shard, not the engine). p99 = 38.8µs.</div>
-    </section>
-
-    <section class="doc" id="reactive">
-      <h2>Reactive sync & CDC</h2>
-      <p>The engine's commit hook feeds a <b>reactive hub</b> that routes committed mutations to topic
-        subscribers by key prefix, and keeps a durable change-data-capture log. Subscribers see committed
-        changes <i>after</i> they're durable — decoupled from the write path (they may lag the strictest
-        snapshot, the deliberate availability trade from the architecture).</p>
-      <pre><code>CDCLEN                  # length of the change-log
-# subscribe (in a client) to prefix "kv:user" → only matching commits arrive</code></pre>
-    </section>
-
-    <section class="doc" id="memory">
-      <h2>AI agent memory</h2>
-      <p>Four memory structures on the same substrate, with <b>provenance / lineage</b> as a first-class
-        primitive — the non-malleable-authority hardening 2026 agent-memory research (MemLineage,
-        poisoning defenses) demands and Mem0 / Zep / Letta don't ship.</p>
-      <ul>
-        <li><span class="tag feat">WM</span><b>Working memory (STM)</b> — hot per-agent context, TTL-cleared, Redis speed, same rows the durable engine sees.</li>
-        <li><span class="tag feat">LTM</span><b>Long-term memory</b> — durable semantic store, pushed into the shared HNSW for one-hop recall. Lineage-attached (source, created_ts, salience, derivation chain).</li>
-        <li><span class="tag feat">EP</span><b>Episodic</b> — append-only event log, queryable by agent + kind.</li>
-        <li><span class="tag feat">KW</span><b>Keyword index</b> — BM25-ish inverted index for exact-term recall that pure-vector memory misses.</li>
-      </ul>
-      <p>Recall is <b>blended semantic + keyword</b>, ranked by a salience-weighted score so important
-        memories surface. This is what's built to beat Mem0 (26% accuracy lift on LoCoMo) and Zep/Letta.</p>
-      <pre><code># remember (source + salience + embedding)
-MEM.REMEMBER "user prefers Rust for speed" user 0.9 1.0 0.2 0.0
-# recall blended by similarity + keyword + salience
-MEM.RECALL 5 "rust speed preference" 1.0 0.2 0.0</code></pre>
-    </section>
-
-    <section class="doc" id="rag">
-      <h2>RAG as a first-class query</h2>
-      <p>Retrieval is <b>hybrid</b>: dense (HNSW ANN) + sparse (BM25 keyword), fused with
-        <b>Reciprocal Rank Fusion</b> — the technique that consistently beats either signal alone — plus a
-        lightweight lexical rerank. The RAG engine wraps agent memory and a MITM-guarded query cache.</p>
-      <pre><code>RAG.INGEST "Rust ownership prevents data races" doc:rust 1.0 0.0 0.0
-RAG.SEARCH 5 "nearest neighbor graph index" 1.0 0.0 0.0
-# -> cached/fresh flag + (id, score, source, text) hits</code></pre>
-      <div class="callout good"><b>Corpus cache is safe:</b> every ingest bumps a monotonic corpus generation.
-        A changed corpus can never serve a stale answer — the cache key includes the generation, and the
-        MITM debugger records the source write.</div>
-    </section>
-
-    <section class="doc" id="mitm">
-      <h2>MITM cache debugger</h2>
-      <p>"Your vector index is a cache with no invalidation strategy." StrikeDB solves that at the engine
-        level: a man-in-the-middle observer sits between any cache and the source-of-truth, stamping every
-        entry with the authoritative engine version. On each read it classifies the outcome:</p>
-      <table>
-        <tr><th>Verdict</th><th>Meaning</th></tr>
-        <tr><td><code>HIT</code></td><td>cache value == engine value (fresh)</td></tr>
-        <tr><td><code class="us">STALE_HIT</code></td><td>cache value != engine value — <b>THE bug</b></td></tr>
-        <tr><td><code>MISS</code></td><td>key absent from cache</td></tr>
-        <tr><td><code class="us">PHANTOM</code></td><td>cached but engine has no value (missed invalidation)</td></tr>
-      </table>
-      <p>Every event is time-stamped into a ring buffer you can dump, diff, and replay — <b>provable
-        per-key staleness with the exact version delta</b>, no guessing.</p>
-      <pre><code>CACHE.SRCSET user:1 alice        # authoritative write (bumps version)
-CACHE.SET   user:1 alice        # populate cache
-CACHE.GET   user:1               # -> HIT
-CACHE.SRCSET user:1 alice-v2    # source updated, cache NOT invalidated
-CACHE.GET   user:1               # -> STALE_HIT  (caught instantly)
-CACHE.BUGS                      # list every bug trace</code></pre>
-    </section>
-
-    <section class="doc" id="benchmarks">
-      <h2>Benchmarks</h2>
-      <p>Measured by the bundled production harness (<a href="../tests/test_dbstrike.py"><code>tests/test_dbstrike.py</code></a>, 96 checks)
-        against the release binary, single connection, warm. Lower is better.
-        Full verified numbers, including 50k-scale vectors and concurrency scaling, are in
-        <a href="../BENCHMARKS.md"><code>BENCHMARKS.md</code></a>. Runnable example apps live in
-        <a href="../demos/README.md"><code>demos/</code></a>.</p>
-      <table>
-        <tr><th>Operation</th><th>p50</th><th>p90</th><th>p99</th><th>max</th></tr>
-        <tr><td>PING</td><td>13.4µs</td><td>13.7µs</td><td>18.3µs</td><td>32.3µs</td></tr>
-        <tr><td>SET</td><td>24.0µs</td><td>27.8µs</td><td>36.5µs</td><td>600µs</td></tr>
-        <tr><td>GET</td><td>14.2µs</td><td>16.7µs</td><td>20.1µs</td><td>40.8µs</td></tr>
-        <tr><td>VSEARCH k=10 (8-d)</td><td>16.0µs</td><td>16.1µs</td><td>18.5µs</td><td>26.2µs</td></tr>
-        <tr><td>VSEARCH k=10 (768-d)</td><td>530µs</td><td>622µs</td><td>728µs</td><td>816µs</td></tr>
-        <tr><td>REDUCE</td><td>24.1µs</td><td>24.8µs</td><td>29.0µs</td><td>58.7µs</td></tr>
-        <tr><td class="us">Agent turn (3 ops)</td><td class="us">78.9µs</td><td class="us">89.9µs</td><td class="us">120.6µs</td><td>270µs</td></tr>
-      </table>
-      <table>
-        <tr><th>Metric</th><th>Value</th></tr>
-        <tr><td>Single-connection SET</td><td>39,318 ops/s</td></tr>
-        <tr><td>8-connection SET peak</td><td>96,249 ops/s</td></tr>
-        <tr><td>64-connection SET</td><td>87,497 ops/s (2.23× single-conn)</td></tr>
-        <tr><td>50k × 128-d HNSW recall</td><td>1.00 Recall@10 vs brute-force</td></tr>
-        <tr><td>Unit + integration tests</td><td>140 passing, 0 failing (44 rust + 96 integration)</td></tr>
-      </table>
-    </section>
-
-    <section class="doc" id="demos">
-      <h2>Example apps</h2>
-      <p>Three runnable apps in <a href="../demos/README.md"><code>demos/</code></a> use StrikeDB as a
-        real backend over the RESP wire — no mocks. Run them with
-        <code>bash demos/run_demos.sh</code> (builds if needed, starts the server, runs all three).</p>
-      <ul>
-        <li><a href="../demos/agent_memory_demo.py"><code>agent_memory_demo.py</code></a> — an AI agent
-          ("Atlas") with persistent <b>working + long-term + graph + bi-temporal + procedural</b> memory in one engine.</li>
-        <li><a href="../demos/realtime_dashboard_demo.py"><code>realtime_dashboard_demo.py</code></a> —
-          time-series ingest from 8 simulated devices, a live window read, pub/sub fan-out, and
-          WAL-backed crash replay.</li>
-        <li><a href="../demos/rag_demo.py"><code>rag_demo.py</code></a> — hybrid RAG (dense + sparse,
-          RRF-fused) with the MITM cache debugger proving a stale corpus can never be served.</li>
-      </ul>
-    </section>
-
-    <section class="doc" id="compare">
-      <h2>Market comparison</h2>
-      <p>The combined-Apple approach — each leader's advantage, the gaps closed in-house.</p>
-      <div style="overflow-x:auto">
-      <table>
-        <tr><th>Capability</th><th>Redis</th><th>pgvector</th><th>Milvus</th><th>Mem0</th><th>SpacetimeDB</th><th>StrikeDB</th></tr>
-        <tr><td>KV / counters</td><td>✅</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td><td class="us">✅</td></tr>
-        <tr><td>Relational</td><td>❌</td><td>✅</td><td>❌</td><td>❌</td><td>✅</td><td class="us">✅</td></tr>
-        <tr><td>Vector / ANN</td><td>❌</td><td>⚠️</td><td>✅</td><td>⚠️</td><td>❌</td><td class="us">✅</td></tr>
-        <tr><td>RAG as a query</td><td>❌</td><td>❌</td><td>⚠️</td><td>❌</td><td>❌</td><td class="us">✅</td></tr>
-        <tr><td>AI agent memory</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td><td>❌</td><td class="us">✅</td></tr>
-        <tr><td>MITM cache debug</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td class="us">✅</td></tr>
-        <tr><td>In-DB logic</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td><td class="us">✅</td></tr>
-        <tr><td>One license</td><td>n/a</td><td>PostgreSQL</td><td>✅</td><td>MIT</td><td>✅</td><td class="us">Apache-2.0</td></tr>
-      </table>
+      <div class="callout">
+        <strong>Env knobs:</strong> <code>DBSTRIKE_WAL=&lt;path&gt;</code> for WAL location (default: <code>dbstrike.wal</code>).
+        <code>DBSTRIKE_SYNC=0</code> skips the WAL entirely — writes apply directly to sharded maps,
+        no fsync, no flusher round-trip. Reads still see the write (same process), but crash
+        durability is dropped. Default is durable (fsync every batch). Great for sessions,
+        presence, caches, and test rigs.
       </div>
     </section>
 
-    <section class="doc" id="roadmap">
+    <!-- RESP Wire -->
+    <section class="doc fade-up" id="wire">
+      <h2>The RESP Wire</h2>
+      <p>Speaks Redis <strong>RESP</strong> — any Redis client works unchanged.
+        40+ commands, case-insensitive, both array and inline forms.</p>
+
+      <h3>KV & General</h3>
+      <div class="table-wrap"><table>
+        <tr><th>Command</th><th>Args</th><th>Returns</th></tr>
+        <tr><td><code>PING</code></td><td>—</td><td><code>PONG</code></td></tr>
+        <tr><td><code>SET / GET / DEL</code></td><td>key [value]</td><td>OK / bulk / nil</td></tr>
+        <tr><td><code>MSET / MGET</code></td><td>k v [k v...] / k [k...]</td><td>OK / array</td></tr>
+        <tr><td><code>INCR / INCRBY</code></td><td>key [n]</td><td>new integer</td></tr>
+        <tr><td><code>KEYS / DBSIZE</code></td><td>prefix / —</td><td>array / count</td></tr>
+        <tr><td><code>SELECT / COMMAND</code></td><td>—</td><td>OK (no-op compat)</td></tr>
+        <tr><td><code>FLUSHALL / FLUSHDB</code></td><td>—</td><td>OK (no-op compat)</td></tr>
+        <tr><td><code>QUIT</code></td><td>—</td><td>closes connection</td></tr>
+      </table></div>
+
+      <h3>Vector, Time-series, Compute</h3>
+      <div class="table-wrap"><table>
+        <tr><th>Command</th><th>Args</th><th>Returns</th></tr>
+        <tr><td><code>VADD</code></td><td>id f1 f2...</td><td>OK</td></tr>
+        <tr><td><code>VSEARCH</code></td><td>k f1 f2...</td><td>id/dist pairs (k-NN)</td></tr>
+        <tr><td><code>VSEARCH.MANY</code></td><td>k dim q1...qN...</td><td>batched k-NN</td></tr>
+        <tr><td><code>TSADD</code></td><td>series ts val</td><td>OK</td></tr>
+        <tr><td><code>TSRANGE</code></td><td>series from to</td><td>ts/val pairs</td></tr>
+        <tr><td><code>TSRANGE.LATEST</code></td><td>series n</td><td>last n points</td></tr>
+        <tr><td><code>REDUCE</code></td><td>name shardkey key by</td><td>new value</td></tr>
+        <tr><td><code>CHECKPOINT</code></td><td>—</td><td>snapshot + WAL truncate</td></tr>
+      </table></div>
+
+      <h3>Pub/Sub & Agent Memory</h3>
+      <div class="table-wrap"><table>
+        <tr><th>Command</th><th>Args</th><th>Returns</th></tr>
+        <tr><td><code>SUBSCRIBE / PSUBSCRIBE</code></td><td>ch [ch...]</td><td>real-time stream</td></tr>
+        <tr><td><code>PUBLISH</code></td><td>ch msg</td><td>subscriber count</td></tr>
+        <tr><td><code>MEM.REMEMBER</code></td><td>text source sal f1...</td><td>:id</td></tr>
+        <tr><td><code>MEM.RECALL</code></td><td>k query f1...</td><td>id/score/text</td></tr>
+        <tr><td><code>MEM.LINK / MEM.UNLINK</code></td><td>from to rel [weight]</td><td>OK</td></tr>
+        <tr><td><code>MEM.NEIGH / MEM.TRAV</code></td><td>from [rel] / start depth</td><td>neighbors / traversal</td></tr>
+        <tr><td><code>MEM.REMEMBER.T</code></td><td>text source sal vf vt f1...</td><td>:id (bi-temporal)</td></tr>
+        <tr><td><code>MEM.RECALL.AS_OF</code></td><td>k query as_of f1...</td><td>valid facts</td></tr>
+        <tr><td><code>MEM.PROC.SET / GET / LIST</code></td><td>agent name [body]</td><td>OK / body / array</td></tr>
+      </table></div>
+
+      <h3>RAG & MITM Debugger</h3>
+      <div class="table-wrap"><table>
+        <tr><th>Command</th><th>Args</th><th>Returns</th></tr>
+        <tr><td><code>RAG.INGEST</code></td><td>text source f1...</td><td>:id</td></tr>
+        <tr><td><code>RAG.SEARCH</code></td><td>k query f1...</td><td>cached/fresh + hits</td></tr>
+        <tr><td><code>CACHE.SRCSET / SRCDEL</code></td><td>key value</td><td>version bump</td></tr>
+        <tr><td><code>CACHE.SET / GET</code></td><td>key [value]</td><td>verdict + value</td></tr>
+        <tr><td><code>CACHE.BUGS / TRACES / CLEAR</code></td><td>—</td><td>debug reports</td></tr>
+      </table></div>
+    </section>
+
+    <!-- Unified Substrate -->
+    <section class="doc fade-up" id="substrate">
+      <h2>One substrate to rule them all</h2>
+      <p>At the core: an <strong>MVCC + WAL</strong> engine. Every key maps to a version chain
+        ordered by commit timestamp. Readers snapshot, writers buffer and commit atomically —
+        the WAL is fsynced <em>first</em>, then in-memory chains update.</p>
+      <div class="callout">
+        <strong>Tables, KV, vectors, time-series, and CDC are key conventions over this one substrate.</strong>
+        No second engine to drift from. No dual-write. No separate consistency model.
+      </div>
+      <p><strong>Optimistic concurrency control:</strong> a commit aborts cleanly if any read key
+        was modified after its snapshot. 32 shards (FNV-1a), Redis-style <code>{hash-tag}</code>
+        routing, group-commit flusher — one fsync per batch.</p>
+    </section>
+
+    <!-- Views -->
+    <section class="doc fade-up" id="views">
+      <h2>Views: KV / Table / Vector / Time-series</h2>
+      <div class="feat-grid">
+        <div class="feat-card">
+          <span class="feat-icon">&#9889;</span>
+          <h4>KV</h4>
+          <p>Opaque bytes, TTL, prefix scans. Pipelined SET/MSET coalescing — N writes, ONE fsync.</p>
+        </div>
+        <div class="feat-card">
+          <span class="feat-icon">&#128202;</span>
+          <h4>Tables</h4>
+          <p>Rows by string PK, column map, equality filters. Relational rigor on the same substrate.</p>
+        </div>
+        <div class="feat-card">
+          <span class="feat-icon">&#127919;</span>
+          <h4>Vector (HNSW)</h4>
+          <p>INT8 quantization + f32 rerank. AVX2 SIMD. Filtered ANN, batched queries, ef tuning.</p>
+        </div>
+        <div class="feat-card">
+          <span class="feat-icon">&#128200;</span>
+          <h4>Time-series</h4>
+          <p>Append-only, hash-tagged shards. TSRANGE.LATEST: dashboard primitive at 52us p50.</p>
+        </div>
+      </div>
+      <p><strong>{hash-tag} shard routing:</strong> <code>ts:{cpu}:1234</code> hashes only on <code>cpu</code>,
+        co-locating all points in ONE shard. TSRANGE skips 31 useless lock acquires.</p>
+      <p><strong>Filtered ANN planner:</strong> cost-based PreFilter vs PostFilter —
+        <em>"10 most similar tickets, only paying customers, still open"</em> under one plan.</p>
+    </section>
+
+    <!-- Speed of Light -->
+    <section class="doc fade-up" id="speed">
+      <h2>The "speed of light" path</h2>
+      <p>SpacetimeDB's pitch: logic <em>inside</em> the database eliminates the network hop.
+        StrikeDB does the same — and fixes the one flaw that makes SpacetimeDB dangerous:
+        <strong>the reducer-stall problem</strong>.</p>
+      <div class="callout">
+        <strong>Measured:</strong> <code>REDUCE</code> p99 = <strong>45.5us</strong> over RESP.
+        <strong>Zero lost updates</strong> under 32-thread x 500-op contention (16,000/16,000 in 0.15s).
+      </div>
+    </section>
+
+    <!-- Reducers -->
+    <section class="doc fade-up" id="reducers">
+      <h2>Fuel-metered reducers</h2>
+      <p>Logic in the DB — but <strong>safe</strong>. Three in-house fixes for the SpacetimeDB stall:</p>
+      <ol>
+        <li><span class="tag tag-pink">fix</span> <strong>Bulkhead by shard</strong> — a reducer locks only its key-range, not the world.</li>
+        <li><span class="tag tag-pink">fix</span> <strong>Fuel metering</strong> — every instruction charged against a budget. Overrun = clean rollback.</li>
+        <li><span class="tag tag-pink">fix</span> <strong>Circuit breaker</strong> — erroring reducers auto-quarantined until re-enabled.</li>
+      </ol>
+      <pre><code># fuel-metered counter reducer
+REDUCE hit shardA kv:hits 5    # -> 5
+REDUCE hit shardA kv:hits 5    # -> 10
+REDUCE hit shardA kv:hits 3    # -> 13</code></pre>
+    </section>
+
+    <!-- Reactive / Pub-Sub -->
+    <section class="doc fade-up" id="reactive">
+      <h2>Reactive sync & SUBSCRIBE/PUBLISH</h2>
+      <p>Commit hook feeds a <strong>reactive hub</strong> — mutations route to subscribers by
+        key prefix, durable CDC log underneath.</p>
+      <p><strong>Redis-compatible pub/sub over the wire.</strong> PUBLISH is a <em>durable</em> write
+        on <code>chan:&lt;name&gt;</code> — every subscriber receives via the same MVCC+WAL substrate.</p>
+      <pre><code># terminal A
+redis-cli -p 6380 SUBSCRIBE trades
+
+# terminal B
+redis-cli -p 6380 PUBLISH trades "AAPL 42"
+# -> 1) "message"  2) "trades"  3) "AAPL 42"</code></pre>
+      <div class="callout">
+        Round-trip PUBLISH->SUBSCRIBE: <strong>p50 = 31us</strong>, p99 = 120us over the wire.
+      </div>
+    </section>
+
+    <!-- Memory -->
+    <section class="doc fade-up" id="memory">
+      <h2>AI agent memory</h2>
+      <p>Every category leader's core primitive, <strong>on one substrate, in one process</strong>.
+        Seven memory structures with provenance/lineage as a first-class primitive.</p>
+      <div class="feat-grid">
+        <div class="feat-card">
+          <span class="tag tag-green">WM</span>
+          <h4>Working Memory</h4>
+          <p>Hot per-agent context, TTL-cleared. Redis speed on the durable engine.</p>
+        </div>
+        <div class="feat-card">
+          <span class="tag tag-green">LTM</span>
+          <h4>Long-Term Memory</h4>
+          <p>Durable semantic store in HNSW. Lineage-attached: source, salience, derivation chain.</p>
+        </div>
+        <div class="feat-card">
+          <span class="tag tag-green">EP</span>
+          <h4>Episodic</h4>
+          <p>Append-only event log. Queryable by agent + kind. The event timeline.</p>
+        </div>
+        <div class="feat-card">
+          <span class="tag tag-green">KW</span>
+          <h4>Keyword Index</h4>
+          <p>BM25 inverted index. Exact-term recall that pure-vector memory misses.</p>
+        </div>
+        <div class="feat-card">
+          <span class="tag tag-blue">GRAPH</span>
+          <h4>Graph Memory</h4>
+          <p>Typed edges, forward + reverse index. MEM.LINK / NEIGH / TRAV for BFS traversal.</p>
+        </div>
+        <div class="feat-card">
+          <span class="tag tag-purple">BITEMP</span>
+          <h4>Bi-temporal Facts</h4>
+          <p>valid_from / valid_to on LTM. RECALL.AS_OF: "what did we know at time T?"</p>
+        </div>
+        <div class="feat-card">
+          <span class="tag tag-blue">PROC</span>
+          <h4>Procedural Memory</h4>
+          <p>Per-agent workflows and rules. Stored by name, retrieved on demand.</p>
+        </div>
+      </div>
+      <p><strong>Blended recall:</strong> semantic ANN + BM25 keyword, ranked by salience-weighted
+        score via in-memory cache. Zero substrate reads during scoring.</p>
+      <pre><code># remember
+MEM.REMEMBER "user prefers Rust for speed" user 0.9 1.0 0.2 0.0
+
+# blended recall
+MEM.RECALL 5 "rust speed preference" 1.0 0.2 0.0
+
+# graph edges
+MEM.LINK alice works_at acme 1.0
+MEM.TRAV alice 3
+
+# bi-temporal
+MEM.REMEMBER.T "CEO of Acme" user 0.8 3000 0 1.0 0.2 0.0
+MEM.RECALL.AS_OF 5 "CEO" 5000 1.0 0.2 0.0</code></pre>
+    </section>
+
+    <!-- RAG -->
+    <section class="doc fade-up" id="rag">
+      <h2>RAG as a first-class query</h2>
+      <p>Hybrid retrieval: <strong>dense (HNSW) + sparse (BM25)</strong>, fused with
+        <strong>Reciprocal Rank Fusion</strong> — the technique that consistently beats either
+        signal alone — plus lexical rerank.</p>
+      <pre><code>RAG.INGEST "Rust ownership prevents data races" doc:rust 1.0 0.0 0.0
+RAG.SEARCH 5 "nearest neighbor graph index" 1.0 0.0 0.0
+# -> cached/fresh flag + (id, score, source, text) hits</code></pre>
+      <div class="callout">
+        <strong>Corpus cache is safe:</strong> every ingest bumps a monotonic generation.
+        Stale answers are structurally impossible.
+      </div>
+    </section>
+
+    <!-- MITM -->
+    <section class="doc fade-up" id="mitm">
+      <h2>MITM cache debugger</h2>
+      <p><em>"Your vector index is a cache with no invalidation strategy."</em>
+        StrikeDB solves that: a man-in-the-middle stamps every cache entry with the
+        authoritative engine version.</p>
+      <div class="table-wrap"><table>
+        <tr><th>Verdict</th><th>Meaning</th></tr>
+        <tr><td><code>HIT</code></td><td>cache == engine (fresh)</td></tr>
+        <tr><td><code class="hl">STALE_HIT</code></td><td>cache != engine — <strong>THE bug</strong></td></tr>
+        <tr><td><code>MISS</code></td><td>absent from cache</td></tr>
+        <tr><td><code class="hl">PHANTOM</code></td><td>cached but engine has nothing (missed invalidation)</td></tr>
+      </table></div>
+      <pre><code>CACHE.SRCSET user:1 alice        # authoritative write
+CACHE.SET   user:1 alice        # populate cache
+CACHE.GET   user:1               # -> HIT
+CACHE.SRCSET user:1 alice-v2    # source updated
+CACHE.GET   user:1               # -> STALE_HIT (caught!)
+CACHE.BUGS                      # every bug trace</code></pre>
+    </section>
+
+    <!-- Benchmarks -->
+    <section class="doc fade-up" id="benchmarks">
+      <h2>Benchmarks</h2>
+      <p>Two harnesses: native Rust bench (18 sections, in-process) and Python integration
+        (21 sections, over RESP). All numbers reproducible.</p>
+
+      <h3>vs Redis 8.x</h3>
+      <p>Measured with <strong>redis-benchmark 8.0.5</strong>, same machine, apples-to-apples.</p>
+      <div class="table-wrap"><table>
+        <tr><th>Op / Pipeline</th><th>-P 64</th><th>-P 256</th><th>-P 1024</th><th>Redis 8 (in-mem)</th><th>Redis 8 (AOF)</th></tr>
+        <tr><td><strong>SET</strong></td><td class="hl">5.88M/s</td><td class="hl">12.1M/s</td><td class="hl">~17M/s</td><td>2.94M/s</td><td>2.30M/s</td></tr>
+        <tr><td><strong>GET</strong></td><td class="hl">5.88M/s</td><td class="hl">13.3M/s</td><td class="hl">~16M/s</td><td>4.17M/s</td><td>6.41M/s</td></tr>
+        <tr><td>MSET (10 keys)</td><td>3.51M/s</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+      </table></div>
+      <p><strong>Latency:</strong> durable SET p99 = <strong>6.6ms</strong> at -P1024 —
+        <strong>~5x lower p99</strong> than Redis AOF everysec while sustaining <strong>~7x throughput</strong>.</p>
+
+      <h3>Over RESP Wire</h3>
+      <div class="table-wrap"><table>
+        <tr><th>Operation</th><th>p50</th><th>p90</th><th>p99</th></tr>
+        <tr><td>PING</td><td>13.5us</td><td>15.1us</td><td>18.2us</td></tr>
+        <tr><td>SET</td><td>22.8us</td><td>26.7us</td><td>37.7us</td></tr>
+        <tr><td>GET</td><td>15.4us</td><td>16.3us</td><td>20.4us</td></tr>
+        <tr><td>REDUCE</td><td>26.8us</td><td>29.6us</td><td>45.5us</td></tr>
+        <tr><td><strong>Agent turn</strong></td><td class="hl">83.0us</td><td class="hl">95.4us</td><td class="hl">124.6us</td></tr>
+      </table></div>
+
+      <h3>Vector Search — 100k x 384d</h3>
+      <div class="table-wrap"><table>
+        <tr><th>ef</th><th>Recall@10</th><th>p50</th><th>p99</th></tr>
+        <tr><td>32</td><td><strong>0.926</strong></td><td class="hl">69us</td><td>143us</td></tr>
+        <tr><td>128</td><td>0.926</td><td>79us</td><td>193us</td></tr>
+        <tr><td>256</td><td>0.926</td><td>108us</td><td>273us</td></tr>
+      </table></div>
+      <p>8-thread concurrent VSEARCH: <strong>79,374 QPS</strong>.</p>
+
+      <h3>1M Vectors (384d)</h3>
+      <div class="table-wrap"><table>
+        <tr><th>Metric</th><th>Value</th></tr>
+        <tr><td>Ingest</td><td>4,780 vec/s</td></tr>
+        <tr><td>VSEARCH p50</td><td>159us</td></tr>
+        <tr><td>Recall@10 vs brute-force</td><td>0.845</td></tr>
+        <tr><td>8-thread QPS</td><td>30,881</td></tr>
+      </table></div>
+
+      <h3>YCSB A / B / C / F</h3>
+      <div class="table-wrap"><table>
+        <tr><th>Workload</th><th>Mix</th><th>Throughput</th></tr>
+        <tr><td>Load</td><td>100% SET</td><td>41,204 ops/s</td></tr>
+        <tr><td><strong>YCSB-A</strong></td><td>50/50 read/update</td><td><strong>52,281 ops/s</strong></td></tr>
+        <tr><td><strong>YCSB-B</strong></td><td>95/5 read/update</td><td><strong>73,011 ops/s</strong></td></tr>
+        <tr><td><strong>YCSB-C</strong></td><td>100% read</td><td><strong>74,648 ops/s</strong></td></tr>
+        <tr><td><strong>YCSB-F</strong></td><td>50/50 read/RMW</td><td><strong>39,068 ops/s</strong></td></tr>
+      </table></div>
+
+      <h3>Jepsen Chaos</h3>
+      <div class="table-wrap"><table>
+        <tr><th>Metric</th><th>Value</th></tr>
+        <tr><td>SIGKILL iterations</td><td>10</td></tr>
+        <tr><td>Acked writes</td><td>64,848</td></tr>
+        <tr><td><strong>Lost after SIGKILL + reopen</strong></td><td class="hl">0</td></tr>
+      </table></div>
+    </section>
+
+    <!-- Demos -->
+    <section class="doc fade-up" id="demos">
+      <h2>Live Demos</h2>
+      <p>Three native Rust CLI apps in <code>crates/demos</code> — proof the primitives compose
+        into real products. Every app has <code>--bench</code> mode with p50/p99 + RSS.</p>
+      <div class="feat-grid">
+        <div class="feat-card">
+          <span class="feat-icon">&#129302;</span>
+          <h4>agent-cli</h4>
+          <p>Interactive AI agent: WM + LTM + graph + bi-temporal + procedural memory. REMEMBER 170us, RECALL 311us.</p>
+        </div>
+        <div class="feat-card">
+          <span class="feat-icon">&#128200;</span>
+          <h4>tsdash</h4>
+          <p>Live dashboard with sparklines. TSADD 26us, TSRANGE.LATEST 52us p50.</p>
+        </div>
+        <div class="feat-card">
+          <span class="feat-icon">&#128172;</span>
+          <h4>rtchat</h4>
+          <p>Realtime chat with rooms, presence, typing. PUB->SUB round-trip p50 = 31us.</p>
+        </div>
+      </div>
+      <pre><code>./target/release/dbstrike 127.0.0.1:6380 &
+./target/release/agent-cli 127.0.0.1:6380 alice
+./target/release/tsdash 127.0.0.1:6380 30
+./target/release/rtchat --self alice --room lobby --addr 127.0.0.1:6380</code></pre>
+    </section>
+
+    <!-- Market Comparison -->
+    <section class="doc fade-up" id="compare">
+      <h2>Market Map</h2>
+      <p>Each leader's advantage, the gaps closed in-house.</p>
+      <div class="compare-scroll">
+      <div class="table-wrap"><table>
+        <tr><th>Capability</th><th>Redis</th><th>pgvector</th><th>Qdrant</th><th>Milvus</th><th>Mem0</th><th>Zep</th><th>SpacetimeDB</th><th>StrikeDB</th></tr>
+        <tr><td>KV / counters</td><td>yes</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td class="hl">yes</td></tr>
+        <tr><td>Relational tables</td><td>no</td><td>yes</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td class="hl">yes</td></tr>
+        <tr><td>Vector / ANN</td><td>no</td><td>warn</td><td>yes</td><td>yes</td><td>warn</td><td>warn</td><td>no</td><td class="hl">INT8+f32</td></tr>
+        <tr><td>Time-series</td><td>no</td><td>warn</td><td>no</td><td>warn</td><td>no</td><td>no</td><td>no</td><td class="hl">native</td></tr>
+        <tr><td>Pub/sub push</td><td>yes</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td class="hl">wire-level</td></tr>
+        <tr><td>RAG as query</td><td>no</td><td>no</td><td>warn</td><td>warn</td><td>no</td><td>no</td><td>no</td><td class="hl">cost-based</td></tr>
+        <tr><td>Graph memory</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td>yes</td><td>no</td><td class="hl">typed edges</td></tr>
+        <tr><td>Bi-temporal</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td>no</td><td class="hl">native</td></tr>
+        <tr><td>Procedural mem</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td>no</td><td>no</td><td class="hl">per-agent</td></tr>
+        <tr><td>MITM cache debug</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td class="hl">built-in</td></tr>
+        <tr><td>In-DB logic</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td class="hl">fuel-metered</td></tr>
+        <tr><td>One license</td><td>BSD</td><td>PostgreSQL</td><td>Apache-2.0</td><td>Apache-2.0</td><td>MIT</td><td>Apache-2.0</td><td>BSL</td><td class="hl">Apache-2.0</td></tr>
+      </table></div>
+      </div>
+    </section>
+
+    <!-- Roadmap -->
+    <section class="doc fade-up" id="roadmap">
       <h2>Roadmap</h2>
-      <ul>
-        <li>✅ Unified MVCC+WAL substrate</li>
-        <li>✅ HNSW vector index + filtered-ANN planner</li>
-        <li>✅ Agent memory (WM/LTM/episodic/keyword) with lineage</li>
-        <li>✅ Hybrid RAG (dense+sparse, RRF fusion)</li>
-        <li>✅ MITM cache debugger</li>
-        <li>✅ Fuel-metered reducers (bulkhead + circuit breaker)</li>
-        <li>✅ RESP wire + reactive CDC + HLC/CRDT</li>
-        <li>⬜ PG-wire + gRPC shims</li>
-        <li>⬜ Tiered cold storage to NVMe / object store</li>
-        <li>⬜ Raft per-shard consensus</li>
+      <ul class="roadmap-list">
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Unified MVCC+WAL substrate</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Sharded storage (32 shards, FNV-1a)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">HNSW + filtered-ANN planner</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">INT8 quantization + f32 rerank (AVX2)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Agent memory (WM/LTM/episodic/keyword) + lineage</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Graph memory (typed edges, BFS traversal)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Bi-temporal facts (valid_from / valid_to)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Procedural memory (per-agent workflows)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Hybrid RAG (dense+sparse, RRF fusion)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">MITM cache debugger</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Fuel-metered reducers (bulkhead + circuit breaker)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">RESP wire + reactive CDC + HLC/CRDT</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">SUBSCRIBE / PUBLISH over the wire</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">VSEARCH.MANY (batched vector queries)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Pipelined SET/MSET coalescing (88x durable)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">TSRANGE.LATEST (dashboard primitive)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">CHECKPOINT + WAL truncate</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">Native Rust bench (18 sections, YCSB, chaos)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">1M-vector benchmark (384d + 1536d)</span></li>
+        <li><span class="rm-todo">...</span><span class="rm-text">Tiered cold storage to NVMe / object store</span></li>
+        <li><span class="rm-todo">...</span><span class="rm-text">Raft per-shard consensus <span class="rm-note">(not yet implemented — HLC+CRDT is the current consistency layer)</span></span></li>
+        <li><span class="rm-todo">...</span><span class="rm-text">Product Quantization (8-16x compression)</span></li>
+        <li><span class="rm-todo">...</span><span class="rm-text">Long soak testing (72h continuous)</span></li>
+        <li><span class="rm-todo">...</span><span class="rm-text">ann-benchmarks datasets (SIFT1M, GIST, GloVe)</span></li>
+        <li><span class="rm-todo">...</span><span class="rm-text">gRPC shim</span></li>
       </ul>
     </section>
-  </main>
-</div></div>
 
+  </main>
+</div>
+</section>
+</div>
+
+<!-- Footer -->
 <footer>
-  <div class="wrap">StrikeDB · One engine, every data model · Apache-2.0 · Built with Rust, zero external crates.</div>
+  <div class="wrap">
+    <strong>StrikeDB</strong> &middot; One engine, every data model &middot; Apache-2.0 &middot;
+    Built with Rust, zero external crates &middot;
+    <a href="https://github.com/Mr-DS-ML-85/StrikeDB">GitHub</a>
+  </div>
 </footer>
 
 <script>
-// ---- Real-time doc search (client-side, instant, no network) ----
+// ---- Generate floating particles ----
+(function(){
+  const c = document.getElementById('particles');
+  for(let i = 0; i < 30; i++){
+    const p = document.createElement('div');
+    p.className = 'particle';
+    p.style.left = Math.random()*100 + '%';
+    p.style.animationDelay = Math.random()*8 + 's';
+    p.style.animationDuration = (6 + Math.random()*6) + 's';
+    p.style.width = p.style.height = (2 + Math.random()*4) + 'px';
+    c.appendChild(p);
+  }
+})();
+
+// ---- Scroll fade-in ----
+(function(){
+  const obs = new IntersectionObserver(es => {
+    es.forEach(e => { if(e.isIntersecting) e.target.classList.add('visible'); });
+  }, { threshold: 0.08 });
+  document.querySelectorAll('.fade-up').forEach(el => obs.observe(el));
+})();
+
+// ---- TOC active state ----
+(function(){
+  const toc = document.querySelectorAll('nav.toc a');
+  const obs = new IntersectionObserver(es => {
+    es.forEach(e => {
+      if(e.isIntersecting){
+        toc.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#'+e.target.id));
+      }
+    });
+  }, { rootMargin: '-40% 0px -55% 0px' });
+  document.querySelectorAll('section.doc').forEach(s => obs.observe(s));
+})();
+
+// ---- Search ----
 const DOCS = [
-  {t:"Introduction — one engine, every data model", g:"intro", b:"unified storage substrate, combined-apple approach, zero external crates, pure rust, views over one engine, single license apache"},
-  {t:"Install & Run — build release, serve RESP", g:"install", b:"cargo build --release, dbstrike binary, DBSTRIKE_WAL, redis-cli, python3 tests/test_dbstrike.py harness"},
-  {t:"The RESP wire — Redis protocol compatibility", g:"wire", b:"RESP commands PING SET GET DEL INCR KEYS VADD VSEARCH TSADD TSRANGE REDUCE CDCLEN MEM RAG CACHE"},
-  {t:"Unified substrate — MVCC + WAL", g:"substrate", b:"multiversion concurrency control, write ahead log, snapshot isolation, optimistic concurrency control, version chain, crash recovery replay, transactions"},
-  {t:"Views: KV / Table / Vector / Time-series", g:"views", b:"key value, relational tables, HNSW vector index, cosine distance, filtered ANN, time series range, planner selectivity prefilter postfilter"},
-  {t:"Fuel-metered reducers — fix SpacetimeDB stall", g:"reducers", b:"reducer bulkhead by shard, fuel metering stack VM, circuit breaker quarantine, rollback, in-database logic, contention no lost updates"},
-  {t:"Reactive sync & CDC — pub/sub + change log", g:"reactive", b:"reactive hub, change data capture, pub sub, key prefix subscribers, durability decoupled write path, availability trade"},
-  {t:"AI agent memory — beat Mem0 / Letta / Zep", g:"memory", b:"working memory STM, long term memory LTM, episodic, keyword BM25 index, lineage provenance, salience, blended recall, LoCoMo accuracy"},
-  {t:"RAG as a first-class query", g:"rag", b:"retrieval augmented generation, hybrid dense sparse, reciprocal rank fusion RRF, lexical rerank, corpus generation cache, embeddings"},
-  {t:"MITM cache debugger — catch stale reads instantly", g:"mitm", b:"man in the middle, cache debugger, STALE_HIT, PHANTOM, HIT, MISS, version delta, staleness detection, ring buffer, invalidation"},
-  {t:"Benchmarks — latency and throughput", g:"benchmarks", b:"p50 p90 p99 latency, ops per second, throughput, 21 microsecond PING, 85k ops, HNSW recall 10/10, agent turn 186 microsecond"},
-  {t:"Market comparison — vs Redis pgvector Milvus Mem0 SpacetimeDB", g:"compare", b:"comparison table, advantage gap closure, single license, agent memory, RAG query, in-db logic"},
-  {t:"Roadmap — what is built and next", g:"roadmap", b:"pg wire, grpc shim, tiered cold storage NVMe object store, raft consensus sharding, next features"}
+  {t:"Introduction — why StrikeDB exists", g:"intro", b:"unified storage substrate, combined-apple approach, zero external crates, pure rust, single license apache"},
+  {t:"Quick Start — build and serve", g:"install", b:"cargo build, dbstrike binary, DBSTRIKE_WAL, DBSTRIKE_SYNC, redis-cli, bench --tcp --ycsb --chaos, test_dbstrike.py"},
+  {t:"RESP Wire — 40+ Redis commands", g:"wire", b:"RESP PING SET GET DEL MSET MGET INCR KEYS DBSIZE VADD VSEARCH VSEARCH.MANY TSADD TSRANGE TSRANGE.LATEST REDUCE CHECKPOINT SUBSCRIBE PUBLISH MEM RAG CACHE"},
+  {t:"Unified Substrate — MVCC + WAL", g:"substrate", b:"MVCC, write ahead log, snapshot isolation, optimistic concurrency, 32 shards, hash-tag routing, group commit"},
+  {t:"Views — KV, Table, Vector, Time-series", g:"views", b:"key value, relational, HNSW, INT8 quantization, f32 rerank, AVX2 SIMD, filtered ANN, TSRANGE.LATEST, hash-tag, TSADD.F"},
+  {t:"Speed of Light — fix SpacetimeDB stall", g:"speed", b:"in-database logic, reducer stall, bulkhead, fuel metering, circuit breaker"},
+  {t:"Fuel-Metered Reducers", g:"reducers", b:"bulkhead by shard, fuel metering VM, circuit breaker, rollback, no lost updates"},
+  {t:"SUBSCRIBE / PUBLISH — realtime push", g:"reactive", b:"pub sub, CDC, reactive hub, durable write, wire-level"},
+  {t:"AI Agent Memory — 7 primitives", g:"memory", b:"working memory, long-term, episodic, keyword BM25, graph LINK NEIGH TRAV, bi-temporal REMEMBER.T RECALL.AS_OF, procedural PROC, salience cache"},
+  {t:"RAG as a First-Class Query", g:"rag", b:"hybrid dense sparse, reciprocal rank fusion RRF, lexical rerank, corpus generation cache"},
+  {t:"MITM Cache Debugger", g:"mitm", b:"STALE_HIT, PHANTOM, HIT, MISS, version delta, ring buffer, CACHE.SRCSET CACHE.BUGS"},
+  {t:"Benchmarks — vs Redis, YCSB, Jepsen", g:"benchmarks", b:"5.88M SET/s, 17M pipelined, redis-benchmark, YCSB A B C F, Jepsen chaos 0 lost, 1M vector, 100k 384d, 69us vector search"},
+  {t:"Live Demos — agent-cli, tsdash, rtchat", g:"demos", b:"agent memory dashboard realtime chat, TSADD TSRANGE sparklines, PUB SUB latency"},
+  {t:"Market Map — vs Redis pgvector Qdrant Milvus Mem0 Zep", g:"compare", b:"comparison table, capabilities, single license, graph memory, bi-temporal, procedural, time-series"},
+  {t:"Roadmap — built and next", g:"roadmap", b:"Raft not implemented, HLC CRDT, tiered storage, product quantization, gRPC, ann-benchmarks"}
 ];
-const q = document.getElementById('q');
-const res = document.getElementById('results');
+const qEl = document.getElementById('q');
+const rEl = document.getElementById('results');
 function go(id){ const el=document.getElementById(id); if(el) el.scrollIntoView({behavior:'smooth',block:'start'}); }
 function search(){
-  const s = q.value.trim().toLowerCase();
-  if(!s){ res.classList.remove('show'); return; }
+  const s = qEl.value.trim().toLowerCase();
+  if(!s){ rEl.classList.remove('show'); return; }
   const terms = s.split(/\s+/);
   const hits = DOCS.map(d=>{
     const hay = (d.t+' '+d.b).toLowerCase();
     let score=0; for(const t of terms){ if(hay.includes(t)) score++; }
     return {d, score};
   }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,8);
-  if(!hits.length){ res.innerHTML='<div class="res"><p>No matches — try "reducer", "memory", "cache", "RAG", "benchmark".</p></div>'; res.classList.add('show'); return; }
-  res.innerHTML = hits.map(x=>`<div class="res" data-g="${x.d.g}"><span class="tg">#${x.d.g}</span><b>${x.d.t}</b><p>score ${x.score}</p></div>`).join('');
-  res.classList.add('show');
-  res.querySelectorAll('.res').forEach(r=>r.onclick=()=>{ go(r.dataset.g); res.classList.remove('show'); q.blur(); });
+  if(!hits.length){ rEl.innerHTML='<div class="sr-item"><span>No matches. Try "memory", "RAG", "benchmark", "vector".</span></div>'; rEl.classList.add('show'); return; }
+  rEl.innerHTML = hits.map(x=>`<div class="sr-item" data-g="${x.d.g}"><span class="sr-tag">#${x.d.g}</span><b>${x.d.t}</b><span>relevance ${x.score}</span></div>`).join('');
+  rEl.classList.add('show');
+  rEl.querySelectorAll('.sr-item').forEach(r=>r.onclick=()=>{ go(r.dataset.g); rEl.classList.remove('show'); qEl.blur(); });
 }
-q.addEventListener('input', search);
-q.addEventListener('keydown', e=>{ if(e.key==='Escape'){ res.classList.remove('show'); q.blur(); } });
-document.addEventListener('click', e=>{ if(!e.target.closest('.search')) res.classList.remove('show'); });
-// "/" focuses search
-document.addEventListener('keydown', e=>{ if(e.key==='/' && document.activeElement!==q){ e.preventDefault(); q.focus(); } });
-// active TOC highlighting
-const toc = document.querySelectorAll('nav.toc a');
-const obs = new IntersectionObserver(es=>{
-  es.forEach(en=>{ if(en.isIntersecting){
-    toc.forEach(a=>a.classList.toggle('active', a.getAttribute('href')==='#'+en.target.id));
-  }});
-},{rootMargin:'-40% 0px -55% 0px'});
-document.querySelectorAll('section.doc').forEach(s=>obs.observe(s));
+qEl.addEventListener('input', search);
+qEl.addEventListener('keydown', e=>{ if(e.key==='Escape'){ rEl.classList.remove('show'); qEl.blur(); } });
+document.addEventListener('click', e=>{ if(!e.target.closest('.search-box')) rEl.classList.remove('show'); });
+document.addEventListener('keydown', e=>{ if(e.key==='/' && document.activeElement!==qEl){ e.preventDefault(); qEl.focus(); } });
 </script>
 </body>
 </html>

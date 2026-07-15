@@ -5,297 +5,793 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>StrikeDB — One Engine. Every Data Model. Speed of Light.</title>
 <style>
-  :root{
-    --cyan:#22d3ee; --mag:#ff4fd8; --bg:#05060a; --panel:#0c0f17;
-    --ink:#e8edf6; --muted:#8b93a7; --green:#3ddc97; --line:#1b2233;
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  html{scroll-behavior:smooth}
-  body{background:var(--bg);color:var(--ink);font:16px/1.6 ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial;overflow-x:hidden}
-  a{color:var(--cyan);text-decoration:none}
-  .wrap{max-width:1140px;margin:0 auto;padding:0 22px}
-  header.nav{position:sticky;top:0;z-index:30;backdrop-filter:blur(12px);
-    background:rgba(5,6,10,.72);border-bottom:1px solid var(--line)}
-  .nav .wrap{display:flex;align-items:center;justify-content:space-between;height:64px}
-  .brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.5px}
-  .brand img{width:34px;height:34px;border-radius:9px;box-shadow:0 0 18px rgba(34,211,238,.5)}
-  .nav nav a{margin-left:22px;color:var(--muted);font-weight:600;font-size:14px}
-  .nav nav a:hover{color:var(--ink)}
-  .hero{position:relative;padding:54px 0 30px;overflow:hidden}
-  .hero .wrap{position:relative;z-index:2;display:grid;grid-template-columns:1.05fr .95fr;gap:30px;align-items:center}
-  #scene{position:absolute;inset:0;z-index:0;opacity:.28;pointer-events:none}
-  #hero-canvas{width:100%;height:420px;display:block;border-radius:22px;
-    background:radial-gradient(120% 120% at 70% 20%,rgba(34,211,238,.10),transparent 60%),
-               radial-gradient(120% 120% at 20% 90%,rgba(255,79,216,.10),transparent 60%),#070a12;
-    border:1px solid var(--line);box-shadow:0 30px 80px rgba(34,211,238,.10)}
-  .hero .copy{position:relative;z-index:3;text-align:left}
-  .logo-mark{display:flex;align-items:center;gap:14px;margin-bottom:18px}
-  .logo-mark img{width:64px;height:64px;border-radius:16px;box-shadow:0 0 26px rgba(34,211,238,.55)}
-  .logo-mark .name{font-size:26px;font-weight:900;letter-spacing:1px}
-  .logo-mark .name .grad{background:linear-gradient(90deg,var(--cyan),var(--mag));-webkit-background-clip:text;background-clip:text;color:transparent}
-  .sub{color:var(--muted);font-size:clamp(15px,2vw,20px);max-width:560px;margin:0 0 26px}
-  .cta{display:flex;gap:14px;justify-content:flex-start;flex-wrap:wrap}
-  .stats{display:grid;grid-template-columns:repeat(2,minmax(0,150px));gap:14px;margin:40px 0 0;max-width:340px}
-  .badge-top{display:inline-flex;gap:8px;align-items:center;padding:6px 14px;border:1px solid var(--line);
-    border-radius:999px;background:var(--panel);color:var(--muted);font-size:13px;font-weight:600}
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}
-  h1{font-size:clamp(34px,6vw,68px);line-height:1.04;margin:22px 0 14px;letter-spacing:-1px}
-  h1 .grad{background:linear-gradient(90deg,var(--cyan),var(--mag));-webkit-background-clip:text;background-clip:text;color:transparent}
-  .sub{color:var(--muted);font-size:clamp(15px,2vw,20px);max-width:720px;margin:0 auto 26px}
-  .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
-  .btn{padding:13px 26px;border-radius:12px;font-weight:700;font-size:15px;border:1px solid transparent}
-  .btn.primary{background:linear-gradient(90deg,var(--cyan),var(--mag));color:#05060a}
-  .btn.ghost{border-color:var(--line);color:var(--ink);background:var(--panel)}
-  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:46px auto 0;max-width:880px}
-  .stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 14px}
-  .stat b{display:block;font-size:26px;background:linear-gradient(90deg,var(--cyan),var(--mag));
-    -webkit-background-clip:text;background-clip:text;color:transparent}
-  .stat span{color:var(--muted);font-size:12.5px;font-weight:600}
-  section{padding:64px 0;border-top:1px solid var(--line)}
-  h2{font-size:clamp(26px,4vw,40px);letter-spacing:-.5px;margin-bottom:10px}
-  .lead{color:var(--muted);max-width:680px;margin-bottom:30px}
-  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px;transition:.2s}
-  .card:hover{border-color:var(--cyan);transform:translateY(-3px);box-shadow:0 10px 30px rgba(34,211,238,.08)}
-  .card h3{font-size:18px;margin-bottom:8px}
-  .card p{color:var(--muted);font-size:14.5px}
-  .ico{font-size:24px;margin-bottom:10px}
-  table.cmp{width:100%;border-collapse:collapse;font-size:14px;margin-top:10px}
-  table.cmp th,table.cmp td{border:1px solid var(--line);padding:10px 12px;text-align:center}
-  table.cmp th{background:var(--panel);color:var(--ink);font-weight:700}
-  table.cmp td:first-child,table.cmp th:first-child{text-align:left;color:var(--muted)}
-  table.cmp td.us{background:rgba(34,211,238,.10);color:var(--cyan);font-weight:700}
-  .bars{display:grid;gap:14px;margin-top:10px}
-  .bar{display:grid;grid-template-columns:200px 1fr;gap:14px;align-items:center}
-  .bar .lab{color:var(--muted);font-size:13.5px;font-weight:600;text-align:right}
-  .bar .track{background:var(--panel);border:1px solid var(--line);border-radius:8px;height:26px;overflow:hidden}
-  .bar .fill{height:100%;background:linear-gradient(90deg,var(--cyan),var(--mag));border-radius:8px;
-    display:flex;align-items:center;justify-content:flex-end;padding-right:10px;font-size:12px;font-weight:700;color:#05060a}
-  pre{background:#07090f;border:1px solid var(--line);border-radius:12px;padding:18px;overflow:auto;
-    font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfe3ff}
-  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-  footer{border-top:1px solid var(--line);padding:34px 0;color:var(--muted);font-size:13.5px;text-align:center}
-  @media(max-width:820px){.grid3{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.bar{grid-template-columns:120px 1fr}
-    .hero .wrap{grid-template-columns:1fr}
-    #hero-canvas{height:300px;order:-1}
-    .stats{max-width:none}}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  --cyan: #06d6a0; --magenta: #ef476f; --blue: #118ab2; --purple: #7b2ff7;
+  --gold: #ffd166; --bg: #050510; --glass: rgba(255,255,255,0.03);
+  --glass-border: rgba(255,255,255,0.08); --glass-hover: rgba(255,255,255,0.06);
+  --ink: #f0f0f5; --muted: #6b7280; --line: rgba(255,255,255,0.06);
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 16px/1.7 'Inter', -apple-system, system-ui, sans-serif;
+  overflow-x: hidden; -webkit-font-smoothing: antialiased;
+}
+
+/* ===== ANIMATED BACKGROUND ===== */
+.bg-canvas { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+.orb {
+  position: absolute; border-radius: 50%; filter: blur(130px); opacity: 0.3;
+  animation: orbFloat 22s ease-in-out infinite alternate;
+}
+.orb-1 { width: 800px; height: 800px; background: var(--purple); top: -20%; left: -15%; animation-duration: 28s; }
+.orb-2 { width: 600px; height: 600px; background: var(--cyan); bottom: -15%; right: -10%; animation-duration: 20s; animation-delay: -6s; }
+.orb-3 { width: 500px; height: 500px; background: var(--magenta); top: 35%; left: 45%; animation-duration: 24s; animation-delay: -12s; }
+@keyframes orbFloat {
+  0% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(80px, -50px) scale(1.1); }
+  66% { transform: translate(-40px, 60px) scale(0.95); }
+  100% { transform: translate(50px, -30px) scale(1.05); }
+}
+
+/* ===== PARTICLES ===== */
+.particles { position: absolute; inset: 0; z-index: 1; pointer-events: none; overflow: hidden; }
+.particle {
+  position: absolute; width: 3px; height: 3px; border-radius: 50%;
+  background: var(--cyan); opacity: 0;
+  animation: pFloat 10s ease-in-out infinite;
+}
+.particle:nth-child(odd) { background: var(--magenta); }
+.particle:nth-child(3n) { background: var(--purple); }
+@keyframes pFloat {
+  0%, 100% { opacity: 0; transform: translateY(100vh) scale(0); }
+  10% { opacity: 0.5; }
+  90% { opacity: 0.5; }
+  50% { transform: translateY(-15vh) scale(1.8) translateX(40px); }
+}
+
+/* ===== GLASS ===== */
+.glass {
+  background: var(--glass); border: 1px solid var(--glass-border); border-radius: 20px;
+  backdrop-filter: blur(20px) saturate(1.4); -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.glass:hover {
+  background: var(--glass-hover); border-color: rgba(255,255,255,0.12);
+  box-shadow: 0 8px 40px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.05);
+  transform: translateY(-3px);
+}
+
+/* ===== LAYOUT ===== */
+.wrap { max-width: 1200px; margin: 0 auto; padding: 0 28px; position: relative; z-index: 2; }
+.content-wrap { position: relative; z-index: 2; }
+
+/* ===== HEADER ===== */
+header {
+  position: sticky; top: 0; z-index: 100;
+  background: rgba(5,5,16,0.65); backdrop-filter: blur(28px) saturate(1.6);
+  -webkit-backdrop-filter: blur(28px) saturate(1.6);
+  border-bottom: 1px solid var(--glass-border);
+}
+header .wrap { display: flex; align-items: center; justify-content: space-between; height: 66px; }
+.brand { display: flex; align-items: center; gap: 12px; font-weight: 800; letter-spacing: 0.5px; }
+.brand img { width: 36px; height: 36px; border-radius: 10px; box-shadow: 0 0 20px rgba(6,214,160,0.4); }
+.brand span { font-size: 21px; }
+nav a {
+  margin-left: 24px; color: var(--muted); font-weight: 600; font-size: 14px;
+  transition: color 0.25s;
+}
+nav a:hover { color: var(--ink); }
+
+/* ===== HERO ===== */
+.hero { position: relative; padding: 80px 0 50px; overflow: hidden; min-height: 80vh; display: flex; align-items: center; }
+.hero .wrap {
+  display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 40px; align-items: center;
+  position: relative; z-index: 3;
+}
+.hero-grid {
+  position: absolute; inset: 0; opacity: 0.03; z-index: 1;
+  background-image: linear-gradient(rgba(255,255,255,0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.08) 1px, transparent 1px);
+  background-size: 70px 70px;
+  mask-image: radial-gradient(ellipse at center, black 20%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse at center, black 20%, transparent 70%);
+}
+.hero-left { position: relative; z-index: 3; }
+.hero-right { position: relative; z-index: 3; }
+
+.hero-badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 7px 16px; border-radius: 999px; font-size: 13px; font-weight: 600;
+  background: rgba(6,214,160,0.08); border: 1px solid rgba(6,214,160,0.2);
+  color: var(--cyan); margin-bottom: 28px;
+}
+.hero-badge .pulse {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--cyan);
+  box-shadow: 0 0 12px var(--cyan); animation: pulse 2s ease-in-out infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+.hero h1 {
+  font-size: clamp(44px, 7vw, 82px); font-weight: 900; letter-spacing: -2.5px;
+  line-height: 0.98; margin-bottom: 24px;
+}
+.hero h1 .line2 {
+  display: block;
+  background: linear-gradient(135deg, var(--cyan), var(--blue), var(--purple), var(--magenta));
+  background-size: 300% 300%; -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: gradShift 6s ease-in-out infinite;
+}
+@keyframes gradShift { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+.hero h1 .line3 { display: block; font-size: 0.55em; color: var(--muted); font-weight: 500; letter-spacing: -0.5px; }
+
+.hero-sub {
+  color: var(--muted); font-size: 18px; max-width: 540px; margin-bottom: 32px; line-height: 1.7;
+}
+.hero-sub strong { color: var(--ink); font-weight: 600; }
+
+.hero-cta { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 48px; }
+.btn {
+  padding: 14px 30px; border-radius: 14px; font-weight: 700; font-size: 15px;
+  border: none; cursor: pointer; transition: all 0.3s; text-decoration: none; display: inline-flex; align-items: center; gap: 8px;
+}
+.btn-primary {
+  background: linear-gradient(135deg, var(--cyan), var(--blue)); color: #050510;
+  box-shadow: 0 4px 20px rgba(6,214,160,0.3);
+}
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(6,214,160,0.4); }
+.btn-ghost {
+  background: rgba(255,255,255,0.04); color: var(--ink);
+  border: 1px solid var(--glass-border);
+}
+.btn-ghost:hover { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.15); }
+
+/* Hero stats row */
+.hero-stats {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
+}
+.hero-stat {
+  padding: 20px 14px; text-align: center;
+  background: rgba(255,255,255,0.02); border: 1px solid var(--glass-border);
+  border-radius: 16px; transition: all 0.4s cubic-bezier(0.4,0,0.2,1);
+  transform-style: preserve-3d; perspective: 600px;
+}
+.hero-stat:hover {
+  transform: translateY(-4px) rotateX(2deg);
+  border-color: rgba(6,214,160,0.3); box-shadow: 0 12px 40px rgba(6,214,160,0.08);
+}
+.hero-stat .num {
+  font-size: 30px; font-weight: 900; letter-spacing: -1px;
+  font-family: 'JetBrains Mono', monospace;
+  background: linear-gradient(135deg, var(--cyan), var(--blue));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero-stat .label { font-size: 11px; color: var(--muted); margin-top: 4px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; }
+
+/* 3D canvas container */
+#hero-canvas {
+  width: 100%; height: 480px; display: block; border-radius: 24px;
+  background: radial-gradient(130% 130% at 70% 20%, rgba(6,214,160,0.08), transparent 60%),
+    radial-gradient(130% 130% at 20% 90%, rgba(239,71,111,0.06), transparent 60%), rgba(7,10,18,0.8);
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 40px 100px rgba(6,214,160,0.08), inset 0 1px 0 rgba(255,255,255,0.03);
+}
+
+/* ===== SECTIONS ===== */
+section { padding: 80px 0; border-top: 1px solid var(--line); position: relative; z-index: 2; }
+section .section-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 14px; border-radius: 999px; font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px;
+  background: rgba(6,214,160,0.08); border: 1px solid rgba(6,214,160,0.2); color: var(--cyan);
+}
+h2 {
+  font-size: clamp(30px, 4.5vw, 48px); font-weight: 900; letter-spacing: -1px;
+  line-height: 1.05; margin-bottom: 14px;
+}
+h2 .grad {
+  background: linear-gradient(135deg, var(--cyan), var(--blue));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.lead { color: var(--muted); max-width: 680px; margin-bottom: 36px; font-size: 17px; line-height: 1.7; }
+.lead strong { color: var(--ink); }
+
+/* ===== FEATURE CARDS ===== */
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+.card {
+  padding: 28px 24px; border-radius: 18px;
+  background: rgba(255,255,255,0.02); border: 1px solid var(--glass-border);
+  transition: all 0.4s cubic-bezier(0.4,0,0.2,1);
+  transform-style: preserve-3d;
+}
+.card:hover {
+  transform: translateY(-5px) rotateX(1deg) rotateY(-1deg);
+  border-color: rgba(6,214,160,0.25);
+  box-shadow: 0 18px 50px rgba(0,0,0,0.3), 0 0 40px rgba(6,214,160,0.04);
+}
+.card .ico { font-size: 30px; margin-bottom: 14px; display: block; }
+.card h3 { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+.card p { color: var(--muted); font-size: 14px; line-height: 1.65; }
+.card .tag {
+  display: inline-block; font: 10px 'JetBrains Mono', monospace; padding: 3px 10px;
+  border-radius: 6px; font-weight: 600; margin-bottom: 10px;
+}
+.tag-g { background: rgba(6,214,160,0.12); color: var(--cyan); border: 1px solid rgba(6,214,160,0.25); }
+.tag-p { background: rgba(239,71,111,0.12); color: var(--magenta); border: 1px solid rgba(239,71,111,0.25); }
+.tag-b { background: rgba(17,138,178,0.12); color: #38bdf8; border: 1px solid rgba(17,138,178,0.25); }
+.tag-v { background: rgba(123,47,247,0.12); color: #a78bfa; border: 1px solid rgba(123,47,247,0.25); }
+
+/* ===== MEMORY GRID ===== */
+.mem-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+
+/* ===== BENCHMARK BARS ===== */
+.bars { display: grid; gap: 14px; }
+.bar { display: grid; grid-template-columns: 200px 1fr; gap: 16px; align-items: center; }
+.bar .lab { color: var(--muted); font-size: 13.5px; font-weight: 600; text-align: right; font-family: 'JetBrains Mono', monospace; }
+.bar .track {
+  background: rgba(255,255,255,0.03); border: 1px solid var(--glass-border);
+  border-radius: 10px; height: 30px; overflow: hidden;
+}
+.bar .fill {
+  height: 100%; border-radius: 10px;
+  background: linear-gradient(90deg, var(--cyan), var(--blue));
+  display: flex; align-items: center; justify-content: flex-end;
+  padding-right: 12px; font-size: 12px; font-weight: 700; color: #050510;
+  font-family: 'JetBrains Mono', monospace;
+  transition: width 1.5s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 0 20px rgba(6,214,160,0.2);
+}
+
+/* ===== TABLES ===== */
+.table-wrap { overflow-x: auto; margin: 16px 0; border-radius: 16px; border: 1px solid var(--glass-border); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 13px 16px; text-align: center; border-bottom: 1px solid var(--line); }
+th {
+  background: rgba(255,255,255,0.03); color: var(--ink); font-weight: 700;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; position: sticky; top: 0;
+}
+td:first-child, th:first-child { text-align: left; color: var(--muted); font-weight: 500; }
+td.hl { background: rgba(6,214,160,0.06); color: var(--cyan); font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+tr:hover td { background: rgba(255,255,255,0.02); }
+
+/* ===== CODE ===== */
+code {
+  font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  background: rgba(6,214,160,0.08); border: 1px solid rgba(6,214,160,0.15);
+  border-radius: 6px; padding: 2px 8px; color: #6ee7b7;
+}
+pre {
+  background: rgba(0,0,0,0.4); border: 1px solid var(--glass-border);
+  border-radius: 18px; padding: 22px; overflow: auto;
+  font: 13px/1.6 'JetBrains Mono', monospace; color: #d1fae5;
+  margin: 20px 0; backdrop-filter: blur(10px);
+  box-shadow: inset 0 2px 12px rgba(0,0,0,0.3);
+}
+pre code { background: none; border: none; padding: 0; color: inherit; }
+
+/* ===== CALLOUT ===== */
+.callout {
+  background: rgba(6,214,160,0.04); border: 1px solid rgba(6,214,160,0.15);
+  border-left: 3px solid var(--cyan); border-radius: 14px;
+  padding: 18px 22px; margin: 20px 0; color: #9ca3af; backdrop-filter: blur(10px);
+}
+.callout strong { color: var(--ink); }
+.callout.warn { background: rgba(255,209,102,0.04); border-color: rgba(255,209,102,0.15); border-left-color: var(--gold); }
+.callout.danger { background: rgba(239,71,111,0.04); border-color: rgba(239,71,111,0.15); border-left-color: var(--magenta); }
+
+/* ===== FOOTER ===== */
+footer {
+  border-top: 1px solid var(--glass-border); padding: 44px 0; text-align: center;
+  color: var(--muted); font-size: 13px; position: relative; z-index: 2;
+  background: rgba(5,5,16,0.5); backdrop-filter: blur(20px);
+}
+footer a { color: var(--cyan); font-weight: 600; }
+footer .ft-links { display: flex; justify-content: center; gap: 28px; margin-bottom: 14px; }
+footer .ft-links a { color: var(--muted); font-weight: 500; transition: color 0.2s; }
+footer .ft-links a:hover { color: var(--ink); }
+
+/* ===== SCROLL ANIMATIONS ===== */
+.fade-up { opacity: 0; transform: translateY(30px); transition: opacity 0.7s ease, transform 0.7s ease; }
+.fade-up.visible { opacity: 1; transform: translateY(0); }
+
+/* ===== RESPONSIVE ===== */
+@media (max-width: 900px) {
+  .hero .wrap { grid-template-columns: 1fr; text-align: center; }
+  .hero-left { order: 1; } .hero-right { order: 2; }
+  .hero-sub { margin-left: auto; margin-right: auto; }
+  .hero-cta { justify-content: center; }
+  .hero-stats { max-width: 500px; margin: 0 auto; }
+  #hero-canvas { height: 320px; }
+  .grid3 { grid-template-columns: 1fr; }
+  nav { display: none; }
+}
+@media (max-width: 600px) {
+  .hero h1 { font-size: 38px; letter-spacing: -1px; }
+  .hero-stats { grid-template-columns: repeat(2, 1fr); }
+  .bar { grid-template-columns: 120px 1fr; }
+}
 </style>
 </head>
 <body>
 
-<header class="nav">
+<!-- Background -->
+<div class="bg-canvas">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+</div>
+<div class="particles" id="particles"></div>
+
+<!-- Header -->
+<header>
   <div class="wrap">
-    <div class="brand"><img src="docs/assets/logo.svg" alt="StrikeDB logo" onerror="this.style.display='none'"/><span>DB·Strike</span></div>
+    <div class="brand">
+      <img src="docs/assets/logo.svg" alt="StrikeDB" onerror="this.style.display='none'"/>
+      <span>StrikeDB</span>
+    </div>
     <nav>
       <a href="#features">Features</a>
       <a href="#memory">Memory</a>
       <a href="#benchmarks">Benchmarks</a>
       <a href="#compare">Compare</a>
       <a href="docs/index.html">Docs</a>
-      <a href="https://github.com/">GitHub</a>
+      <a href="https://github.com/Mr-DS-ML-85/StrikeDB">GitHub</a>
     </nav>
   </div>
 </header>
 
-<div class="hero">
-  <canvas id="scene"></canvas>
+<div class="content-wrap">
+
+<!-- Hero -->
+<section class="hero">
+  <div class="hero-grid"></div>
   <div class="wrap">
-    <div class="copy">
-      <div class="logo-mark">
-        <img src="docs/assets/logo.svg" alt="StrikeDB logo" onerror="this.style.display='none'"/>
-        <div class="name">DB<span class="grad">·</span>Strike</div>
+    <div class="hero-left">
+      <div class="hero-badge"><span class="pulse"></span> 211 tests passing &middot; zero external crates &middot; Apache-2.0</div>
+      <h1>
+        One engine.
+        <span class="line2">Every data model.</span>
+        <span class="line3">Speed of light.</span>
+      </h1>
+      <p class="hero-sub">
+        <strong>StrikeDB</strong> unifies KV, vectors, time-series, pub/sub,
+        <strong>AI agent memory</strong>, and <strong>RAG</strong> into one storage substrate.
+        Built to outrun SpacetimeDB. Built to beat Mem0. One license, one consistency, zero gaps.
+      </p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="#benchmarks">See the numbers</a>
+        <a class="btn btn-ghost" href="docs/index.html">Read the docs &rarr;</a>
       </div>
-      <div class="badge-top"><span class="dot"></span> 48 tests passing · p99 PING 21µs · zero external crates</div>
-      <h1>One engine.<br><span class="grad">Every data model.</span><br>Speed of light.</h1>
-      <p class="sub">StrikeDB is a single unified data engine where KV, vectors, time-series,
-        pub/sub, <b>AI agent memory</b>, and <b>RAG</b> are views over one storage substrate —
-        not five bolted systems. Built to outrun SpacetimeDB and become the #1 agent-memory + RAG core.</p>
-      <div class="cta">
-        <a class="btn primary" href="#benchmarks">See the numbers</a>
-        <a class="btn ghost" href="docs/index.html">Read the docs →</a>
-      </div>
-      <div class="stats">
-        <div class="stat"><b>21µs</b><span>PING p99 latency</span></div>
-        <div class="stat"><b>85k/s</b><span>ops across 16 conns</span></div>
-        <div class="stat"><b>186µs</b><span>agent turn p99 (3 ops)</span></div>
-        <div class="stat"><b>1.00</b><span>HNSW recall vs brute</span></div>
+      <div class="hero-stats">
+        <div class="hero-stat glass">
+          <div class="num">5.88M</div>
+          <div class="label">SET ops/s</div>
+        </div>
+        <div class="hero-stat glass">
+          <div class="num">69</div>
+          <div class="label">vector p50 us</div>
+        </div>
+        <div class="hero-stat glass">
+          <div class="num">83</div>
+          <div class="label">agent turn us</div>
+        </div>
+        <div class="hero-stat glass">
+          <div class="num">0</div>
+          <div class="label">lost under SIGKILL</div>
+        </div>
       </div>
     </div>
-    <canvas id="hero-canvas"></canvas>
-  </div>
-</div>
-
-<section id="features">
-  <div class="wrap">
-    <h2>What you get</h2>
-    <p class="lead">The combined-Apple approach: take each category leader's advantage and close the
-      database gaps with novel in-house techniques — one license, one consistency model.</p>
-    <div class="grid3">
-      <div class="card"><div class="ico">⚡</div><h3>Unified substrate</h3><p>MVCC + WAL engine. Tables, KV, vectors, time-series and the CDC log are all key conventions over one store — zero dual-write drift.</p></div>
-      <div class="card"><div class="ico">🧠</div><h3>AI agent memory</h3><p>Working / long-term / episodic / keyword, with provenance lineage as a first-class primitive Mem0·Zep·Letta don't ship.</p></div>
-      <div class="card"><div class="ico">🔍</div><h3>RAG as a query</h3><p>Hybrid dense+sparse retrieval fused with Reciprocal Rank Fusion, planned by the same cost-based optimizer that plans joins.</p></div>
-      <div class="card"><div class="ico">🐞</div><h3>MITM cache debugger</h3><p>An in-engine man-in-the-middle that flags STALE_HIT / PHANTOM on every cache read — provable staleness, instantly.</p></div>
-      <div class="card"><div class="ico">🏎️</div><h3>Fuel-metered reducers</h3><p>Logic runs in-DB like SpacetimeDB, but bulkheaded by shard, fuel-metered, and circuit-breaker protected. No global stall.</p></div>
-      <div class="card"><div class="ico">🔄</div><h3>Reactive sync + CDC</h3><p>Pub/sub and a durable change-log fed by the commit hook. Decoupled from the write path for availability.</p></div>
+    <div class="hero-right">
+      <canvas id="hero-canvas"></canvas>
     </div>
   </div>
 </section>
 
+<!-- Features -->
+<section id="features">
+  <div class="wrap">
+    <div class="section-badge">Core Engine</div>
+    <h2>What you <span class="grad">actually get</span></h2>
+    <p class="lead">The combined-Apple approach: each category leader's advantage, the gaps closed
+      with novel in-house engineering. <strong>One license. One consistency model. Zero bolt-ons.</strong></p>
+    <div class="grid3">
+      <div class="card">
+        <span class="ico">&#9889;</span>
+        <h3>Unified substrate</h3>
+        <p>MVCC + WAL engine. Tables, KV, vectors, time-series and CDC are all key conventions over
+          one store. 32 shards, group-commit, hash-tag routing. Zero dual-write drift.</p>
+      </div>
+      <div class="card">
+        <span class="ico">&#129504;</span>
+        <h3>AI agent memory</h3>
+        <p><strong>7 primitives:</strong> working, long-term, episodic, keyword, graph, bi-temporal,
+          procedural. Lineage as a first-class primitive. Built to beat Mem0, Zep, Letta.</p>
+      </div>
+      <div class="card">
+        <span class="ico">&#128269;</span>
+        <h3>RAG as a query</h3>
+        <p>Hybrid dense+sparse retrieval fused with <strong>Reciprocal Rank Fusion</strong>,
+          planned by the same cost-based optimizer that plans joins. Not a bolted pipeline.</p>
+      </div>
+      <div class="card">
+        <span class="ico">&#128027;</span>
+        <h3>MITM cache debugger</h3>
+        <p>In-engine man-in-the-middle flags <strong>STALE_HIT / PHANTOM</strong> on every cache read.
+          Provable per-key staleness with the exact version delta. No guessing.</p>
+      </div>
+      <div class="card">
+        <span class="ico">&#127939;</span>
+        <h3>Fuel-metered reducers</h3>
+        <p>Logic runs in-DB like SpacetimeDB, but <strong>bulkheaded by shard</strong>, fuel-metered,
+          and circuit-breaker protected. No global stall. p99 = 45.5us.</p>
+      </div>
+      <div class="card">
+        <span class="ico">&#128260;</span>
+        <h3>Realtime pub/sub</h3>
+        <p>Redis-compatible <strong>SUBSCRIBE / PUBLISH</strong> over the wire. Durable writes,
+          reactive CDC. PUBLISH->SUBSCRIBE p50 = 31us round-trip.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Memory -->
 <section id="memory">
   <div class="wrap">
-    <h2>AI agent memory, built to win</h2>
-    <p class="lead">Four memory structures on the same substrate. Blended semantic + keyword recall,
-      salience-weighted, with non-malleable lineage so poisoning is detectable.</p>
-    <div class="grid3">
-      <div class="card"><div class="ico">🔥</div><h3>Working (STM)</h3><p>Hot per-agent context, TTL-cleared, Redis speed — but the same rows the durable engine sees.</p></div>
-      <div class="card"><div class="ico">🗄️</div><h3>Long-term (LTM)</h3><p>Durable semantic store, pushed into the shared HNSW for one-hop recall. Lineage-attached.</p></div>
-      <div class="card"><div class="ico">📜</div><h3>Episodic</h3><p>Append-only event log of everything that happened, queryable by agent + kind.</p></div>
-      <div class="card"><div class="ico">🔤</div><h3>Keyword index</h3><p>BM25-ish inverted index over LTM text — exact-term recall that pure-vector memory misses.</p></div>
+    <div class="section-badge">AI Memory</div>
+    <h2>Seven memory primitives. <span class="grad">One substrate.</span></h2>
+    <p class="lead">Every category leader's core memory type, on one engine, in one process.
+      <strong>Provenance / lineage</strong> as a first-class primitive — the non-malleable-authority
+      hardening 2026 agent-memory research demands.</p>
+    <div class="mem-grid">
+      <div class="card">
+        <span class="tag tag-g">WM</span>
+        <h3>Working Memory</h3>
+        <p>Hot per-agent context, TTL-cleared. Redis speed on the durable engine.</p>
+      </div>
+      <div class="card">
+        <span class="tag tag-g">LTM</span>
+        <h3>Long-Term Memory</h3>
+        <p>Durable semantic store in HNSW. Lineage-attached: source, salience, derivation chain.</p>
+      </div>
+      <div class="card">
+        <span class="tag tag-g">EP</span>
+        <h3>Episodic</h3>
+        <p>Append-only event log. Queryable by agent + kind. The event timeline.</p>
+      </div>
+      <div class="card">
+        <span class="tag tag-g">KW</span>
+        <h3>Keyword Index</h3>
+        <p>BM25 inverted index. Exact-term recall that pure-vector memory misses.</p>
+      </div>
+      <div class="card">
+        <span class="tag tag-b">GRAPH</span>
+        <h3>Graph Memory</h3>
+        <p>Typed edges, forward + reverse index. MEM.LINK / NEIGH / TRAV for BFS traversal.</p>
+      </div>
+      <div class="card">
+        <span class="tag tag-v">BITEMP</span>
+        <h3>Bi-temporal Facts</h3>
+        <p>valid_from / valid_to on LTM. RECALL.AS_OF: "what did we know at time T?"</p>
+      </div>
+      <div class="card">
+        <span class="tag tag-b">PROC</span>
+        <h3>Procedural Memory</h3>
+        <p>Per-agent workflows and rules. Stored by name, retrieved on demand.</p>
+      </div>
     </div>
     <pre><code># remember something (source + salience + embedding)
 redis-cli -p 6380 MEM.REMEMBER "user prefers Rust for speed" user 0.9 1.0 0.2 0.0
-# recall blended by similarity + keyword + salience
-redis-cli -p 6380 MEM.RECALL 5 "rust speed preference" 1.0 0.2 0.0</code></pre>
+
+# blended semantic + keyword + salience recall
+redis-cli -p 6380 MEM.RECALL 5 "rust speed preference" 1.0 0.2 0.0
+
+# graph edges
+redis-cli -p 6380 MEM.LINK alice works_at acme 1.0
+redis-cli -p 6380 MEM.TRAV alice 3
+
+# bi-temporal — "what did we know at time T?"
+redis-cli -p 6380 MEM.REMEMBER.T "CEO of Acme" user 0.8 3000 0 1.0 0.2 0.0
+redis-cli -p 6380 MEM.RECALL.AS_OF 5 "CEO" 5000 1.0 0.2 0.0</code></pre>
   </div>
 </section>
 
+<!-- Benchmarks -->
 <section id="benchmarks">
   <div class="wrap">
-    <h2>Benchmarks (release, this machine)</h2>
-    <p class="lead">Single connection, warm. Lower is better. Measured by the bundled production test harness.</p>
+    <div class="section-badge">Performance</div>
+    <h2>Benchmarks that <span class="grad">speak for themselves</span></h2>
+    <p class="lead">Two harnesses: native Rust bench (18 sections, in-process) and Python integration
+      (21 sections, over RESP). <strong>All numbers reproducible.</strong></p>
+
+    <h3 style="margin-bottom:16px; font-size:16px; color:var(--ink);">vs Redis 8.x &mdash; measured with redis-benchmark 8.0.5</h3>
     <div class="bars">
-      <div class="bar"><div class="lab">PING p99</div><div class="track"><div class="fill" style="width:2%">21µs</div></div></div>
-      <div class="bar"><div class="lab">GET p99</div><div class="track"><div class="fill" style="width:3%">31µs</div></div></div>
-      <div class="bar"><div class="lab">SET p99</div><div class="track"><div class="fill" style="width:4%">39µs</div></div></div>
-      <div class="bar"><div class="lab">VSEARCH p99</div><div class="track"><div class="fill" style="width:2.4%">24µs</div></div></div>
-      <div class="bar"><div class="lab">REDUCE p99</div><div class="track"><div class="fill" style="width:4%">39µs</div></div></div>
-      <div class="bar"><div class="lab">Agent turn p99</div><div class="track"><div class="fill" style="width:19%">186µs</div></div></div>
-      <div class="bar"><div class="lab">SET 16-conn</div><div class="track"><div class="fill" style="width:100%">85,515 ops/s</div></div></div>
+      <div class="bar"><div class="lab">SET -P64</div><div class="track"><div class="fill" style="width:35%">5.88M/s</div></div></div>
+      <div class="bar"><div class="lab">SET -P256</div><div class="track"><div class="fill" style="width:71%">12.1M/s</div></div></div>
+      <div class="bar"><div class="lab">SET -P1024</div><div class="track"><div class="fill" style="width:100%">~17M/s</div></div></div>
+      <div class="bar"><div class="lab">GET -P256</div><div class="track"><div class="fill" style="width:78%">13.3M/s</div></div></div>
+      <div class="bar"><div class="lab">Redis SET (in-mem)</div><div class="track"><div class="fill" style="width:17%; background:linear-gradient(90deg,#6b7280,#9ca3af);">2.94M/s</div></div></div>
+      <div class="bar"><div class="lab">Redis SET (AOF)</div><div class="track"><div class="fill" style="width:14%; background:linear-gradient(90deg,#6b7280,#9ca3af);">2.30M/s</div></div></div>
     </div>
-    <p class="lead" style="margin-top:22px">Under 16-way contention, reducers lose <b>zero</b> updates (bulkhead serializes the shard,
-      not the engine). HNSW cluster recall: <b>10/10</b>.</p>
+
+    <h3 style="margin:32px 0 16px; font-size:16px; color:var(--ink);">Over RESP wire &mdash; single connection</h3>
+    <div class="bars">
+      <div class="bar"><div class="lab">PING p99</div><div class="track"><div class="fill" style="width:2%">18us</div></div></div>
+      <div class="bar"><div class="lab">SET p99</div><div class="track"><div class="fill" style="width:3%">38us</div></div></div>
+      <div class="bar"><div class="lab">GET p99</div><div class="track"><div class="fill" style="width:2%">20us</div></div></div>
+      <div class="bar"><div class="lab">REDUCE p99</div><div class="track"><div class="fill" style="width:4%">46us</div></div></div>
+      <div class="bar"><div class="lab">Agent turn p99</div><div class="track"><div class="fill" style="width:10%">125us</div></div></div>
+      <div class="bar"><div class="lab">PUB->SUB p50</div><div class="track"><div class="fill" style="width:3%">31us</div></div></div>
+    </div>
+
+    <h3 style="margin:32px 0 16px; font-size:16px; color:var(--ink);">Vector search &mdash; 100k x 384d INT8 + f32 rerank</h3>
+    <div class="bars">
+      <div class="bar"><div class="lab">VSEARCH p50 (ef=32)</div><div class="track"><div class="fill" style="width:5%">69us</div></div></div>
+      <div class="bar"><div class="lab">VSEARCH p99 (ef=32)</div><div class="track"><div class="fill" style="width:10%">143us</div></div></div>
+      <div class="bar"><div class="lab">Recall@10</div><div class="track"><div class="fill" style="width:93%">0.926</div></div></div>
+      <div class="bar"><div class="lab">8-thread QPS</div><div class="track"><div class="fill" style="width:79%">79,374</div></div></div>
+    </div>
+
+    <h3 style="margin:32px 0 16px; font-size:16px; color:var(--ink);">YCSB A / B / C / F (100k records, over RESP)</h3>
+    <div class="bars">
+      <div class="bar"><div class="lab">YCSB-C (100% read)</div><div class="track"><div class="fill" style="width:100%">74,648 ops/s</div></div></div>
+      <div class="bar"><div class="lab">YCSB-B (95/5)</div><div class="track"><div class="fill" style="width:98%">73,011 ops/s</div></div></div>
+      <div class="bar"><div class="lab">YCSB-A (50/50)</div><div class="track"><div class="fill" style="width:70%">52,281 ops/s</div></div></div>
+      <div class="bar"><div class="lab">YCSB-F (RMW)</div><div class="track"><div class="fill" style="width:52%">39,068 ops/s</div></div></div>
+    </div>
+
+    <div class="callout" style="margin-top:24px;">
+      <strong>Jepsen chaos:</strong> 10 SIGKILL iterations, 64,848 acked writes,
+      <strong>zero lost</strong>. Crash recovery: torn-tail WAL, CRC corruption — engine opens cleanly.
+    </div>
   </div>
 </section>
 
+<!-- Compare -->
 <section id="compare">
   <div class="wrap">
-    <h2>How it compares</h2>
-    <p class="lead">Take each leader's advantage, close the gaps. StrikeDB is the only engine with RAG,
-      lineage-native memory, and a built-in MITM cache debugger.</p>
-    <div style="overflow-x:auto">
-    <table class="cmp">
-      <tr><th>Capability</th><th>Redis</th><th>pgvector</th><th>Milvus</th><th>Mem0</th><th>SpacetimeDB</th><th>StrikeDB</th></tr>
-      <tr><td>KV / counters</td><td>✅</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td><td class="us">✅</td></tr>
-      <tr><td>Relational</td><td>❌</td><td>✅</td><td>❌</td><td>❌</td><td>✅</td><td class="us">✅</td></tr>
-      <tr><td>Vector / ANN</td><td>❌</td><td>⚠️</td><td>✅</td><td>⚠️</td><td>❌</td><td class="us">✅</td></tr>
-      <tr><td>RAG as a query</td><td>❌</td><td>❌</td><td>⚠️</td><td>❌</td><td>❌</td><td class="us">✅</td></tr>
-      <tr><td>AI agent memory</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td><td>❌</td><td class="us">✅</td></tr>
-      <tr><td>MITM cache debug</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td class="us">✅</td></tr>
-      <tr><td>In-DB logic</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td><td class="us">✅</td></tr>
-      <tr><td>One license</td><td>n/a</td><td>PG</td><td>✅</td><td>MIT</td><td>✅</td><td class="us">Apache-2.0</td></tr>
-    </table>
-    </div>
+    <div class="section-badge">Market Map</div>
+    <h2>How it <span class="grad">compares</span></h2>
+    <p class="lead">Each leader's advantage, the gaps closed. StrikeDB is the <strong>only engine</strong>
+      with cost-based RAG, 7-type agent memory, bi-temporal facts, and a built-in MITM cache debugger.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Capability</th><th>Redis</th><th>pgvector</th><th>Qdrant</th><th>Milvus</th><th>Mem0</th><th>Zep</th><th>SpacetimeDB</th><th>StrikeDB</th></tr>
+      <tr><td>KV / counters</td><td>yes</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td class="hl">yes</td></tr>
+      <tr><td>Relational tables</td><td>no</td><td>yes</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td class="hl">yes</td></tr>
+      <tr><td>Vector / ANN</td><td>no</td><td>warn</td><td>yes</td><td>yes</td><td>warn</td><td>warn</td><td>no</td><td class="hl">INT8+f32</td></tr>
+      <tr><td>Time-series</td><td>no</td><td>warn</td><td>no</td><td>warn</td><td>no</td><td>no</td><td>no</td><td class="hl">native</td></tr>
+      <tr><td>Pub/sub push</td><td>yes</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td class="hl">wire-level</td></tr>
+      <tr><td>RAG as query</td><td>no</td><td>no</td><td>warn</td><td>warn</td><td>no</td><td>no</td><td>no</td><td class="hl">cost-based</td></tr>
+      <tr><td>Graph memory</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td>yes</td><td>no</td><td class="hl">typed edges</td></tr>
+      <tr><td>Bi-temporal</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td>no</td><td class="hl">native</td></tr>
+      <tr><td>Procedural mem</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td>no</td><td>no</td><td class="hl">per-agent</td></tr>
+      <tr><td>MITM cache debug</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td class="hl">built-in</td></tr>
+      <tr><td>In-DB logic</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>yes</td><td class="hl">fuel-metered</td></tr>
+      <tr><td>One license</td><td>BSD</td><td>PostgreSQL</td><td>Apache-2.0</td><td>Apache-2.0</td><td>MIT</td><td>Apache-2.0</td><td>BSL</td><td class="hl">Apache-2.0</td></tr>
+    </table></div>
   </div>
 </section>
 
+<!-- Quick Start -->
 <section id="start">
   <div class="wrap">
-    <h2>Get running in 30 seconds</h2>
-    <pre><code># build (pure stdlib Rust — no external crates)
+    <div class="section-badge">Quick Start</div>
+    <h2>Running in <span class="grad">30 seconds</span></h2>
+    <pre><code># build — pure stdlib Rust, zero external crates
 cargo build --release
 
-# serve the RESP wire on 127.0.0.1:6380
+# launch on the RESP wire
 DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380
 
 # talk to it with any Redis client
-redis-cli -p 6380 PING                 # PONG
+redis-cli -p 6380 PING                 # -> PONG
+redis-cli -p 6380 SET user:1 ada
 redis-cli -p 6380 VADD 1 1.0 0.0 0.0
 redis-cli -p 6380 VSEARCH 5 1.0 0.0 0.0
+redis-cli -p 6380 SUBSCRIBE trades &
+redis-cli -p 6380 PUBLISH trades "hello"
+redis-cli -p 6380 CHECKPOINT           # snapshot + WAL truncate
 
-# full production test + benchmark suite
+# native Rust bench — 18 sections, YCSB, chaos
+cargo run --release -p bench
+
+# Python integration + fuzz + crash recovery
 python3 tests/test_dbstrike.py</code></pre>
-    <p class="lead" style="margin-top:18px"><a href="docs/index.html">Open the full documentation →</a></p>
+    <p style="margin-top:20px;"><a href="docs/index.html" style="color:var(--cyan); font-weight:600; font-size:16px;">Open the full documentation &rarr;</a></p>
   </div>
 </section>
 
+</div>
+
+<!-- Footer -->
 <footer>
-  <div class="wrap">StrikeDB · One engine, every data model · Apache-2.0 · Built with Rust, zero external crates.</div>
+  <div class="wrap">
+    <div class="ft-links">
+      <a href="#features">Features</a>
+      <a href="#memory">Memory</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#compare">Compare</a>
+      <a href="docs/index.html">Docs</a>
+      <a href="https://github.com/Mr-DS-ML-85/StrikeDB">GitHub</a>
+    </div>
+    <strong>StrikeDB</strong> &middot; One engine, every data model &middot; Apache-2.0 &middot;
+    Built with Rust, zero external crates
+  </div>
 </footer>
 
+<script>
+// Particles
+(function(){
+  const c = document.getElementById('particles');
+  for(let i = 0; i < 35; i++){
+    const p = document.createElement('div');
+    p.className = 'particle';
+    p.style.left = Math.random()*100 + '%';
+    p.style.animationDelay = Math.random()*10 + 's';
+    p.style.animationDuration = (7 + Math.random()*7) + 's';
+    p.style.width = p.style.height = (2 + Math.random()*4) + 'px';
+    c.appendChild(p);
+  }
+})();
+
+// Scroll fade-in
+(function(){
+  const obs = new IntersectionObserver(es => {
+    es.forEach(e => { if(e.isIntersecting) e.target.classList.add('visible'); });
+  }, { threshold: 0.06 });
+  document.querySelectorAll('.fade-up, .card, .hero-stat').forEach(el => obs.observe(el));
+})();
+
+// Animate benchmark bars on scroll
+(function(){
+  const obs = new IntersectionObserver(es => {
+    es.forEach(e => {
+      if(e.isIntersecting){
+        e.target.querySelectorAll('.fill').forEach(f => {
+          const w = f.style.width; f.style.width = '0%';
+          requestAnimationFrame(() => { requestAnimationFrame(() => { f.style.width = w; }); });
+        });
+      }
+    });
+  }, { threshold: 0.2 });
+  document.querySelectorAll('.bars').forEach(el => obs.observe(el));
+})();
+</script>
+
+<!-- Three.js 3D Scene -->
 <script type="importmap">
 { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
 </script>
 <script type="module">
 import * as THREE from 'three';
 const canvas = document.getElementById('hero-canvas');
-const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
-renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
-camera.position.set(0,0,10);
+camera.position.set(0, 0, 10);
 
 const group = new THREE.Group(); scene.add(group);
 
-// core: glowing icosahedron = the unified engine
-const core = new THREE.Mesh(
-  new THREE.IcosahedronGeometry(1.5, 1),
-  new THREE.MeshStandardMaterial({color:0x0a0e16, emissive:0x22d3ee, emissiveIntensity:.35, metalness:.6, roughness:.3, flatShading:true})
-);
+// Core: glowing icosahedron = the unified engine
+const coreGeo = new THREE.IcosahedronGeometry(1.6, 1);
+const coreMat = new THREE.MeshStandardMaterial({
+  color: 0x0a0e16, emissive: 0x06d6a0, emissiveIntensity: 0.4,
+  metalness: 0.65, roughness: 0.25, flatShading: true
+});
+const core = new THREE.Mesh(coreGeo, coreMat);
 group.add(core);
 
-const wire = new THREE.Mesh(
-  new THREE.IcosahedronGeometry(1.52,1),
-  new THREE.MeshBasicMaterial({color:0xff4fd8, wireframe:true, transparent:true, opacity:.25})
-);
+// Wireframe overlay
+const wireGeo = new THREE.IcosahedronGeometry(1.63, 1);
+const wireMat = new THREE.MeshBasicMaterial({ color: 0x7b2ff7, wireframe: true, transparent: true, opacity: 0.2 });
+const wire = new THREE.Mesh(wireGeo, wireMat);
 group.add(wire);
 
-const labels = ['KV','VEC','TBL','TS','SUB','RED','MEM','RAG'];
-const shards = [];
-labels.forEach((t,i)=>{
-  const a = (i/labels.length)*Math.PI*2;
-  const r = 3.4;
-  const m = new THREE.Mesh(
-    new THREE.BoxGeometry(.55,.55,.55),
-    new THREE.MeshStandardMaterial({color:0x0c0f17, emissive:0x22d3ee, emissiveIntensity:.5, metalness:.5, roughness:.4})
-  );
-  m.position.set(Math.cos(a)*r, Math.sin(a)*r*0.6, Math.sin(a*1.3)*1.2);
-  m.userData = {a, r, base:m.position.clone()};
-  group.add(m); shards.push(m);
-  // link line to core
-  const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), m.position]);
-  const line = new THREE.Line(g, new THREE.LineBasicMaterial({color:0x1b3a4a, transparent:true, opacity:.5}));
-  group.add(line);
+// Second wireframe (magenta, slower)
+const wire2Geo = new THREE.IcosahedronGeometry(1.7, 2);
+const wire2Mat = new THREE.MeshBasicMaterial({ color: 0xef476f, wireframe: true, transparent: true, opacity: 0.1 });
+const wire2 = new THREE.Mesh(wire2Geo, wire2Mat);
+group.add(wire2);
+
+// Orbiting cubes = data models
+const labels = ['KV', 'VEC', 'TBL', 'TS', 'PUB', 'RED', 'MEM', 'RAG'];
+const cubes = [];
+const cubeColors = [0x06d6a0, 0x118ab2, 0x7b2ff7, 0xef476f, 0xffd166, 0x06d6a0, 0x118ab2, 0xef476f];
+labels.forEach((t, i) => {
+  const a = (i / labels.length) * Math.PI * 2;
+  const r = 3.6;
+  const size = 0.4 + Math.random() * 0.2;
+  const geo = i % 2 === 0
+    ? new THREE.BoxGeometry(size, size, size)
+    : new THREE.OctahedronGeometry(size * 0.7, 0);
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x0c0f17, emissive: cubeColors[i], emissiveIntensity: 0.55,
+    metalness: 0.55, roughness: 0.35
+  });
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(Math.cos(a) * r, Math.sin(a) * r * 0.55, Math.sin(a * 1.3) * 1.3);
+  m.userData = { a, r, base: m.position.clone(), idx: i };
+  group.add(m); cubes.push(m);
+
+  // connecting line to core
+  const pts = [new THREE.Vector3(0, 0, 0), m.position.clone()];
+  const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x1a3a4a, transparent: true, opacity: 0.4 });
+  group.add(new THREE.Line(lineGeo, lineMat));
 });
 
-scene.add(new THREE.AmbientLight(0x223344,.8));
-const p1 = new THREE.PointLight(0x22d3ee, 60, 40); p1.position.set(6,6,8); scene.add(p1);
-const p2 = new THREE.PointLight(0xff4fd8, 50, 40); p2.position.set(-7,-4,4); scene.add(p2);
+// Outer ring particles
+const ringCount = 120;
+const ringGeo = new THREE.BufferGeometry();
+const ringPositions = new Float32Array(ringCount * 3);
+const ringColors = new Float32Array(ringCount * 3);
+const c1 = new THREE.Color(0x06d6a0);
+const c2 = new THREE.Color(0xef476f);
+for (let i = 0; i < ringCount; i++) {
+  const a = (i / ringCount) * Math.PI * 2;
+  const r = 4.5 + Math.random() * 0.5;
+  ringPositions[i*3] = Math.cos(a) * r;
+  ringPositions[i*3+1] = (Math.random() - 0.5) * 0.3;
+  ringPositions[i*3+2] = Math.sin(a) * r;
+  const mix = Math.random();
+  ringColors[i*3] = c1.r * mix + c2.r * (1-mix);
+  ringColors[i*3+1] = c1.g * mix + c2.g * (1-mix);
+  ringColors[i*3+2] = c1.b * mix + c2.b * (1-mix);
+}
+ringGeo.setAttribute('position', new THREE.BufferAttribute(ringPositions, 3));
+ringGeo.setAttribute('color', new THREE.BufferAttribute(ringColors, 3));
+const ringMat = new THREE.PointsMaterial({ size: 0.04, vertexColors: true, transparent: true, opacity: 0.6 });
+const ring = new THREE.Points(ringGeo, ringMat);
+group.add(ring);
 
-function resize(){
+// Lights
+scene.add(new THREE.AmbientLight(0x223344, 0.9));
+const p1 = new THREE.PointLight(0x06d6a0, 70, 45); p1.position.set(7, 7, 9); scene.add(p1);
+const p2 = new THREE.PointLight(0xef476f, 55, 45); p2.position.set(-8, -5, 5); scene.add(p2);
+const p3 = new THREE.PointLight(0x7b2ff7, 40, 40); p3.position.set(0, -8, -4); scene.add(p3);
+
+function resize() {
   const w = canvas.clientWidth || 600;
-  const h = canvas.clientHeight || 420;
-  renderer.setSize(w,h,false);
-  camera.aspect = w/h; camera.updateProjectionMatrix();
+  const h = canvas.clientHeight || 480;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
 }
 window.addEventListener('resize', resize); resize();
 
 const clock = new THREE.Clock();
-function animate(){
+function animate() {
   const t = clock.getElapsedTime();
-  group.rotation.y = t*0.18;
-  core.rotation.x = t*0.1; core.rotation.y = t*0.13;
-  wire.rotation.y = -t*0.22;
-  shards.forEach((m,i)=>{
-    const a = m.userData.a + t*0.18;
+
+  group.rotation.y = t * 0.15;
+
+  core.rotation.x = t * 0.08;
+  core.rotation.y = t * 0.11;
+  wire.rotation.y = -t * 0.2;
+  wire.rotation.x = t * 0.05;
+  wire2.rotation.y = t * 0.12;
+  wire2.rotation.z = -t * 0.08;
+
+  cubes.forEach((m, i) => {
+    const a = m.userData.a + t * 0.15;
     const r = m.userData.r;
-    m.position.x = Math.cos(a)*r;
-    m.position.y = Math.sin(a)*r*0.6 + Math.sin(t*1.5+i)*0.08;
-    m.position.z = Math.sin(a*1.3)*1.2;
-    m.rotation.x = t; m.rotation.y = t*0.7;
+    m.position.x = Math.cos(a) * r;
+    m.position.y = Math.sin(a) * r * 0.55 + Math.sin(t * 1.5 + i) * 0.1;
+    m.position.z = Math.sin(a * 1.3) * 1.3;
+    m.rotation.x = t * 0.8;
+    m.rotation.y = t * 0.6;
   });
-  const pulse = 0.35 + Math.sin(t*2)*0.12;
-  core.material.emissiveIntensity = pulse;
-  renderer.render(scene,camera);
+
+  ring.rotation.y = t * 0.06;
+
+  const pulse = 0.4 + Math.sin(t * 2) * 0.15;
+  coreMat.emissiveIntensity = pulse;
+
+  renderer.render(scene, camera);
   requestAnimationFrame(animate);
 }
 animate();
