@@ -488,7 +488,7 @@ SIGKILL'd, then reopened, then every acked key is verified.
 ```
 
 See the
-[📚 docs](docs/index.html) for the deep dives.
+[📚 docs](https://strikedb.devforge.qzz.io/docs/index.html) for the deep dives.
 
 ---
 
