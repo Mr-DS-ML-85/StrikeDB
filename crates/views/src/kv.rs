@@ -25,16 +25,18 @@ impl Kv {
 
     /// Coalesced multi-SET: land N (key, value) pairs under ONE commit ts,
     /// ONE WAL append, ONE fsync. Used by the server's pipelined dispatch
-    /// path to amortize fsync across a burst of pipelined SETs — takes
-    /// durable SET throughput from ~65k/s (per-command fsync) to a fully
-    /// batched fsync rate limited only by the disk / group-commit window.
-    pub fn set_batch(&self, kvs: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+    /// path to amortize fsync across a burst of pipelined SETs.
+    ///
+    /// Takes ownership of the pairs so the value bytes are MOVED (not cloned)
+    /// into the engine. Keys arrive pre-prefixed with `kv:`, so there is no
+    /// second allocation per key — at 16M ops/s every avoided clone counts.
+    pub fn set_batch(&self, kvs: Vec<(Vec<u8>, Vec<u8>)>) -> std::io::Result<()> {
         if kvs.is_empty() {
             return Ok(());
         }
         let entries: Vec<(Vec<u8>, Value)> = kvs
-            .iter()
-            .map(|(key, val)| (k(key), Value::Bytes(val.clone())))
+            .into_iter()
+            .map(|(key, val)| (key, Value::Bytes(val)))
             .collect();
         self.engine.put_batch(entries).map(|_| ())
     }

@@ -161,39 +161,50 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
                 if cmd.is_empty() {
                     return false;
                 }
-                let name = String::from_utf8_lossy(&cmd[0]).to_uppercase();
-                (name == "SET" && cmd.len() == 3) ||
-                (name == "MSET" && cmd.len() >= 3 && (cmd.len() - 1) % 2 == 0)
+                let name = &cmd[0];
+                (name.eq_ignore_ascii_case(b"SET") && cmd.len() == 3)
+                    || (name.eq_ignore_ascii_case(b"MSET")
+                        && cmd.len() >= 3
+                        && (cmd.len() - 1) % 2 == 0)
             }
             if is_coalescable_set(&cmds[i]) {
-                let mut kvs: Vec<(String, Vec<u8>)> = Vec::new();
-                let mut reply_shape: Vec<u8> = Vec::new(); // 1 = +OK per cmd
+                let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 while i < cmds.len() && is_coalescable_set(&cmds[i]) {
-                    let cname = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
-                    let cargs = &cmds[i][1..];
-                    if cname == "SET" {
-                        let key = String::from_utf8_lossy(&cargs[0]).to_string();
-                        kvs.push((key, cargs[1].clone()));
+                    // Take ownership of the command so the value bytes can be
+                    // MOVED (not cloned) straight into the engine — at 16M ops/s
+                    // a per-value heap clone is a measurable allocator tax.
+                    let mut cmd = std::mem::take(&mut cmds[i]);
+                    let cargs = &cmd[1..];
+                    if cmd[0].eq_ignore_ascii_case(b"SET") {
+                        let mut kb = Vec::with_capacity(3 + cargs[0].len());
+                        kb.extend_from_slice(b"kv:");
+                        kb.extend_from_slice(&cargs[0]);
+                        let val = std::mem::take(&mut cmd[2]);
+                        kvs.push((kb, val));
                     } else {
                         // MSET k v k v ...
                         for pair in cargs.chunks(2) {
-                            let key = String::from_utf8_lossy(&pair[0]).to_string();
-                            kvs.push((key, pair[1].clone()));
+                            let mut kb = Vec::with_capacity(3 + pair[0].len());
+                            kb.extend_from_slice(b"kv:");
+                            kb.extend_from_slice(&pair[0]);
+                            kvs.push((kb, pair[1].clone()));
                         }
                     }
-                    reply_shape.push(1); // one +OK per command in the pipeline
                     i += 1;
                 }
-                match db.kv.set_batch(&kvs) {
+                let n = kvs.len();
+                match db.kv.set_batch(kvs) {
                     Ok(_) => {
-                        for _ in &reply_shape {
-                            write_resp_buf(&mut writer, &Resp::Simple("OK".into()))?;
+                        // One "+OK\r\n" per command, written straight to the
+                        // buffered socket — no per-reply Resp alloc / encode.
+                        for _ in 0..n {
+                            writer.write_all(b"+OK\r\n")?;
                         }
                     }
                     Err(e) => {
-                        let emsg = e.to_string();
-                        for _ in &reply_shape {
-                            write_resp_buf(&mut writer, &err(&emsg))?;
+                        let e = err(&e.to_string());
+                        for _ in 0..n {
+                            write_resp_buf(&mut writer, &e)?;
                         }
                     }
                 }
@@ -330,11 +341,16 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if args.is_empty() || args.len() % 2 != 0 {
                 return err("MSET requires an even number of args (k v k v ...)");
             }
-            let kvs: Vec<(String, Vec<u8>)> = args
+            let kvs: Vec<(Vec<u8>, Vec<u8>)> = args
                 .chunks(2)
-                .map(|c| (String::from_utf8_lossy(&c[0]).to_string(), c[1].clone()))
+                .map(|c| {
+                    let mut kb = Vec::with_capacity(3 + c[0].len());
+                    kb.extend_from_slice(b"kv:");
+                    kb.extend_from_slice(&c[0]);
+                    (kb, c[1].clone())
+                })
                 .collect();
-            match db.kv.set_batch(&kvs) {
+            match db.kv.set_batch(kvs) {
                 Ok(_) => Resp::Simple("OK".into()),
                 Err(e) => err(&e.to_string()),
             }
