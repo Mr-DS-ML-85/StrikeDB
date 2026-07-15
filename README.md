@@ -542,3 +542,6 @@ See [`architecture.md`](architecture.md) and the
 ## 📜 License
 
 Apache-2.0. One license, one engine, no bolt-ons.
+
+## ⚠️ Known issue: Firefox Android DoH caching bug with custom domains.
+Use Brave, Chrome, or disable DoH in Firefox settings.
