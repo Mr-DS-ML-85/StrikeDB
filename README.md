@@ -487,7 +487,7 @@ SIGKILL'd, then reopened, then every acked key is verified.
 └────────────────────────────────┘
 ```
 
-See [`architecture.md`](architecture.md) and the
+See the
 [📚 docs](docs/index.html) for the deep dives.
 
 ---
