@@ -14,7 +14,7 @@ licenses, five release cadences, and five places for drift to hide.
 > "Development at the speed of light" — but with the gaps fixed that every system
 > you've been stitching together leaves open.
 
-[📚 Docs](docs/index.html) · [🚀 Live Benchmarks](docs/index.html#benchmarks) · [🧠 Agent Memory](docs/index.html#memory) · [🔍 MITM Cache Debugger](docs/index.html#mitm)
+[📚 Docs](https://strikedb.devforge.qzz.io/docs/index.html) · [🚀 Live Benchmarks](https://strikedb.devforge.qzz.io//#benchmarks) · [🧠 Agent Memory](https://strikedb.devforge.qzz.io/#memory) · [🔍 MITM Cache Debugger](https://strikedb.devforge.qzz.io/docs/index.html#mitm)
 
 ---
 
