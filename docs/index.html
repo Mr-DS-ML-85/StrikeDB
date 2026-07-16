@@ -900,11 +900,40 @@ CACHE.BUGS                      # every bug trace</code></pre>
       <div class="table-wrap"><table>
         <tr><th>Op / Pipeline</th><th>-P 64</th><th>-P 256</th><th>-P 1024</th><th>Redis 8 (in-mem)</th><th>Redis 8 (AOF)</th></tr>
         <tr><td><strong>SET</strong></td><td class="hl">5.88M/s</td><td class="hl">12.1M/s</td><td class="hl">~17M/s</td><td>2.94M/s</td><td>2.30M/s</td></tr>
-        <tr><td><strong>GET</strong></td><td class="hl">5.88M/s</td><td class="hl">13.3M/s</td><td class="hl">~16M/s</td><td>4.17M/s</td><td>6.41M/s</td></tr>
+        <tr><td><strong>GET</strong></td><td class="hl">5.88M/s</td><td class="hl">13.3M/s</td><td class="hl">16.4M/s</td><td>4.17M/s</td><td>6.41M/s</td></tr>
         <tr><td>MSET (10 keys)</td><td>3.51M/s</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
       </table></div>
       <p><strong>Latency:</strong> durable SET p99 = <strong>6.6ms</strong> at -P1024 —
         <strong>~5x lower p99</strong> than Redis AOF everysec while sustaining <strong>~7x throughput</strong>.</p>
+
+      <h3>Reproduce these numbers</h3>
+      <p>Build the release binary, raise the per-process fd limit, then run with
+        <code>-c 100</code> (the sweet spot — <code>-c 50</code> under-saturates the
+        group-commit flusher and drops to ~600k/s; <code>-c 200+</code> contends on it).
+        Numbers vary run-to-run; the table above is the typical envelope.</p>
+      <pre><code>cargo build --release
+ulimit -n 100000
+
+pkill -9 dbstrike 2>/dev/null; sleep 0.3
+rm -f /tmp/dbstrike_p256.wal /tmp/dbstrike_p256.wal.snap
+DBSTRIKE_WAL=/tmp/dbstrike_p256.wal ./target/release/dbstrike 127.0.0.1:6433 >/dev/null 2>&1 &
+SVR=$!; sleep 0.3
+
+echo "== DURABLE @ -P64 ==";  redis-benchmark -h 127.0.0.1 -p 6433 -P 64  -c 100 -n 200000 -t set,get 2>&amp;1 | grep "throughput summary"
+echo "== DURABLE @ -P256 =="; redis-benchmark -h 127.0.0.1 -p 6433 -P 256 -c 100 -n 400000 -t set,get 2>&amp;1 | grep "throughput summary"
+echo "== DURABLE @ -P1024 ==";redis-benchmark -h 127.0.0.1 -p 6433 -P 1024 -c 100 -n 1000000 -t set,get 2>&amp;1 | grep "throughput summary"
+
+kill -9 $SVR; sleep 0.3
+echo "== NON-DURABLE (DBSTRIKE_SYNC=0) @ -P256 =="
+rm -f /tmp/dbstrike_p256.wal
+DBSTRIKE_WAL=/tmp/dbstrike_p256.wal DBSTRIKE_SYNC=0 ./target/release/dbstrike 127.0.0.1:6434 >/dev/null 2>&1 &
+SVR=$!; sleep 0.3
+redis-benchmark -h 127.0.0.1 -p 6434 -P 256 -c 100 -n 400000 -t set,get 2>&amp;1 | grep "throughput summary"
+kill -9 $SVR; wait 2>/dev/null; true</code></pre>
+      <p>Typical envelope on the reference box: <strong>SET 5.88M / 12.1M / ~17M</strong>
+        and <strong>GET 5.88M / 13.3M / 16.4M</strong> ops/s at -P 64 / 256 / 1024.
+        Redis 8.0.5 (same box) lands at 2.94M SET (in-mem) / 2.30M (AOF) and
+        4.17M GET — so StrikeDB is ~3-6x faster on the pipelined path.</p>
 
       <h3>Over RESP Wire</h3>
       <div class="table-wrap"><table>

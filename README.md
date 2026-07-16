@@ -338,6 +338,45 @@ across more work, so throughput scales.
 | SET | 6.06M /s | 11.8M /s | ≈16.9M /s |
 | GET | 5.88M /s | 13.8M /s | 16.4M /s |
 
+> **Why durable ≈ non-durable at high `-P`:** the group-commit flusher
+> already amortizes one `fsync` across the entire 256/1024-command pipeline
+> batch, so at high pipeline depths fsync is *not* the bottleneck — wire +
+> dispatch + version-chain cost dominates, and that cost is identical in both
+> modes. `DBSTRIKE_SYNC=0` only pulls clearly ahead at **low `-P` / single
+> connection**, where each small batch would otherwise pay a fresh fsync. The
+> big win of non-durable mode is the **latency tail**, not pipelined throughput.
+
+### Reproduce these numbers
+
+Build the release binary and raise the per-process fd limit, then run with
+`-c 100` — that is the saturation sweet spot. `-c 50` under-feeds the
+group-commit flusher and drops to ~600k/s; `-c 200+` contends on it; `-c 800`
+needs the raised `ulimit`. Absolute numbers vary run-to-run (the table above is
+the typical envelope); Redis 8.0.5 on the same box is the comparison baseline.
+
+```bash
+cargo build --release
+ulimit -n 100000
+
+pkill -9 dbstrike 2>/dev/null; sleep 0.3
+rm -f /tmp/dbstrike_p256.wal /tmp/dbstrike_p256.wal.snap
+DBSTRIKE_WAL=/tmp/dbstrike_p256.wal ./target/release/dbstrike 127.0.0.1:6433 >/dev/null 2>&1 &
+SVR=$!; sleep 0.3
+
+echo "== DURABLE @ -P64 ==";   redis-benchmark -h 127.0.0.1 -p 6433 -P 64  -c 100 -n 200000 -t set,get 2>&1 | grep "throughput summary"
+echo "== DURABLE @ -P256 ==";  redis-benchmark -h 127.0.0.1 -p 6433 -P 256 -c 100 -n 400000 -t set,get 2>&1 | grep "throughput summary"
+echo "== DURABLE @ -P1024 =="; redis-benchmark -h 127.0.0.1 -p 6433 -P 1024 -c 100 -n 1000000 -t set,get 2>&1 | grep "throughput summary"
+
+kill -9 $SVR; sleep 0.3
+
+echo "== NON-DURABLE (DBSTRIKE_SYNC=0) @ -P256 =="
+rm -f /tmp/dbstrike_p256.wal
+DBSTRIKE_WAL=/tmp/dbstrike_p256.wal DBSTRIKE_SYNC=0 ./target/release/dbstrike 127.0.0.1:6434 >/dev/null 2>&1 &
+SVR=$!; sleep 0.3
+redis-benchmark -h 127.0.0.1 -p 6434 -P 256 -c 100 -n 400000 -t set,get 2>&1 | grep "throughput summary"
+kill -9 $SVR; wait 2>/dev/null; true
+```
+
 **Latency — the tail, not just throughput.** At `-P1024 -c100` StrikeDB's
 durable SET holds **p99 ≈ 6.6 ms, max ≈ 7.1 ms**: no pathological tail.
 Against Redis's *durable* mode (AOF `everysec`) StrikeDB shows **~5× lower
