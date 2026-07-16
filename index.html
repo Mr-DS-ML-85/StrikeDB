@@ -495,7 +495,17 @@ redis-cli -p 6380 MEM.TRAV alice 3
 
 # bi-temporal — "what did we know at time T?"
 redis-cli -p 6380 MEM.REMEMBER.T "CEO of Acme" user 0.8 3000 0 1.0 0.2 0.0
-redis-cli -p 6380 MEM.RECALL.AS_OF 5 "CEO" 5000 1.0 0.2 0.0</code></pre>
+redis-cli -p 6380 MEM.RECALL.AS_OF 5 "CEO" 5000 1.0 0.2 0.0
+
+# working memory (TTL-cleared per-agent context)
+redis-cli -p 6380 MEM.WM_SET alice session_ctx "midnight launch plan" 60000
+redis-cli -p 6380 MEM.WM_GET alice session_ctx
+redis-cli -p 6380 MEM.WM_DELETE alice session_ctx
+
+# episodic — append-only event log, queryable by agent + kind
+redis-cli -p 6380 MEM.EPISODE alice click '{"page":"/pricing"}'
+redis-cli -p 6380 MEM.EPISODES alice 50
+redis-cli -p 6380 MEM.EPISODE_FORGET alice &lt;seq&gt;</code></pre>
   </div>
 </section>
 

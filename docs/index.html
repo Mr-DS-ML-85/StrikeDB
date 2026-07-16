@@ -678,6 +678,8 @@ python3 tests/test_dbstrike.py</code></pre>
         <tr><td><code>MEM.REMEMBER.T</code></td><td>text source sal vf vt f1...</td><td>:id (bi-temporal)</td></tr>
         <tr><td><code>MEM.RECALL.AS_OF</code></td><td>k query as_of f1...</td><td>valid facts</td></tr>
         <tr><td><code>MEM.PROC.SET / GET / LIST</code></td><td>agent name [body]</td><td>OK / body / array</td></tr>
+        <tr><td><code>MEM.WM_SET / GET / DELETE</code></td><td>agent key [value] ttl_ms</td><td>OK / bulk / OK</td></tr>
+        <tr><td><code>MEM.EPISODE / EPISODES / FORGET</code></td><td>agent kind payload / agent limit / agent seq</td><td>:seq / array / OK</td></tr>
       </table></div>
 
       <h3>RAG & MITM Debugger</h3>
@@ -838,7 +840,17 @@ MEM.TRAV alice 3
 
 # bi-temporal
 MEM.REMEMBER.T "CEO of Acme" user 0.8 3000 0 1.0 0.2 0.0
-MEM.RECALL.AS_OF 5 "CEO" 5000 1.0 0.2 0.0</code></pre>
+MEM.RECALL.AS_OF 5 "CEO" 5000 1.0 0.2 0.0
+
+# working memory (TTL-cleared per-agent context)
+MEM.WM_SET alice session_ctx "midnight launch plan" 60000
+MEM.WM_GET alice session_ctx
+MEM.WM_DELETE alice session_ctx
+
+# episodic — append-only event log, queryable by agent + kind
+MEM.EPISODE alice click '{"page":"/pricing"}'
+MEM.EPISODES alice 50
+MEM.EPISODE_FORGET alice &lt;seq&gt;</code></pre>
     </section>
 
     <!-- RAG -->
