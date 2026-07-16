@@ -183,10 +183,10 @@ fn s2_kv() {
     kv.set("user:1", b"ada").unwrap();
     kv.set("user:2", b"bob").unwrap();
     kv.set("post:1", b"hi").unwrap();
-    let mut keys = kv.keys_prefix("user:");
+    let mut keys = kv.keys_prefix(b"user:");
     keys.sort();
-    check("prefix scan", keys == vec!["user:1".to_string(), "user:2".to_string()],
-          &format!("got {keys:?}"));
+    let expect: Vec<Vec<u8>> = vec![b"user:1".to_vec(), b"user:2".to_vec()];
+    check("prefix scan", keys == expect, &format!("got {keys:?}"));
 
     // large blob (10 MB) — round trip
     let big = vec![b'x'; 10 * 1024 * 1024];

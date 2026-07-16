@@ -24,10 +24,10 @@ licenses, five release cadences, and five places for drift to hide.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Dependencies](https://img.shields.io/badge/dependencies-zero%20(crate)--green.svg)
 ![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
-![Tests](https://img.shields.io/badge/tests-211%20passing%20(50%20rust%20%2B%2057%20native%20%2B%20104%20integration)-brightgreen.svg)
-![Durable SET P1024](https://img.shields.io/badge/durable%20SET%20@P1024-14.3M%20ops%2Fs-brightgreen)
+![Tests](https://img.shields.io/badge/tests-228%20passing%20(51%20rust%20%2B%2057%20native%20%2B%20120%20integration)-brightgreen.svg)
+![Durable SET P1024](https://img.shields.io/badge/durable%20SET%20@P1024-17M%20ops%2Fs-brightgreen)
 ![Durable GET P1024](https://img.shields.io/badge/durable%20GET%20@P1024-16.4M%20ops%2Fs-brightgreen)
-![vs Redis SET](https://img.shields.io/badge/vs%20Redis%20SET-4.9×%20faster-brightgreen)
+![vs Redis SET](https://img.shields.io/badge/vs%20Redis%20SET-5.8×%20faster-brightgreen)
 ![vs Redis GET](https://img.shields.io/badge/vs%20Redis%20GET-3.9×%20faster-brightgreen)
 ![Benchmarked with](https://img.shields.io/badge/measured%20with-redis--benchmark-9cf)
 ![1M vectors](https://img.shields.io/badge/1M×384d%20VSEARCH%20p50-159%20µs-brightgreen)
@@ -394,9 +394,10 @@ pipelines (`-P64`) drop p50 to well under 1 ms.
 
 **StrikeDB beats Redis on every op at every pipeline depth**, in both
 durable and non-durable mode — and with lower tail latency in durable mode.
-A burst of 1024 pipelined SETs pays exactly one fsync. Before this refactor
-durable SET was 65 k/s (a **220× regression** from what you see here at
--P1024).
+A burst of 1024 pipelined SETs pays exactly one fsync. Before the
+pipelined-coalescing refactor, durable SET was **65 k/s** — a **~88×**
+regression vs the `-P64` number (5.71M/s) and a **~261×** regression vs the
+`-P1024` number (≈17M/s) shown in the table above.
 
 **Redis-compat command coverage** (all pipelined-coalesced when applicable):
 `PING · SET · GET · MSET · MGET · DEL · INCR · INCRBY · KEYS · DBSIZE ·
@@ -449,6 +450,11 @@ at ef=32 already, higher ef just wastes work.
 | VSEARCH.MANY correctness | 32/32 batched match single calls |
 
 ### Storage & KV — over RESP wire (Python integration suite)
+
+> Latencies below are **per single command** (no pipelining). The
+> millisecond-scale p99s in the "Durable `-P1024`" table above are the
+> *pipelined-burst* tail — the cost of amortizing one fsync across a 1024-command
+> batch — not a per-command number. Both are real and measure different things.
 
 | Operation | p50 | p90 | p99 |
 |---|---:|---:|---:|
@@ -525,9 +531,9 @@ SIGKILL'd, then reopened, then every acked key is verified.
 
 | Suite | Result |
 |---|---|
-| Rust unit tests | **44 passing, 0 failing** |
-| Native Rust bench (in-process, 14 sections) | **56 passing, 0 failing in 2.5s** |
-| Python integration + wire suite (21 sections) | **104 passing, 0 failing in 33s** |
+| Rust unit tests | **51 passing, 0 failing** |
+| Native Rust bench (in-process) | **57 passing, 0 failing in ~17s** |
+| Python integration + wire suite | **120 passing, 0 failing in ~34s** |
 | Fuzz — 200 random wire payloads | server stayed up (0 crashes) |
 | Fuzz — 20 random 1-byte WAL corruptions | engine reopened cleanly all 20 |
 | Crash recovery — SIGKILL mid-write | reopens, earliest pre-kill write survives |
