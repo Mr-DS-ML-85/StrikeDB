@@ -53,13 +53,6 @@ fn ep_key(agent: &str, seq: u64) -> Vec<u8> {
     b.extend_from_slice(&seq.to_be_bytes());
     b
 }
-fn ep_kind_key(agent: &str, seq: u64) -> Vec<u8> {
-    let mut b = b"mem:epk:".to_vec();
-    b.extend_from_slice(agent.as_bytes());
-    b.push(b':');
-    b.extend_from_slice(&seq.to_be_bytes());
-    b
-}
 fn kw_key(token: &str, id: u64) -> Vec<u8> {
     let mut b = b"mem:kw:".to_vec();
     b.extend_from_slice(token.as_bytes());
@@ -207,6 +200,10 @@ pub struct Memory {
     /// IDF (which needs N) is O(1) — was previously an O(N) prefix scan per
     /// recall, catastrophic at scale.
     ltm_count: std::sync::atomic::AtomicU64,
+    /// Monotonic per-engine counter guaranteeing collision-free episodic seqs
+    /// (EP-1): two `episode()` calls in the same millisecond can no longer
+    /// generate identical keys and silently overwrite each other.
+    ep_seq: std::sync::atomic::AtomicU64,
     /// In-memory salience mirror: id → salience. Recall's scoring loop needs
     /// per-doc salience for every candidate that matched any keyword — that
     /// was fetching `Meta` from the substrate per candidate (3 engine.get()
@@ -244,6 +241,7 @@ impl Memory {
             vectors,
             next_id: std::sync::atomic::AtomicU64::new(max + 1),
             ltm_count: std::sync::atomic::AtomicU64::new(count),
+            ep_seq: std::sync::atomic::AtomicU64::new(0),
             salience_cache: std::sync::RwLock::new(sal_cache),
         }
     }
@@ -263,10 +261,13 @@ impl Memory {
         now: u64,
     ) -> std::io::Result<()> {
         let exp = if ttl_ms == 0 { 0 } else { now + ttl_ms };
-        self.engine
-            .put(wm_key(agent, key), Value::Bytes(value.to_vec()))?;
-        self.engine
-            .put(wm_exp_key(agent, key), Value::Int(exp as i64))?;
+        // WM-2: write value + expiry as a single atomic batch so a crash
+        // between the two puts can never leave a permanent (orphaned) entry
+        // with no expiry key.
+        self.engine.put_batch(vec![
+            (wm_key(agent, key), Value::Bytes(value.to_vec())),
+            (wm_exp_key(agent, key), Value::Int(exp as i64)),
+        ])?;
         Ok(())
     }
 
@@ -280,8 +281,20 @@ impl Memory {
         }
         match self.engine.get(&wm_key(agent, key)) {
             Some(Value::Bytes(b)) => Some(b),
-            _ => None,
+            // WM-3: a value deleted externally (DEL / compaction) leaves an
+            // orphaned expiry key behind — clean it up to avoid a slow leak.
+            _ => {
+                let _ = self.engine.delete(wm_exp_key(agent, key));
+                None
+            }
         }
+    }
+
+    // WM-1: proactive eviction before TTL expiry.
+    pub fn wm_delete(&self, agent: &str, key: &str) -> std::io::Result<()> {
+        let _ = self.engine.delete(wm_key(agent, key));
+        let _ = self.engine.delete(wm_exp_key(agent, key));
+        Ok(())
     }
 
     // ── LONG-TERM MEMORY (semantic) ────────────────────────────────────────
@@ -386,14 +399,24 @@ impl Memory {
     }
 
     // ── EPISODIC ───────────────────────────────────────────────────────────
+    /// Append an episode. Returns a globally-unique, monotonic `seq`.
+    ///
+    /// EP-1 fix: `seq` is `now() << 22 | counter`, so two calls in the same
+    /// millisecond get distinct counters instead of clobbering the same key.
+    /// The high bits keep wall-clock ordering; the low bits guarantee
+    /// uniqueness without a per-agent metadata round-trip.
     pub fn episode(&self, agent: &str, kind: &str, payload: &[u8]) -> std::io::Result<u64> {
-        let seq = self.engine.now();
-        self.engine
-            .put(ep_key(agent, seq), Value::Bytes(payload.to_vec()))?;
-        self.engine.put(
-            ep_kind_key(agent, seq),
-            Value::Bytes(kind.as_bytes().to_vec()),
-        )?;
+        let ts = self.engine.now();
+        let c = self.ep_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = (ts << 22) | (c & 0x3F_FFFF);
+        // EP-2 fix: store kind inline in the value (kind_len || kind || payload)
+        // so `episodes()` is a single prefix scan with zero per-episode reads.
+        let mut val = Vec::with_capacity(2 + kind.len() + payload.len());
+        let klen = kind.len() as u16;
+        val.extend_from_slice(&klen.to_be_bytes());
+        val.extend_from_slice(kind.as_bytes());
+        val.extend_from_slice(payload);
+        self.engine.put(ep_key(agent, seq), Value::Bytes(val))?;
         Ok(seq)
     }
 
@@ -406,7 +429,8 @@ impl Memory {
         };
         let mut out = Vec::new();
         for (k, v) in self.engine.scan_prefix(&prefix, self.engine.snapshot()) {
-            if k.len() < 8 {
+            // EP-3 fix: require exactly 8 bytes of seq AFTER the prefix.
+            if k.len() < prefix.len() + 8 {
                 continue;
             }
             let seq = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
@@ -414,20 +438,50 @@ impl Memory {
                 Value::Bytes(b) => b,
                 _ => continue,
             };
-            let kind = match self.engine.get(&ep_kind_key(agent, seq)) {
-                Some(Value::Bytes(b)) => String::from_utf8_lossy(&b).to_string(),
-                _ => String::new(),
+            // EP-2: split inline kind from payload (kind_len || kind || payload)
+            let (kind, body) = if payload.len() >= 2 {
+                let klen = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+                if payload.len() >= 2 + klen {
+                    (
+                        String::from_utf8_lossy(&payload[2..2 + klen]).to_string(),
+                        payload[2 + klen..].to_vec(),
+                    )
+                } else {
+                    (String::new(), payload[2..].to_vec())
+                }
+            } else {
+                (String::new(), payload)
             };
             out.push(Episode {
                 seq,
                 agent: agent.to_string(),
                 kind,
-                payload,
+                payload: body,
             });
         }
         out.sort_by_key(|e| e.seq);
         out.truncate(limit);
         out
+    }
+
+    /// EP-4: evict a single episode.
+    pub fn episode_forget(&self, agent: &str, seq: u64) -> std::io::Result<()> {
+        let _ = self.engine.delete(ep_key(agent, seq));
+        Ok(())
+    }
+
+    /// EP-4: bulk-clear all episodes for an agent.
+    pub fn episodes_clear(&self, agent: &str) -> std::io::Result<()> {
+        let prefix = {
+            let mut b = b"mem:ep:".to_vec();
+            b.extend_from_slice(agent.as_bytes());
+            b.push(b':');
+            b
+        };
+        for (k, _) in self.engine.scan_prefix(&prefix, self.engine.snapshot()) {
+            let _ = self.engine.delete(k);
+        }
+        Ok(())
     }
 
     // ── RECALL (blended semantic + keyword) ────────────────────────────────

@@ -283,6 +283,14 @@ fn err(msg: &str) -> Resp {
     Resp::Error(format!("ERR {msg}"))
 }
 
+/// Wall-clock milliseconds, used as the TTL reference for Working Memory.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// True for I/O errors that just mean "the client hung up mid-request".
 /// These aren't bugs and shouldn't spam the console.
 fn is_benign_disconnect(e: &std::io::Error) -> bool {
@@ -876,6 +884,100 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let agent = String::from_utf8_lossy(&args[0]).to_string();
             let names = db.rag.memory().proc_list(&agent);
             Resp::Array(names.into_iter().map(|s| Resp::Bulk(s.into_bytes())).collect())
+        }
+
+        // ── WORKING MEMORY (STM) ────────────────────────────────────────
+        // MEM.WM_SET agent key value ttl_ms  -> OK
+        "MEM.WM_SET" => {
+            if args.len() != 4 {
+                return err("MEM.WM_SET requires agent key value ttl_ms");
+            }
+            let agent = String::from_utf8_lossy(&args[0]).to_string();
+            let key = String::from_utf8_lossy(&args[1]).to_string();
+            let ttl: u64 = match std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("ttl_ms is not a u64"),
+            };
+            match db.rag.memory().wm_set(&agent, &key, &args[2], ttl, now_ms()) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+        // MEM.WM_GET agent key  -> bulk | nil
+        "MEM.WM_GET" => {
+            if args.len() != 2 {
+                return err("MEM.WM_GET requires agent key");
+            }
+            let agent = String::from_utf8_lossy(&args[0]).to_string();
+            let key = String::from_utf8_lossy(&args[1]).to_string();
+            match db.rag.memory().wm_get(&agent, &key, now_ms()) {
+                Some(b) => Resp::Bulk(b),
+                None => Resp::Nil,
+            }
+        }
+        // MEM.WM_DELETE agent key  -> OK
+        "MEM.WM_DELETE" => {
+            if args.len() != 2 {
+                return err("MEM.WM_DELETE requires agent key");
+            }
+            let agent = String::from_utf8_lossy(&args[0]).to_string();
+            let key = String::from_utf8_lossy(&args[1]).to_string();
+            match db.rag.memory().wm_delete(&agent, &key) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+
+        // ── EPISODIC ────────────────────────────────────────────────────
+        // MEM.EPISODE agent kind payload  -> :seq
+        "MEM.EPISODE" => {
+            if args.len() != 3 {
+                return err("MEM.EPISODE requires agent kind payload");
+            }
+            let agent = String::from_utf8_lossy(&args[0]).to_string();
+            let kind = String::from_utf8_lossy(&args[1]).to_string();
+            match db.rag.memory().episode(&agent, &kind, &args[2]) {
+                Ok(seq) => Resp::Int(seq as i64),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+        // MEM.EPISODES agent limit  -> array of (seq, kind, payload)
+        "MEM.EPISODES" => {
+            if args.len() != 2 {
+                return err("MEM.EPISODES requires agent limit");
+            }
+            let agent = String::from_utf8_lossy(&args[0]).to_string();
+            let limit: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("limit is not a usize"),
+            };
+            let eps = db.rag.memory().episodes(&agent, limit);
+            let out: Vec<Resp> = eps
+                .into_iter()
+                .map(|e| {
+                    Resp::Array(vec![
+                        Resp::Int(e.seq as i64),
+                        Resp::Bulk(e.kind.into_bytes()),
+                        Resp::Bulk(e.payload),
+                    ])
+                })
+                .collect();
+            Resp::Array(out)
+        }
+        // MEM.EPISODE_FORGET agent seq  -> OK
+        "MEM.EPISODE_FORGET" => {
+            if args.len() != 2 {
+                return err("MEM.EPISODE_FORGET requires agent seq");
+            }
+            let agent = String::from_utf8_lossy(&args[0]).to_string();
+            let seq: u64 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("seq is not a u64"),
+            };
+            match db.rag.memory().episode_forget(&agent, seq) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e.to_string()),
+            }
         }
 
         // ── RAG ─────────────────────────────────────────────────────────
