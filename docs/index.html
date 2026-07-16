@@ -591,9 +591,9 @@ footer a { color: var(--cyan); }
         are all <strong>views over one storage substrate</strong>. One engine. One consistency model.
         One license. Zero gaps.</p>
       <div class="callout">
-        <strong>The Combined-Apple approach:</strong> take each category leader's <em>advantage</em>
-        (Redis' speed, Postgres' rigor, Milvus' scale, Mem0's memory, SpacetimeDB's in-DB logic)
-        and close the gaps with novel in-house engineering.
+        <strong>StrikeDB is a single Rust binary</strong> — no bolt-ons, no external crates, no
+        drift. It speaks Redis RESP, so any Redis client works unchanged. 40+ commands, case-insensitive,
+        both array and inline forms.
       </div>
       <p>Built in <strong>pure Rust with zero external crates</strong>. Every line — storage, HNSW,
         agent memory, RAG, MITM debugger, reducers, RESP wire, CDC, HLC, CRDTs — is hand-rolled
@@ -1120,7 +1120,7 @@ kill -9 $SVR; wait 2>/dev/null; true</code></pre>
 
 // ---- Search ----
 const DOCS = [
-  {t:"Introduction — why StrikeDB exists", g:"intro", b:"unified storage substrate, combined-apple approach, zero external crates, pure rust, single license apache"},
+  {t:"Introduction — why StrikeDB exists", g:"intro", b:"unified storage substrate, zero external crates, pure rust, single license apache"},
   {t:"Quick Start — build and serve", g:"install", b:"cargo build, dbstrike binary, DBSTRIKE_WAL, DBSTRIKE_SYNC, redis-cli, bench --tcp --ycsb --chaos, test_dbstrike.py"},
   {t:"RESP Wire — 40+ Redis commands", g:"wire", b:"RESP PING SET GET DEL MSET MGET INCR KEYS DBSIZE VADD VSEARCH VSEARCH.MANY TSADD TSRANGE TSRANGE.LATEST REDUCE CHECKPOINT SUBSCRIBE PUBLISH MEM RAG CACHE"},
   {t:"Unified Substrate — MVCC + WAL", g:"substrate", b:"MVCC, write ahead log, snapshot isolation, optimistic concurrency, 32 shards, hash-tag routing, group commit"},
