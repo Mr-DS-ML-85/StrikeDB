@@ -966,12 +966,22 @@ kill -9 $SVR; wait 2>/dev/null; true</code></pre>
       <h3>YCSB A / B / C / F</h3>
       <div class="table-wrap"><table>
         <tr><th>Workload</th><th>Mix</th><th>Throughput</th></tr>
-        <tr><td>Load</td><td>100% SET</td><td>41,204 ops/s</td></tr>
-        <tr><td><strong>YCSB-A</strong></td><td>50/50 read/update</td><td><strong>52,281 ops/s</strong></td></tr>
-        <tr><td><strong>YCSB-B</strong></td><td>95/5 read/update</td><td><strong>73,011 ops/s</strong></td></tr>
-        <tr><td><strong>YCSB-C</strong></td><td>100% read</td><td><strong>74,648 ops/s</strong></td></tr>
-        <tr><td><strong>YCSB-F</strong></td><td>50/50 read/RMW</td><td><strong>39,068 ops/s</strong></td></tr>
+        <tr><td>Load</td><td>100% SET</td><td>43,537 ops/s</td></tr>
+        <tr><td><strong>YCSB-A</strong></td><td>50/50 read/update</td><td><strong>55,443 ops/s</strong></td></tr>
+        <tr><td><strong>YCSB-B</strong></td><td>95/5 read/update</td><td><strong>75,598 ops/s</strong></td></tr>
+        <tr><td><strong>YCSB-C</strong></td><td>100% read</td><td><strong>78,815 ops/s</strong></td></tr>
+        <tr><td><strong>YCSB-F</strong></td><td>50/50 read/RMW</td><td><strong>40,045 ops/s</strong></td></tr>
       </table></div>
+
+      <p><strong>Why these don't match the M/s <code>redis-benchmark</code>
+      numbers:</strong> YCSB is a <em>mixed / read-heavy</em> workload over the
+      RESP wire with one command per round-trip (no <code>-P1024</code>
+      batching), so it exercises realistic shape, not a raw SET storm. The
+      <code>≈17M/s</code> SET figure is the <em>pipelined × concurrent</em>
+      ceiling (<code>-P1024 -c100</code>). The single-thread in-process SET
+      (~122K/s) is the <em>per-write fsync floor</em>. K/s vs M/s is the same
+      curve seen at different pipelining/concurrency — not a contradiction.
+      Redis shows the identical spread on this box.</p>
 
       <h3>Jepsen Chaos</h3>
       <div class="table-wrap"><table>

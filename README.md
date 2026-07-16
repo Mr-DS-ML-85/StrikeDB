@@ -440,10 +440,18 @@ at ef=32 already, higher ef just wastes work.
 
 ### Storage & KV — in-process (native Rust bench)
 
+> **Axis:** these are **single-client, per-command, fully-durable** numbers
+> (one SET → wait for fsync → repeat), with **no pipelining and no connection
+> concurrency**. They measure the *per-write cost floor*. The **M/s** figures
+> elsewhere (SET 17M / GET 16.4M @ `-P1024 -c100`) are a *different axis*:
+> 1024 commands batched per round-trip × 100 concurrent connections. Pipelining
+> + concurrency is exactly what turns the K/s floor into M/s — see the
+> reconciliation note after the YCSB table.
+
 | Metric | Value |
 |---|---:|
-| Single-thread SET (fsync'd WAL) | **122,931 ops/s** |
-| **8-thread SET (sharded storage + group commit)** | **345,429 ops/s** (**2.8× single-thread**) |
+| Single-thread SET (fsync'd WAL) | **122,048 ops/s** |
+| **8-thread SET (sharded storage + group commit)** | **364,253 ops/s** (**2.97× single-thread**) |
 | 32-thread reducer contention | **0 lost updates** (16,000/16,000 in 0.15s) |
 | 10k×128d VSEARCH p99 (small) | **48 µs** |
 | 10k×128d 8-thread concurrent VSEARCH | **200,182 QPS** |
@@ -476,14 +484,37 @@ KV stores. Loads 100k × 100-byte records, then runs each workload.
 
 | Workload | Mix | Throughput |
 |---|---|---:|
-| Load | 100% SET | 41,204 ops/s |
-| **YCSB-A** | 50% read / 50% update | **52,281 ops/s** |
-| **YCSB-B** | 95% read / 5% update | **73,011 ops/s** |
-| **YCSB-C** | 100% read | **74,648 ops/s** |
-| **YCSB-F** | 50% read / 50% read-modify-write | **39,068 ops/s** |
+| Load | 100% SET | 43,537 ops/s |
+| **YCSB-A** | 50% read / 50% update | **55,443 ops/s** |
+| **YCSB-B** | 95% read / 5% update | **75,598 ops/s** |
+| **YCSB-C** | 100% read | **78,815 ops/s** |
+| **YCSB-F** | 50% read / 50% read-modify-write | **40,045 ops/s** |
 
 *Run yourself:* start `./target/release/dbstrike 127.0.0.1:6399`, then
 `cargo run --release -p bench -- --ycsb 127.0.0.1:6399`
+
+#### Why the three harnesses don't agree (and that's expected)
+
+The numbers above look wildly different from each other and from the
+`redis-benchmark` M/s table. They are **not contradictory** — they measure
+different axes. A reader comparing "17M SET/s" with "122K single-thread SET/s"
+or "74K YCSB-C" should read this first:
+
+| Harness | Axis | What it isolates | Typical SET number |
+|---|---|---|---:|
+| `redis-benchmark -P1024 -c100` | **pipelined × concurrent**, durable | throughput ceiling under ideal batching | **≈17M/s** |
+| YCSB (over RESP, 100k recs) | **mixed / read-heavy** workload | realistic shape (not a raw SET storm) | 40K–79K/s |
+| In-process single-thread SET | **one writer, fully durable, no pipelining** | per-write fsync cost floor | **122K/s** |
+| In-process 8-thread SET | same, but **sharded + group commit** | multithread write scaling | **364K/s** |
+
+The jump from 122K/s (1 fd, 1 command/RTT, fsync per batch) to 17M/s
+(1024 commands/RTT × 100 connections) is *purely* pipelining + concurrency —
+the per-write engine cost is identical in both. YCSB sits lower because it is
+**not a SET-only storm**: YCSB-C is 100% reads, YCSB-A/B/F mix in updates and
+read-modify-write, and every op pays a full RESP round-trip (no `-P1024`
+batching). Redis shows the exact same spread on the same machine (its
+`redis-benchmark -P1` is hundreds of K/s; `-P1024` is millions). So the K/s
+and M/s figures are two ends of the same curve, not two conflicting claims.
 
 ### 💥 Jepsen-style chaos — SIGKILL under load, verify durability
 
