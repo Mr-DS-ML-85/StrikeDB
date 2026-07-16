@@ -586,7 +586,86 @@ def test_procedural_memory():
     c.close()
 
 # ---------------------------------------------------------------------------
-# 13. High-dim vector benchmark — 768-d (real embedding size)
+# 12b. Working memory (STM) + Episodic memory — the two primitives that were
+#     implemented in the library but not exposed over RESP until now.
+# ---------------------------------------------------------------------------
+def test_wm_ep_memory():
+    section("11b. Working + Episodic memory (WM/EP RESP wiring)")
+    c = Resp()
+
+    # ── Working memory: TTL-cleared per-agent context ──
+    check("WM_SET returns OK",
+          c.cmd("MEM.WM_SET", "agentX", "task", "ship-launch", 5000) == "OK")
+    got = c.cmd("MEM.WM_GET", "agentX", "task")
+    check("WM_GET returns value", got == b"ship-launch", f"got={got!r}")
+
+    # overwrite + independent key/agent isolation
+    c.cmd("MEM.WM_SET", "agentX", "task", "post-launch", 5000)
+    check("WM_GET reflects overwrite",
+          c.cmd("MEM.WM_GET", "agentX", "task") == b"post-launch")
+    check("WM_GET other agent -> nil",
+          c.cmd("MEM.WM_GET", "agentY", "task") is None)
+
+    # proactive delete
+    check("WM_DELETE returns OK",
+          c.cmd("MEM.WM_DELETE", "agentX", "task") == "OK")
+    check("WM_GET after delete -> nil",
+          c.cmd("MEM.WM_GET", "agentX", "task") is None)
+
+    # TTL expiry: ttl=1ms, wait, value should be gone
+    c.cmd("MEM.WM_SET", "agentX", "ephemeral", "boom", 1)
+    time.sleep(0.05)
+    check("WM_GET expired entry -> nil (TTL clears)",
+          c.cmd("MEM.WM_GET", "agentX", "ephemeral") is None)
+
+    # ── Episodic memory: append-only event log ──
+    # Two episodes in immediate succession must NOT collide (EP-1 fix).
+    s1 = c.cmd("MEM.EPISODE", "agentX", "click", b'{"page":"/pricing"}')
+    s2 = c.cmd("MEM.EPISODE", "agentX", "click", b'{"page":"/docs"}')
+    check("EPISODE returns distinct seqs (no collision)",
+          isinstance(s1, int) and isinstance(s2, int) and s1 != s2,
+          f"s1={s1} s2={s2}")
+
+    # a third episode, different kind
+    s3 = c.cmd("MEM.EPISODE", "agentX", "message", b"hello")
+    check("EPISODE seq monotonic-ish (s3 > s1)",
+          isinstance(s3, int) and s3 > s1, f"s3={s3}")
+
+    # list newest-limited
+    eps = c.cmd("MEM.EPISODES", "agentX", 50)
+    # server returns array of [seq, kind, payload] groups
+    recs = [(int(e[0]), e[1].decode(), bytes(e[2]))
+             for e in eps]
+    seqs = [r[0] for r in recs]
+    check("EPISODES returns all 3 episodes",
+          len(recs) == 3, f"got={len(recs)}")
+    check("EPISODES seqs sorted ascending",
+          seqs == sorted(seqs), f"{seqs}")
+    kinds = sorted(r[1] for r in recs)
+    check("EPISODES kinds round-trip (EP-2 inline kind)",
+          kinds == ["click", "click", "message"], f"kinds={kinds}")
+    payloads = {r[0]: r[2] for r in recs}
+    check("EPISODES payload round-trips",
+          payloads[s1] == b'{"page":"/pricing"}' and
+          payloads[s2] == b'{"page":"/docs"}' and payloads[s3] == b"hello",
+          f"p1={payloads[s1]!r} p2={payloads[s2]!r} p3={payloads[s3]!r}")
+
+    # forget one, confirm it drops out
+    check("EPISODE_FORGET returns OK",
+          c.cmd("MEM.EPISODE_FORGET", "agentX", s1) == "OK")
+    eps2 = c.cmd("MEM.EPISODES", "agentX", 50)
+    seqs2 = [int(e[0]) for e in eps2]
+    check("EPISODE_FORGET removes the seq", s1 not in seqs2,
+          f"remaining={seqs2}")
+
+    # agent isolation for episodes
+    c.cmd("MEM.EPISODE", "agentY", "click", b"other-agent-event")
+    eps_y = c.cmd("MEM.EPISODES", "agentY", 50)
+    check("EPISODES scoped per agent",
+          len(eps_y) == 1 and bytes(eps_y[0][2]) == b"other-agent-event",
+          f"got={len(eps_y)}")
+    c.close()
+
 # ---------------------------------------------------------------------------
 def test_high_dim_vectors():
     section("12. High-dim vectors — 768-d (SIMD hot path, real embedding size)")
@@ -1262,6 +1341,7 @@ def main():
         run(test_graph_memory)
         run(test_temporal)
         run(test_procedural_memory)
+        run(test_wm_ep_memory)
         run(test_high_dim_vectors)
         run(test_rag_pipeline)
         run(test_protocol_robustness)
