@@ -204,6 +204,40 @@ class DBStrike:
         res = self.cmd("MEM.PROC.LIST", agent)
         return [n.decode() for n in res] if res else []
 
+    # ---- WORKING MEMORY (STM) ----------------------------------------
+    def wm_set(self, agent, key, value, ttl_ms):
+        if isinstance(value, str):
+            value = value.encode()
+        return self.cmd("MEM.WM_SET", agent, key, value, ttl_ms)
+
+    def wm_get(self, agent, key):
+        return self.cmd("MEM.WM_GET", agent, key)
+
+    def wm_delete(self, agent, key):
+        return self.cmd("MEM.WM_DELETE", agent, key)
+
+    # ---- EPISODIC MEMORY --------------------------------------------
+    def episode(self, agent, kind, payload):
+        if isinstance(payload, str):
+            payload = payload.encode()
+        return self.cmd("MEM.EPISODE", agent, kind, payload)
+
+    def episodes(self, agent, limit):
+        raw = self.cmd("MEM.EPISODES", agent, limit)
+        if not raw:
+            return []
+        out = []
+        for e in raw:
+            out.append({
+                "seq": int(e[0]),
+                "kind": e[1].decode(),
+                "payload": e[2],
+            })
+        return out
+
+    def episode_forget(self, agent, seq):
+        return self.cmd("MEM.EPISODE_FORGET", agent, seq)
+
     def _recall_hits(self, raw):
         if not raw:
             return []

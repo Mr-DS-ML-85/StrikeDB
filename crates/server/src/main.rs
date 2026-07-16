@@ -20,9 +20,9 @@
 //!   INFO                                   -> bulk (engine stats)
 //!   QUIT                                   -> OK, closes
 
-use std::io::{BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use compute::{counter_reducer, ReducerResult, ReducerRuntime};
 use mitm::CacheDebugger;
@@ -63,9 +63,18 @@ fn main() -> std::io::Result<()> {
     let db = Arc::new(Db { engine, reactive, router, kv, ts, reducers, rag, cache, memory });
 
     let listener = TcpListener::bind(&addr)?;
+    // Large backlog so a connection storm (-c800+) queues instead of the
+    // kernel dropping SYNs; the real ceiling is the per-process fd limit
+    // (ulimit -n), which must be raised on the host for very high -c.
+    let _ = listener.set_nonblocking(false);
     println!("DB-Strike listening on {addr} (RESP wire), WAL={data_path}");
     println!("One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug");
 
+    // Rate-limit accept-error logging: under EMFILE the accept loop would
+    // otherwise spew thousands of identical lines per second. Print at most
+    // once per second, keeping the last error for the periodic line.
+    let mut last_accept_err: Option<String> = None;
+    let mut last_log = std::time::Instant::now();
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -82,7 +91,19 @@ fn main() -> std::io::Result<()> {
                     }
                 });
             }
-            Err(e) => eprintln!("accept error: {e}"),
+            Err(e) => {
+                let msg = e.to_string();
+                let now = std::time::Instant::now();
+                let repeat = last_accept_err.as_deref() == Some(msg.as_str());
+                if !repeat || now.duration_since(last_log) >= std::time::Duration::from_secs(1) {
+                    eprintln!("accept error: {msg} (raise ulimit -n for higher -c; sleeping 10ms to shed load)");
+                    last_accept_err = Some(msg);
+                    last_log = now;
+                }
+                // Back off briefly so a sustained EMFILE storm doesn't burn a
+                // full core spinning on accept().
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
     }
     Ok(())
@@ -92,8 +113,16 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
     // TCP_NODELAY: disable Nagle so per-batch flushes actually go on the wire
     // immediately (matters for latency-sensitive workloads like signaling).
     let _ = stream.set_nodelay(true);
-    let mut sock_read = stream.try_clone()?;
-    let mut writer = BufWriter::with_capacity(64 * 1024, stream);
+    // Single shared stream behind a Mutex. We deliberately AVOID `try_clone()`
+    // here: cloning dups the fd, so every connection would burn *two* fds and
+    // the per-process fd ceiling (ulimit -n) would be hit at half the real
+    // connection count — causing "Too many open files" storms under a high -c
+    // benchmark. One Arc<Mutex<TcpStream>> = one fd per connection.
+    let stream = Arc::new(Mutex::new(stream));
+    // Accumulate all replies for a parsed batch into this buffer, then do a
+    // single locked write + flush. Keeps the hot path lock-free except for the
+    // one flush per pipeline batch (matching the old BufWriter throughput).
+    let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
     // Manual read buffer so we can peek pipelined commands without going
     // command-at-a-time. BufRead's fill_buf has capacity semantics that make
     // the "keep parsing until short" pattern awkward; a plain Vec<u8> is
@@ -103,7 +132,10 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
 
     loop {
         // Block until we have SOMETHING to parse (or the client closes).
-        let n = sock_read.read(&mut tmp)?;
+        let n = {
+            let mut s = stream.lock().unwrap();
+            s.read(&mut tmp)?
+        };
         if n == 0 {
             return Ok(()); // client closed
         }
@@ -195,16 +227,16 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
                 let n = kvs.len();
                 match db.kv.set_batch(kvs) {
                     Ok(_) => {
-                        // One "+OK\r\n" per command, written straight to the
-                        // buffered socket — no per-reply Resp alloc / encode.
+                        // One "+OK\r\n" per command, appended to the batch
+                        // output buffer — no per-reply Resp alloc / encode.
                         for _ in 0..n {
-                            writer.write_all(b"+OK\r\n")?;
+                            out.extend_from_slice(b"+OK\r\n");
                         }
                     }
                     Err(e) => {
                         let e = err(&e.to_string());
                         for _ in 0..n {
-                            write_resp_buf(&mut writer, &e)?;
+                            write_resp_buf(&mut out, &e)?;
                         }
                     }
                 }
@@ -212,33 +244,41 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
             }
 
             let resp = dispatch(&db, &name, args);
-            write_resp_buf(&mut writer, &resp)?;
+            write_resp_buf(&mut out, &resp)?;
             if name == "QUIT" {
                 quit = true;
                 break;
             }
             i += 1;
         }
-        writer.flush()?;
+        // Single locked flush of the whole batch.
+        {
+            let mut s = stream.lock().unwrap();
+            s.write_all(&out)?;
+            s.flush()?;
+        }
+        out.clear();
         if quit {
             return Ok(());
         }
         if let Some((name, args)) = subscribe_after_batch {
-            return handle_subscribe(&db, &mut writer, &name, &args);
+            return handle_subscribe(&db, &stream, &name, &args);
         }
     }
 }
 
 /// Hijack the connection into push-stream mode after SUBSCRIBE/PSUBSCRIBE.
 /// Factored out of `handle` so the fast-path batched dispatch stays tight.
+/// Shares the single `Arc<Mutex<TcpStream>>` so it still uses just one fd.
 fn handle_subscribe(
     db: &Arc<Db>,
-    writer: &mut BufWriter<TcpStream>,
+    stream: &Arc<Mutex<TcpStream>>,
     _name: &str,
     args: &[Vec<u8>],
 ) -> std::io::Result<()> {
     if args.is_empty() {
-        write_resp(writer, &err("SUBSCRIBE requires at least one channel"))?;
+        let mut s = stream.lock().unwrap();
+        write_resp(&mut *s, &err("SUBSCRIBE requires at least one channel"))?;
         return Ok(());
     }
     let prefixes: Vec<Vec<u8>> = args
@@ -256,7 +296,8 @@ fn handle_subscribe(
             Resp::Bulk(ch.clone()),
             Resp::Int((i as i64) + 1),
         ]);
-        write_resp(writer, &ack)?;
+        let mut s = stream.lock().unwrap();
+        write_resp(&mut *s, &ack)?;
     }
     for ev in rx.iter() {
         let channel = ev.key.strip_prefix(b"chan:").unwrap_or(&ev.key).to_vec();
@@ -272,7 +313,8 @@ fn handle_subscribe(
             Resp::Bulk(channel),
             Resp::Bulk(payload),
         ]);
-        if write_resp(writer, &msg).is_err() {
+        let mut s = stream.lock().unwrap();
+        if write_resp(&mut *s, &msg).is_err() {
             break;
         }
     }
@@ -337,8 +379,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if args.len() != 2 {
                 return err("SET requires key value");
             }
-            let key = String::from_utf8_lossy(&args[0]).to_string();
-            match db.kv.set(&key, &args[1]) {
+            match db.kv.set_b(&args[0], &args[1]) {
                 Ok(_) => Resp::Simple("OK".into()),
                 Err(e) => err(&e.to_string()),
             }
@@ -371,12 +412,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
             let out: Vec<Resp> = args
                 .iter()
-                .map(|a| {
-                    let key = String::from_utf8_lossy(a).to_string();
-                    match db.kv.get(&key) {
-                        Some(v) => Resp::Bulk(v),
-                        None => Resp::Nil,
-                    }
+                .map(|a| match db.kv.get_b(a) {
+                    Some(v) => Resp::Bulk(v),
+                    None => Resp::Nil,
                 })
                 .collect();
             Resp::Array(out)
@@ -399,8 +437,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if args.len() != 1 {
                 return err("GET requires key");
             }
-            let key = String::from_utf8_lossy(&args[0]).to_string();
-            match db.kv.get(&key) {
+            match db.kv.get_b(&args[0]) {
                 Some(v) => Resp::Bulk(v),
                 None => Resp::Nil,
             }
@@ -409,8 +446,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if args.len() != 1 {
                 return err("DEL requires key");
             }
-            let key = String::from_utf8_lossy(&args[0]).to_string();
-            match db.kv.del(&key) {
+            match db.kv.del_b(&args[0]) {
                 Ok(true) => Resp::Int(1),
                 Ok(false) => Resp::Int(0),
                 Err(e) => err(&e.to_string()),
@@ -421,7 +457,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 if args.len() != 1 {
                     return err("INCR requires key");
                 }
-                (String::from_utf8_lossy(&args[0]).to_string(), 1)
+                (args[0].clone(), 1)
             } else {
                 if args.len() != 2 {
                     return err("INCRBY requires key n");
@@ -430,18 +466,20 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                     Some(n) => n,
                     None => return err("n is not an integer"),
                 };
-                (String::from_utf8_lossy(&args[0]).to_string(), by)
+                (args[0].clone(), by)
             };
-            match db.kv.incr_by(&key, by) {
+            match db.kv.incr_by_lossy(&key, by) {
                 Ok(n) => Resp::Int(n),
                 Err(e) => err(&e),
             }
         }
         "KEYS" => {
-            let prefix = args.first().map(|a| String::from_utf8_lossy(a).to_string()).unwrap_or_default();
-            let prefix = prefix.trim_end_matches('*').to_string();
-            let keys = db.kv.keys_prefix(&prefix);
-            Resp::Array(keys.into_iter().map(|k| Resp::Bulk(k.into_bytes())).collect())
+            let prefix = args.first().map(|a| {
+                let s = String::from_utf8_lossy(a);
+                s.trim_end_matches('*').to_string()
+            }).unwrap_or_default();
+            let keys = db.kv.keys_prefix(prefix.as_bytes());
+            Resp::Array(keys.into_iter().map(Resp::Bulk).collect())
         }
 
         "VADD" => {

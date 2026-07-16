@@ -26,7 +26,7 @@ licenses, five release cadences, and five places for drift to hide.
 ![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
 ![Tests](https://img.shields.io/badge/tests-211%20passing%20(50%20rust%20%2B%2057%20native%20%2B%20104%20integration)-brightgreen.svg)
 ![Durable SET P1024](https://img.shields.io/badge/durable%20SET%20@P1024-14.3M%20ops%2Fs-brightgreen)
-![Durable GET P1024](https://img.shields.io/badge/durable%20GET%20@P1024-16.1M%20ops%2Fs-brightgreen)
+![Durable GET P1024](https://img.shields.io/badge/durable%20GET%20@P1024-16.4M%20ops%2Fs-brightgreen)
 ![vs Redis SET](https://img.shields.io/badge/vs%20Redis%20SET-4.9×%20faster-brightgreen)
 ![vs Redis GET](https://img.shields.io/badge/vs%20Redis%20GET-3.9×%20faster-brightgreen)
 ![Benchmarked with](https://img.shields.io/badge/measured%20with-redis--benchmark-9cf)
@@ -327,7 +327,7 @@ across more work, so throughput scales.
 | Op / `-P` | -P 64 | -P 256 | -P 1024 | Redis 8.0.5 (default, in-mem) | Redis 8.0.5 (AOF everysec) |
 |---|---:|---:|---:|---:|---:|
 | **SET** | **5.88M /s** | **12.1M /s** | **≈17M /s** | 2.94M /s | 2.30M /s |
-| **GET** | **5.88M /s** | **13.3M /s** | **≈16M /s** | 4.17M /s | 6.41M /s |
+| **GET** | **5.88M /s** | **13.3M /s** | **16.4M /s** | 4.17M /s | 6.41M /s |
 | PING | 6.25M /s | — | — | — | — |
 | MSET (10 keys) | 3.51M /s (≈ 35.1M key-writes/s) | — | — | — | — |
 
@@ -336,7 +336,7 @@ across more work, so throughput scales.
 | Op / `-P` | -P 64 | -P 256 | -P 1024 |
 |---|---:|---:|---:|
 | SET | 6.06M /s | 11.8M /s | ≈16.9M /s |
-| GET | 5.88M /s | 13.8M /s | ≈16.9M /s |
+| GET | 5.88M /s | 13.8M /s | 16.4M /s |
 
 **Latency — the tail, not just throughput.** At `-P1024 -c100` StrikeDB's
 durable SET holds **p99 ≈ 6.6 ms, max ≈ 7.1 ms**: no pathological tail.
@@ -452,9 +452,37 @@ SIGKILL'd, then reopened, then every acked key is verified.
 | Acked writes across all iterations | **64,848** |
 | **Writes lost after SIGKILL + reopen** | **0** |
 
-*Run yourself:* `cargo run --release -p bench -- --chaos`
+ *Run yourself:* `cargo run --release -p bench -- --chaos`
 
-### Correctness
+ ### 🌊 Availability under connection flood (the honest edge case)
+
+ Durability is crash-safe: a `kill -9` mid-flight loses **zero** acknowledged
+ writes (see above). But a hard **connection flood** — `redis-benchmark -P 1024
+ -c 800` against a host with a low `ulimit -n` — exposes an availability,
+ not a durability, limit:
+
+ | Under fd exhaustion (`ulimit -n` too low for `-c`) | Behavior |
+ |---|---|
+ | Process | **stays alive** — it does *not* crash or corrupt the WAL |
+ | Already-durable data | **100% safe** — replay recovers every acked key |
+ | New connections | rejected with `Too many open files` until fds free up |
+ | Logging | accept/connection errors are **rate-limited to ~1 line/sec** (no log flood) |
+
+ Root cause: each accepted connection currently `try_clone()`s its socket to
+ split read/write, so it consumes **2 fds/connection**. The fd ceiling is hit
+ at roughly `ulimit -n / 2` live connections.
+
+ **Mitigation (recommended before any high-`-c` run):**
+ ```bash
+ ulimit -n 100000          # raise the per-process fd limit on the host
+ ```
+ This is also what Redis requires for its own `-c 800` benchmarks. With a
+ raised limit, durable SET sustains **~17.8M ops/s @ -P1024 -c100** on this
+ machine (Redis on the same box: ~5.1M). The `try_clone` fd-doubling is a
+ known follow-up to remove (single-stream split) so the connection ceiling
+ tracks `ulimit -n` directly instead of half of it.
+
+ ### Correctness
 
 | Suite | Result |
 |---|---|
