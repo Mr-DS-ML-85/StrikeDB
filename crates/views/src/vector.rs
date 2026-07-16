@@ -597,6 +597,18 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// Graph-only insert — **bench-only, NOT production.**
+    /// Skips the durable substrate `Value::Vector` write so the scale bench
+    /// uses just the two in-memory HNSW buffers (`all_i8` + `all_f32`)
+    /// instead of three copies (int8 + f32 mirror + substrate f32). At
+    /// 1M×1536d that avoids ~6 GB of redundant RAM and, more importantly,
+    /// avoids 1M sequential WAL fsyncs that made `--xlarge` hang/freeze the
+    /// whole box. Vectors inserted this way are NOT durable/recoverable —
+    /// which is fine for a benchmark that never reopens the index.
+    pub fn insert_graph_only(&self, id: u64, vector: Vec<f32>) {
+        self.hnsw.write().unwrap().insert(id, vector);
+    }
+
     /// k-NN search returning (id, cosine_distance) ascending.
     /// Default search-ef of 128 gives Qdrant-class recall at 100k+ scale.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {

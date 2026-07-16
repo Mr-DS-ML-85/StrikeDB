@@ -27,3 +27,6 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+# Benchmarks are produced on Ryzen 7 7700 (Zen 4, AVX2) with
+# `target-cpu=native` so the AVX2 int8 dot-product is actually
+# emitted. See .cargo/config.toml for the rustflags.

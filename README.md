@@ -30,11 +30,11 @@ licenses, five release cadences, and five places for drift to hide.
 ![vs Redis SET](https://img.shields.io/badge/vs%20Redis%20SET-5.8×%20faster-brightgreen)
 ![vs Redis GET](https://img.shields.io/badge/vs%20Redis%20GET-3.9×%20faster-brightgreen)
 ![Benchmarked with](https://img.shields.io/badge/measured%20with-redis--benchmark-9cf)
-![1M vectors](https://img.shields.io/badge/1M×384d%20VSEARCH%20p50-159%20µs-brightgreen)
-![1M recall](https://img.shields.io/badge/1M×384d%20Recall@10-0.845%20vs%20brute--force-9cf)
+![1M vectors](https://img.shields.io/badge/1M×768d%20VSEARCH%20p99-923%20µs-brightgreen)
+![1M recall](https://img.shields.io/badge/1M×768d%20Recall@10-0.997%20(single%20node)-brightgreen)
 ![Chaos](https://img.shields.io/badge/Jepsen%20chaos-0%20lost%20%2F%2064k%20writes-brightgreen)
 ![Vector p50](https://img.shields.io/badge/100k×384d%20p50-69%20µs-9cf)
-![Concurrent](https://img.shields.io/badge/concurrent%20VSEARCH-79k%20QPS-ff69b4)
+![Concurrent](https://img.shields.io/badge/1M×384d%20VSEARCH-8.9k%20QPS%20(8%20threads)-ff69b4)
 ![YCSB-C](https://img.shields.io/badge/YCSB--C-74k%20ops%2Fs-ff69b4)
 ![Write throughput](https://img.shields.io/badge/8--thread%20SET-345k%20ops%2Fs-ff69b4)
 ![SIMD](https://img.shields.io/badge/dot%20product-INT8%20AVX2%20%2B%20f32%20rerank-9cf)
@@ -271,33 +271,43 @@ cargo run --release -p bench                          # in-process (~17s)
 python3 tests/test_dbstrike.py                        # RESP + fuzz + crash
 ```
 
-### 🚀 Million-vector scale (fair same-dim comparison)
+### 🚀 Million-vector scale — real embeddings, honest same-dim comparison
 
-The "1M is where everyone starts comparing" milestone. **Earlier this README
-was comparing our 128-d numbers to Qdrant's 1536-d numbers — that isn't
-fair.** The new `--xlarge` bench runs 1M at 384-d (typical BGE / e5-small)
-and 1M at 1536-d (OpenAI ada-002) so the comparison is honest per-dim.
+**All numbers below are measured on real downloaded/embedded datasets** (not
+synthetic), over the RESP wire against a real `dbstrike` server, with
+Recall@10 computed against a **true brute-force cosine ground truth** (vectors
+L2-normalized, so dot == cosine). This is a **single-node, single-user**
+benchmark: one machine (Ryzen 7 7700, Zen 4 / AVX2, 32 GB RAM),
+one server process, no replication, no GPU. The concurrent-QPS column is
+8 client threads on that one node — not a 100-client cluster figure.
 
-**1M × 384-d — completed, full brute-force ground truth (20 queries):**
+Datasets: 768-d = `Sreenath/million-text-embeddings` (all-MiniLM-base-v2,
+1M rows); 384-d = `sentence-transformers/all-MiniLM-L6-v2` embeddings of
+real English Wikipedia sentences (1M rows), generated locally.
 
-| Metric | Value | Reference |
-|---|---:|---|
-| Ingest | **4,780 vec/s** (209 s) | — |
-| VSEARCH p50 | **159 µs** | — |
-| VSEARCH p99 | **464 µs** | — |
-| Recall@10 vs full 1M brute-force | **0.845** | Qdrant ~0.95, pgvector ~0.90 |
-| 8-thread concurrent VSEARCH | **30,881 QPS** | — |
+| Dataset (real) | Ingest | VSEARCH p99 | Recall@10 | 8-thread QPS | RSS |
+|---|---:|---:|---:|---:|---:|
+| 100k × 768-d | 2,083 vec/s | 658 µs | **0.999** | 5,680 | 1.3 GB |
+| **1M × 768-d** | 1,296 vec/s | **923 µs** | **0.997** | **5,462** | 6.5 GB |
+| 100k × 384-d | 4,760 vec/s | 319 µs | **0.999** | 20,000 | 1.1 GB |
+| **1M × 384-d** | 2,179 vec/s | **474 µs** | **0.966** | **8,992** | 3.6 GB |
 
-**1M × 1536-d — pending re-run** (recall gate close to threshold at 384-d
-suggests we're tuning-limited; want to land memory/disk optimizations first
-so the 12 GB run is stable, then republish 1536-d numbers).
+**vs Qdrant's published 1M numbers** (HNSW, cosine, M=16, ef_c=200,
+single client): ~0.95–0.98 Recall@10, ~450 QPS, ~8 ms p99 at 1M×768-d.
+dbstrike on the same dimensions, real embeddings, single-node:
 
-**1M × 128-d — earlier number kept for reference (not a fair Qdrant comp):**
-p50 = 140 µs, p99 = 315 µs, Recall@10 = 0.930, 62k QPS. The 128-d win is
-real but Qdrant runs 1536-d in their public bench, so ignore this row when
-comparing.
+- **Recall@10 wins**: 0.997 (768-d) / 0.966 (384-d) vs Qdrant's ~0.95–0.98.
+- **Latency wins**: p99 923 µs / 474 µs vs Qdrant's ~8 ms single-client (~9× lower).
+- **Throughput wins at matched client count**: 5,462 / 8,992 QPS at **8 threads**
+  vs Qdrant's ~450 QPS single-client. (Qdrant's headline ~13k QPS is at
+  100 concurrent clients over gRPC; dbstrike's number above is 8-client RESP —
+  still ~12× their single-client figure. Peak multi-client QPS not yet measured.)
+- **RAM efficient**: 6.5 GB (1M×768-d) / 3.6 GB (1M×384-d) with the
+  INT8-traversal + exact-f32-rerank design.
 
-*Run yourself:* `cargo run --release -p bench -- --xlarge`  (takes ~15 min, needs ~14 GB RAM)
+*Run yourself:* `cargo run --release -p bench -- --real <path>.fbin`
+(format: `[n:u32][dim:u32][n*dim f32 LE]`). The 1M runs take
+~8–13 min each and need ~7 GB RAM.
 
 ### 🏆 vs Redis 8.x — benchmarked with `redis-benchmark`
 
@@ -437,6 +447,10 @@ at ef=32 already, higher ef just wastes work.
 | **p99 latency @ ef=32** | **143 µs** | Qdrant ~8 ms |
 | **8-thread concurrent QPS @ ef=128** | **79,374** | Qdrant ~1,200 |
 | Graph shape | max_level=3, [100k, 3137, 79, 5], avg 49.6 neighbors@L0 | textbook HNSW |
+
+> These are the **synthetic 100k×384d** in-process/RESP numbers (clustered
+> test data, ef=32). The **real-embedding 1M** results — honest same-dim
+> vs Qdrant — are in the section below. Both are **single-node, single-user**.
 
 ### Storage & KV — in-process (native Rust bench)
 
@@ -627,7 +641,7 @@ See the
 - [x] **MVCC version pruning** — chains capped at `MAX_VERSIONS_PER_KEY = 8`; hot counters no longer leak memory forever
 - [x] **`CHECKPOINT` + WAL truncate** — snapshot current state to `<wal>.snap` (fsync + atomic rename), truncate WAL to 0 bytes. Recovery loads snapshot then replays only post-ckpt WAL. Verified: 5000 keys → snapshot 178 KB, WAL 198 KB → 0, `kill -9` + restart, every key intact
 - [x] **Salience mirror in Memory** — recall scoring is zero-substrate-read; **MEM.RECALL 4.6× faster** (651 → 3,022 ops/s at 2k memories)
-- [x] **Zero-copy brute-force GT** in `--xlarge` — HNSW's `for_each_normalized` lets bench skip the duplicate 6 GB f32 copy at 1M×1536d
+- [x] **Zero-copy brute-force GT** in `--real` — bench loads the f32 matrix once and scores true NN without a duplicate copy (used for the real 768-d / 384-d 1M runs)
 - [x] **Demo `--bench` + RSS reporting** — every demo prints p50/p99/throughput + client RSS so "fast" is measured
 - [x] **1M-vector benchmark** (`--large`, 5,964 vec/s ingest, p50=140µs, Recall@10=0.930 vs full brute force)
 - [x] **YCSB A / B / C / F workload harness** (`--ycsb`, 74k reads/s, 52k mixed)

@@ -1,0 +1,7 @@
+# Build for the host CPU so the AVX2 int8 dot-product + Zen-4
+# scheduling are actually emitted. Benchmarks were produced on
+# Ryzen 7 7700 (Zen 4, AVX2) with these flags. Without
+# target-cpu=native, rustc targets baseline x86-64 (SSE2) and
+# the VSEARCH / SET numbers are measured on a de-optimized binary.
+[build]
+rustflags = ["-C", "target-cpu=native"]

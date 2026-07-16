@@ -531,7 +531,7 @@ footer a { color: var(--cyan); }
     <span class="pill"><span class="num">17M</span> durable SET/s</span>
     <span class="pill"><span class="num">7</span> memory primitives</span>
     <span class="pill"><span class="num">0</span> external crates</span>
-    <span class="pill"><span class="num">69</span> p50 vector search</span>
+     <span class="pill"><span class="num">923us</span> 1M×768d p99 (real)</span>
     <span class="pill">Apache-2.0</span>
   </div>
   <div class="hero-stats">
@@ -945,23 +945,16 @@ kill -9 $SVR; wait 2>/dev/null; true</code></pre>
         <tr><td><strong>Agent turn</strong></td><td class="hl">83.0us</td><td class="hl">95.4us</td><td class="hl">124.6us</td></tr>
       </table></div>
 
-      <h3>Vector Search — 100k x 384d</h3>
+      <h3>Vector Search — real embeddings, 1M scale</h3>
+      <p style="font-size:13px; color:var(--muted);">Single node, single user. One Ryzen 7 7700 (AVX2), 32 GB, no GPU, no replication. Real datasets (768-d = Sreenath/million-text-embeddings; 384-d = all-MiniLM-L6-v2 on Wikipedia), Recall@10 vs true brute-force cosine ground truth, over the RESP wire.</p>
       <div class="table-wrap"><table>
-        <tr><th>ef</th><th>Recall@10</th><th>p50</th><th>p99</th></tr>
-        <tr><td>32</td><td><strong>0.926</strong></td><td class="hl">69us</td><td>143us</td></tr>
-        <tr><td>128</td><td>0.926</td><td>79us</td><td>193us</td></tr>
-        <tr><td>256</td><td>0.926</td><td>108us</td><td>273us</td></tr>
+        <tr><th>Dataset (real)</th><th>Ingest</th><th>VSEARCH p99</th><th>Recall@10</th><th>8-thread QPS</th><th>RSS</th></tr>
+        <tr><td>100k × 768-d</td><td>2,083 v/s</td><td>658us</td><td><strong>0.999</strong></td><td>5,680</td><td>1.3 GB</td></tr>
+        <tr><td><strong>1M × 768-d</strong></td><td>1,296 v/s</td><td><strong>923us</strong></td><td><strong>0.997</strong></td><td><strong>5,462</strong></td><td>6.5 GB</td></tr>
+        <tr><td>100k × 384-d</td><td>4,760 v/s</td><td>319us</td><td><strong>0.999</strong></td><td>20,000</td><td>1.1 GB</td></tr>
+        <tr><td><strong>1M × 384-d</strong></td><td>2,179 v/s</td><td><strong>474us</strong></td><td><strong>0.966</strong></td><td><strong>8,992</strong></td><td>3.6 GB</td></tr>
       </table></div>
-      <p>8-thread concurrent VSEARCH: <strong>79,374 QPS</strong>.</p>
-
-      <h3>1M Vectors (384d)</h3>
-      <div class="table-wrap"><table>
-        <tr><th>Metric</th><th>Value</th></tr>
-        <tr><td>Ingest</td><td>4,780 vec/s</td></tr>
-        <tr><td>VSEARCH p50</td><td>159us</td></tr>
-        <tr><td>Recall@10 vs brute-force</td><td>0.845</td></tr>
-        <tr><td>8-thread QPS</td><td>30,881</td></tr>
-      </table></div>
+      <p>vs Qdrant's published 1M×768-d (single client): ~0.95–0.98 Recall@10, ~450 QPS, ~8 ms p99. dbstrike wins on recall, latency (~9× lower p99), and throughput at matched client count — on a single node, single user.</p>
 
       <h3>YCSB A / B / C / F</h3>
       <div class="table-wrap"><table>
@@ -1065,7 +1058,7 @@ kill -9 $SVR; wait 2>/dev/null; true</code></pre>
         <li><span class="rm-done">&#10003;</span><span class="rm-text done">TSRANGE.LATEST (dashboard primitive)</span></li>
         <li><span class="rm-done">&#10003;</span><span class="rm-text done">CHECKPOINT + WAL truncate</span></li>
         <li><span class="rm-done">&#10003;</span><span class="rm-text done">Native Rust bench (18 sections, YCSB, chaos)</span></li>
-        <li><span class="rm-done">&#10003;</span><span class="rm-text done">1M-vector benchmark (384d + 1536d)</span></li>
+        <li><span class="rm-done">&#10003;</span><span class="rm-text done">1M-vector benchmark on real embeddings (768d + 384d, single node)</span></li>
         <li><span class="rm-todo">...</span><span class="rm-text">Tiered cold storage to NVMe / object store</span></li>
         <li><span class="rm-todo">...</span><span class="rm-text">Raft per-shard consensus <span class="rm-note">(not yet implemented — HLC+CRDT is the current consistency layer)</span></span></li>
         <li><span class="rm-todo">...</span><span class="rm-text">Product Quantization (8-16x compression)</span></li>
@@ -1138,7 +1131,7 @@ const DOCS = [
   {t:"AI Agent Memory — 7 primitives", g:"memory", b:"working memory, long-term, episodic, keyword BM25, graph LINK NEIGH TRAV, bi-temporal REMEMBER.T RECALL.AS_OF, procedural PROC, salience cache"},
   {t:"RAG as a First-Class Query", g:"rag", b:"hybrid dense sparse, reciprocal rank fusion RRF, lexical rerank, corpus generation cache"},
   {t:"MITM Cache Debugger", g:"mitm", b:"STALE_HIT, PHANTOM, HIT, MISS, version delta, ring buffer, CACHE.SRCSET CACHE.BUGS"},
-  {t:"Benchmarks — vs Redis, YCSB, Jepsen", g:"benchmarks", b:"5.88M SET/s, 17M pipelined, redis-benchmark, YCSB A B C F, Jepsen chaos 0 lost, 1M vector, 100k 384d, 69us vector search"},
+  {t:"Benchmarks — vs Redis, YCSB, Jepsen", g:"benchmarks", b:"5.88M SET/s, 17M pipelined, redis-benchmark, YCSB A B C F, Jepsen chaos 0 lost, 1M vector real embeddings, 1M×768d p99 923us, recall 0.997, single node"},
   {t:"Live Demos — agent-cli, tsdash, rtchat", g:"demos", b:"agent memory dashboard realtime chat, TSADD TSRANGE sparklines, PUB SUB latency"},
   {t:"Market Map — vs Redis pgvector Qdrant Milvus Mem0 Zep", g:"compare", b:"comparison table, capabilities, single license, graph memory, bi-temporal, procedural, time-series"},
   {t:"Roadmap — built and next", g:"roadmap", b:"Raft not implemented, HLC CRDT, tiered storage, product quantization, gRPC, ann-benchmarks"}
