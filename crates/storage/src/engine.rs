@@ -373,6 +373,18 @@ impl Engine {
         Ok(engine)
     }
 
+    /// Non-durable, throwaway engine for in-process graph builds (the
+    /// parallel-segment path mutates only the in-memory HNSW, so no WAL
+    /// durability is needed). Uses a unique temp WAL with `DBSTRIKE_SYNC=0`
+    /// semantics. Cheap: a single empty file, no fsyncs.
+    pub fn open_for_build() -> Arc<Self> {
+        let dir = std::env::temp_dir().join(format!("dbstrike_build_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("build.wal");
+        let _ = std::fs::remove_file(&p);
+        Engine::open(&p).unwrap_or_else(|_| Engine::open(std::env::temp_dir().join("dbstrike_fallback_build.wal")).unwrap())
+    }
+
     /// Monotonic timestamp source (also serves as the logical commit clock).
     pub fn now(&self) -> u64 {
         self.clock.fetch_add(1, Ordering::SeqCst) + 1

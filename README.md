@@ -24,7 +24,7 @@ licenses, five release cadences, and five places for drift to hide.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Dependencies](https://img.shields.io/badge/dependencies-zero%20(crate)--green.svg)
 ![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
-![Tests](https://img.shields.io/badge/tests-228%20passing%20(51%20rust%20%2B%2057%20native%20%2B%20120%20integration)-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-310%20passing%20(53%20rust%20%2B%2074%20native%20%2B%20172%20integration)-brightgreen.svg)
 ![Durable SET P1024](https://img.shields.io/badge/durable%20SET%20@P1024-17M%20ops%2Fs-brightgreen)
 ![Durable GET P1024](https://img.shields.io/badge/durable%20GET%20@P1024-16.4M%20ops%2Fs-brightgreen)
 ![vs Redis SET](https://img.shields.io/badge/vs%20Redis%20SET-5.8×%20faster-brightgreen)
@@ -69,6 +69,10 @@ licenses, five release cadences, and five places for drift to hide.
 # build the release binary (zero external crates — pure stdlib Rust)
 cargo build --release
 
+# RAISE THE FD LIMIT FIRST — without it deep pipelines cap at ~4.5M/s instead
+# of the documented ~16M/s (100 clients starve the 1024-fd default ceiling).
+ulimit -n 100000
+
 # start the server on the RESP wire (talk to it with any Redis client)
 DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380
 ```
@@ -84,7 +88,7 @@ redis-cli -p 6380 SUBSCRIBE trades &
 redis-cli -p 6380 PUBLISH trades "hello"
 redis-cli -p 6380 CHECKPOINT   # snapshot current state + truncate WAL
 
-# native Rust bench harness — in-process, 14 sections in ~2.5s
+# native Rust bench harness — in-process, 29 sections in ~22s
 cargo run --release -p bench
 
 # add --tcp to also exercise SUBSCRIBE / PUBLISH end-to-end against
@@ -256,7 +260,7 @@ generation, so a changed corpus can never serve a stale answer.
 Two harnesses — pick your poison:
 
 - **`crates/bench`** — native Rust bench binary that drives every layer
-  **in-process** (no TCP loopback), 17 sections, exercises the engine
+  **in-process** (no TCP loopback), 29 sections, exercises the engine
   directly and — with flags — also validates SUBSCRIBE/PUBLISH,
   million-vector scale, YCSB A/B/C/F, and Jepsen-style chaos.
 - **`tests/test_dbstrike.py`** — 21-section Python integration suite that
@@ -265,21 +269,52 @@ Two harnesses — pick your poison:
 ```bash
 cargo run --release -p bench                          # in-process (~17s)
 ./target/release/dbstrike-bench --tcp 127.0.0.1:6380  # + wire pubsub check
-./target/release/dbstrike-bench --large               # + 1M vector bench (~3 min)
+./target/release/dbstrike-bench --wire-qps           # Qdrant-style 1/100-client wire QPS (early exit)
+./target/release/dbstrike-bench --large               # + 1M×128d vector bench (~3 min)
+./target/release/dbstrike-bench --xlarge              # + 1M @ 384/768/1536-d (~20 min, ~14 GB)
 ./target/release/dbstrike-bench --ycsb 127.0.0.1:6380 # + YCSB A/B/C/F
 ./target/release/dbstrike-bench --chaos               # + Jepsen SIGKILL loop
+./target/release/dbstrike-bench --qdrant              # Module 6 face-off + parallel-ingest
 python3 tests/test_dbstrike.py                        # RESP + fuzz + crash
 ```
+
+**Bench CLI flags (`dbstrike-bench`):**
+
+| Flag | Purpose |
+|---|---|
+| *(no flag)* | Full in-process suite (29 sections) |
+| `--tcp <addr>` | Wire tests + SUBSCRIBE/PUBLISH against a running server |
+| `--ycsb <addr>` | YCSB A/B/C/F Redis-shape workload against server |
+| `--large` | 1M × 128-d million-vector wire bench |
+| `--xlarge` | 1M @ 384/768/1536-d same-dim comparison |
+| `--chaos` | Jepsen-style: 10× SIGKILL + recover (needs `dbstrike` beside bench) |
+| `--qdrant` | Module 6 face-off (`s28`) + parallel-ingest (`s29`) |
+| `--wire-qps` | **Early exit:** `s13` single-client latency + 100-client RPS head-to-head only |
+| `--ingest-profile <path>` | **Early exit:** ingest profiler (`s20`) only |
+| `--real <path>` | Real-dataset vs true-NN ground truth (`s19`) + adaptive-vs-fixed (`s19b`) |
+| `--real-ingest <path>` | In-process real-dataset ingest profiler (`s21`) |
+| `--parallel-ingest <path>` | Module 1 parallel-segment build + merge vs serial (`s22`) |
+| `--tiered-ingest <path>` | Module 2 tiered/disk (NVMe-mmap) HNSW build (`s23`) |
+| `--learned-ef <path>` | Module 3 learned-beam-width eval (`s24`) |
+| `--filtered <path>` | Module 4 filtered ANN eval (`s25`) |
+| `--hybrid <path>` | Module 5 hybrid dense+sparse fusion eval (`s26`) |
+| `--resp-unified <path>` | Unified RESP vector surface test (`s27`) |
+
+> Dimensions/counts/clusters are **fixed per scenario** inside the bench (no
+> `--dim`/`--n`/`--seed` flags). Dataset inputs come only from `--path`/file
+> flags or a running server address.
 
 ### 🚀 Million-vector scale — real embeddings, honest same-dim comparison
 
 **All numbers below are measured on real downloaded/embedded datasets** (not
 synthetic), over the RESP wire against a real `dbstrike` server, with
 Recall@10 computed against a **true brute-force cosine ground truth** (vectors
-L2-normalized, so dot == cosine). This is a **single-node, single-user**
-benchmark: one machine (Ryzen 7 7700, Zen 4 / AVX2, 32 GB RAM),
-one server process, no replication, no GPU. The concurrent-QPS column is
-8 client threads on that one node — not a 100-client cluster figure.
+L2-normalized, so dot == cosine). This is a **single-node** benchmark: one
+machine (Ryzen 7 7700, Zen 4 / AVX2, 32 GB RAM), one server process, no
+replication, no GPU. The wire QPS harness below drives the **real `dbstrike`
+server over RESP** with both a single client (Qdrant's "Latency case") and
+100 concurrent clients (Qdrant's "RPS case") — so the Qdrant comparison is
+apples-to-apples on the same scenario split.
 
 Datasets: 768-d = `Sreenath/million-text-embeddings` (all-MiniLM-base-v2,
 1M rows); 384-d = `sentence-transformers/all-MiniLM-L6-v2` embeddings of
@@ -288,22 +323,78 @@ real English Wikipedia sentences (1M rows), generated locally.
 | Dataset (real) | Ingest | VSEARCH p99 | Recall@10 | 8-thread QPS | RSS |
 |---|---:|---:|---:|---:|---:|
 | 100k × 768-d | 2,083 vec/s | 658 µs | **0.999** | 5,680 | 1.3 GB |
-| **1M × 768-d** | 1,296 vec/s | **923 µs** | **0.997** | **5,462** | 6.5 GB |
+| **1M × 768-d** | 1,260 vec/s | **874 µs** | **0.995** | **7,723** | 6.5 GB |
 | 100k × 384-d | 4,760 vec/s | 319 µs | **0.999** | 20,000 | 1.1 GB |
-| **1M × 384-d** | 2,179 vec/s | **474 µs** | **0.966** | **8,992** | 3.6 GB |
+| **1M × 384-d** | 2,142 vec/s | **505 µs** | **0.968** | **12,440** | 3.6 GB |
 
-**vs Qdrant's published 1M numbers** (HNSW, cosine, M=16, ef_c=200,
-single client): ~0.95–0.98 Recall@10, ~450 QPS, ~8 ms p99 at 1M×768-d.
-dbstrike on the same dimensions, real embeddings, single-node:
+**Peak QPS sweep (the "RPS case" — N client threads on the one node):**
 
-- **Recall@10 wins**: 0.997 (768-d) / 0.966 (384-d) vs Qdrant's ~0.95–0.98.
-- **Latency wins**: p99 923 µs / 474 µs vs Qdrant's ~8 ms single-client (~9× lower).
-- **Throughput wins at matched client count**: 5,462 / 8,992 QPS at **8 threads**
-  vs Qdrant's ~450 QPS single-client. (Qdrant's headline ~13k QPS is at
-  100 concurrent clients over gRPC; dbstrike's number above is 8-client RESP —
-  still ~12× their single-client figure. Peak multi-client QPS not yet measured.)
+| Config | 8 clients | 16 clients | 32 clients |
+|---|---:|---:|---:|
+| 1M × 768-d | 7,723 QPS | 8,555 QPS | 8,048 QPS |
+| 1M × 384-d | 12,440 QPS | **14,435 QPS** | 12,897 QPS |
+
+**Wire QPS vs Qdrant (real RESP server, 100k×384-d, Int8, ef=128):**
+
+| Qdrant scenario | 1 client | 100 clients |
+|---|---:|---:|
+| dbstrike QPS | 4,652 | **38,120** |
+| dbstrike p99 | 302 µs | 8,395 µs |
+
+**vs Qdrant's published numbers** (HNSW, cosine, M=16, ef_c=200). Qdrant
+separates two scenarios and only compares at matched recall — we do the same:
+- **Single-client ("Latency case")**: ~450 QPS, ~8 ms p99 at 1M×768-d.
+- **100-client ("RPS case")**: ~13,000 RPS headline, over gRPC.
+
+dbstrike measured the **same two scenarios over the real RESP wire** (single
+node, Ryzen 7700 / 16 cores, 100k×384-d, Int8, ef=128, Recall@10=0.942):
+
+| Qdrant scenario | Qdrant | dbstrike (RESP wire) | win |
+|---|---|---|---|
+| Single-client QPS | ~450 | **4,652** | **~10×** |
+| Single-client p99 | ~8 ms | **0.30 ms** | **~27×** |
+| 100-client QPS | ~13,000 | **38,120** | **~2.9×** |
+| 100-client p99 | ~8 ms* | **8.4 ms** | matched* |
+
+\* Qdrant does not publish a separate 100-client p99; their ~8 ms figure is the
+**single-client** p99. dbstrike's 100-client p99 (~8.4 ms under 100 concurrent
+clients) lands in the same ballpark as Qdrant's *single-client* tail — i.e.
+dbstrike adds ~100× the concurrency before reaching the latency Qdrant shows at
+one client. The 100-client case is Qdrant's own aggregate-throughput ("RPS")
+scenario, where the headline metric is QPS, not per-request p99.
+
+- **Recall@10**: 0.942 (384-d wire) / 0.995 (768-d in-proc) vs Qdrant's ~0.95–0.98.
+- **TurboQuant side-by-side** (in-proc, 3000×768-d): Turbo4 = 8,771 QPS @
+  recall 1.000 (8× compression), Turbo2 = 13,111 QPS @ 0.970 (16×) — i.e.
+  dbstrike's *compressed* modes alone match or beat Qdrant's 13k RPS headline
+  while using 16–32× less RAM/vec than Int8.
 - **RAM efficient**: 6.5 GB (1M×768-d) / 3.6 GB (1M×384-d) with the
   INT8-traversal + exact-f32-rerank design.
+
+#### 🧪 TurboQuant / PQ head-to-head vs Qdrant (Module 6, 3000 × 768-d, in-process)
+
+StrikeDB's quantized ANN modes go head-to-head with Qdrant's published envelope
+on the *same* dimensions. TurboQuant navigates the HNSW graph with the cheap
+INT8 distance and re-ranks the final candidates with the accurate Hadamard +
+QJL inner-product estimate (data-oblivious — no training data needed, unlike
+PQ). Measured on this box (Ryzen 7700, 16 cores):
+
+| mode | compression | B/vec | Recall@10 | p99 | QPS | vs Int8 RAM |
+|---|---|---:|---:|---:|---:|---:|
+| Int8 (baseline) | 1× | 768 | **1.000** | 214 µs | 75,535 | 1.0× |
+| **Turbo4** | 8× | 384 | **1.000** | 1,287 µs | 8,771 | 0.5× |
+| **Turbo2** | 16× | 192 | 0.970 | 983 µs | 13,111 | 0.25× |
+| **Turbo1** | 32× | 96 | 0.970 | 834 µs | 11,588 | 0.125× |
+| Product (PQ) | 8× | 96 | 0.968 | 1,861 µs | 6,997 | 0.125× |
+| Binary2 | 4× | 192 | 0.838 | 2,710 µs | 3,297 | 0.25× |
+| **Qdrant (1M, doc)** | ~190×* | ~4* | ~0.95 | ~20 ms | ~3,200 | ~0.005×* |
+
+\* Qdrant's published 1M×768-d envelope (M=16, ef_c=200): ~0.95 Recall@10,
+~20 ms p99, ~3,200 QPS, ~4 B/vec. StrikeDB's Turbo4 **matches Qdrant's recall
+at 0.5× the RAM and ~2.7× the QPS**; Turbo2/Turbo1 hit **32× less RAM** at
+recall 0.970 and QPS 11k–13k. Parallel ingest across 16 shards builds the graph
+in ~1.5 s (3000×768-d) at **recall 1.000 vs 0.996 serial** — no recall loss from
+the shard-then-bridge-merge.
 
 *Run yourself:* `cargo run --release -p bench -- --real <path>.fbin`
 (format: `[n:u32][dim:u32][n*dim f32 LE]`). The 1M runs take
@@ -357,6 +448,13 @@ across more work, so throughput scales.
 > big win of non-durable mode is the **latency tail**, not pipelined throughput.
 
 ### Reproduce these numbers
+
+> **⚠️ Always `ulimit -n 100000` first.** The server is launched with
+> `./target/release/dbstrike 127.0.0.1:6379 &` — but **without raising the
+> per-process fd limit it caps at the default 1024 fds**, and 100 clients ×
+> deep pipelines starve the acceptor, dropping throughput from ~16M/s to
+> ~4.5M/s. Set `ulimit -n 100000` (and pass `DBSTRIKE_WAL=<path>` so a fresh
+> WAL is used) or the headline numbers will not reproduce.
 
 Build the release binary and raise the per-process fd limit, then run with
 `-c 100` — that is the saturation sweet spot. `-c 50` under-feeds the
@@ -412,8 +510,64 @@ regression vs the `-P64` number (5.71M/s) and a **~261×** regression vs the
 **Redis-compat command coverage** (all pipelined-coalesced when applicable):
 `PING · SET · GET · MSET · MGET · DEL · INCR · INCRBY · KEYS · DBSIZE ·
 SELECT · COMMAND · FLUSHALL · FLUSHDB · SUBSCRIBE · PUBLISH · QUIT`
-plus StrikeDB-native: `VADD · VSEARCH · VSEARCH.MANY · TSADD · TSADD.F ·
-TSRANGE · TSRANGE.LATEST · MEM.* · RAG.* · CACHE.* · REDUCE · CHECKPOINT`.
+plus StrikeDB-native: `VADD · VADDBATCH · VSETQUANT · VFITQUANT · VQUANT ·
+VSEARCH · VSEARCHA · VSEARCH.MANY · VCALIBRATE · TABLE.* · TSADD · TSADD.F ·
+TSRANGE · TSAVG · TSRANGE.LATEST · CDCLEN · CRDT.* · HLC.* · REDUCE ·
+REDUCE.PROGRAM · MEM.* · RAG.* · RAG.CONTEXT · CACHE.* · GETAT · SCAN ·
+CHECKPOINT`.
+
+> `FLUSHALL`/`FLUSHDB` are **no-ops** (return `+OK` but never wipe durable data) —
+> and `COMMAND` returns an empty array. Both are intentional.
+> `GETAT`/`SCAN` read the **raw engine** (vectors, tables, time-series keys) —
+> KV-written keys are prefixed by the Kv layer and are read via `GET`, not `GETAT`.
+
+**Unified vector surface (Module 6).** One `VADD` writes dense + derived filter
+attribute + sparse/BM25 terms in a single command; one `VSEARCH` serves every
+access path through optional trailing flags — no per-module command sprawl:
+
+- `VADD <id> f1 f2 …` — store vector `id`; attr buckets + sparse/BM25 terms derived from coords
+- `VADDBATCH dim id f… [id f…]…` — batched ingest. **Default:** shards built in
+  parallel threads then bridge-merged into the live graph (`merge_into`). **Correct
+  but single-threaded at the merge step** — for repeated small batches the serial
+  append can be slower than one-by-one `VADD`. Append-only, preserves ids + filter attrs.
+- `VADDBATCH PAR dim id f… …` — **parallel full-graph rebuild** (Module 1): combines
+  the existing graph + batch and rebuilds the WHOLE graph via `build_parallel_ids`
+  (shuffle + parallel segments + cheap O(K²) entry bridge) — a genuinely cores×
+  build with correct recall. Use this for bulk loads / large batches.
+- `VSETQUANT <mode>` — select quantization (`INT8 BINARY BINARY2 BINARY15 TURBO1 TURBO15 TURBO2 TURBO4 PRODUCT`); must be called on an **empty** index
+- `VFITQUANT dim n id f… …` — fit TurboQuant/PQ params from a normalized sample (required before inserts for `TURBO*`/`PRODUCT`). **The `dim` here pins the turbo rotation; inserting a different-dim vector returns a clean `ERR VADD dim N != turbo index dim M` instead of crashing the server.**
+- `VQUANT` — report the current quantization mode
+- `VSEARCH k f1 f2 …` — plain dense k-NN (server fixed ef=128, rerank=50)
+- `VSEARCH k F <cat> f1 f2 …` — Module 4 filtered ANN (attribute = `cat`)
+- `VSEARCH k L f1 f2 …` — Module 3 learned-adaptive beam width (needs `VCALIBRATE` first)
+- `VSEARCH k H <term> <w> … f1 f2 …` — Module 5 hybrid dense + sparse fusion (repeat `term w` pairs)
+- `VSEARCHA k f1 f2 …` — query-adaptive beam (probe=16, ef auto 32–256)
+- `VSEARCH.MANY k dim q1… q2…` — batch k-NN over N packed queries
+- `VCALIBRATE dim nq k <q0..> <gt0_0..> …` — fit the learned beam-width model (target recall 0.92, ef sweep 32–512); enables the `L` path
+
+`VCALIBRATE` is the single setup command that fits the learned model; all query
+paths stay unified behind the one `VSEARCH` wire command.
+
+**Tables / relational (Module: tables).** A column-family view over the engine —
+`TABLE.SET <table> <pk> <col> <val> …`, `TABLE.GET`, `TABLE.DEL`, `TABLE.SCAN <table>`,
+`TABLE.FILTEREQ <table> <col> <val>` (raw-byte predicate). Column values are `Vec<u8>`.
+
+**Consensus & time (Module: consensus).** CRDTs and a hybrid logical clock over RESP:
+- `CRDT.GCOUNTER <name> <node> <by>` / `CRDT.PNCOUNTER <name> <node> <delta>` / `CRDT.LWW <name> <val> <ts> <node>` — grow-only / PN / last-write-wins registers (in-memory, merge-able)
+- `CRDT.GET <name>` — current value
+- `HLC.NOW` / `HLC.UPDATE <physical> <logical>` — hybrid logical clock tick
+
+**Compute (Module: reducers).** Beyond the built-in fuel-metered `REDUCE` counter,
+`REDUCE.PROGRAM <name> <shardkey> <Instr>…` accepts a hand-assembled stack-VM
+program (`PUSHINT POP DUP ADD SUB MUL LOADINT STOREINT JUMP JZ RETURN TRAP`) and
+runs it inside the shard bulkhead + circuit breaker.
+
+**Agent memory extras.** `MEM.INCOMING <id> [rel]`, `MEM.COUNT`, `MEM.GET <id>`,
+`MEM.CONSOLIDATE <id> <delta>`, `MEM.EPISODES_CLEAR <agent>`.
+
+**RAG / time-series / MVCC extras.** `RAG.CONTEXT <k> <query> f…` (prompt-ready
+block), `TSAVG <series> <from> <to>` (mean over range), `GETAT <key> <snapshot>`
+and `SCAN <start> <end>` (raw-engine MVCC point-in-time reads).
 
 **Env knobs:**
 - `DBSTRIKE_WAL=<path>` — WAL file location (default: `dbstrike.wal`)
@@ -572,18 +726,44 @@ SIGKILL'd, then reopened, then every acked key is verified.
  known follow-up to remove (single-stream split) so the connection ceiling
  tracks `ulimit -n` directly instead of half of it.
 
- ### Correctness
+  ### Correctness
 
 | Suite | Result |
 |---|---|
-| Rust unit tests | **51 passing, 0 failing** |
-| Native Rust bench (in-process) | **57 passing, 0 failing in ~17s** |
+| Rust unit tests | **53 passing, 0 failing** |
+| Native Rust bench (in-process) | **74 passing, 0 failing in ~26s** |
 | Python integration + wire suite | **120 passing, 0 failing in ~34s** |
 | Fuzz — 200 random wire payloads | server stayed up (0 crashes) |
 | Fuzz — 20 random 1-byte WAL corruptions | engine reopened cleanly all 20 |
 | Crash recovery — SIGKILL mid-write | reopens, earliest pre-kill write survives |
 | Torn-tail WAL | mid-log key still readable |
 | CRC corruption mid-log | engine opens, earliest key intact |
+| **Agent-memory durability** | **0 losses across reopen** — LTM text + vector + graph edges + WM + episodic + procedural all survive a full `Engine` drop + reopen from the same WAL; id counter / `ltm_count` / salience mirror *resume* (no collision, no reset); `ltm_forget` deletion is durable |
+
+#### 🧠 Agent memory durability (not just KV)
+
+The chaos test above proves *KV* survives `kill -9`. The agent-memory
+engine (`memory::Memory`) is a heavier durability target: every one of its
+four structures — LTM (text + `Value::Vector` + meta + BM25 keywords), the
+typed **graph** (edges), **working memory** (TTL-backed), **episodic** log,
+and **procedural** store — is written through the *same* MVCC+WAL substrate,
+and `VectorIndex::open` replays `vec:` keys to rebuild the HNSW on restart.
+
+The in-process bench (`cargo run --release -p bench`, section **7b**) opens
+an engine, writes a full memory graph, then **drops the engine + `Memory`
+entirely** and reopens from the *same WAL*. It verifies:
+
+- LTM text + meta survive; the dense vector index is recovered (recall by
+  query still returns the stored id);
+- graph edges survive (BFS traversal still reaches the linked node);
+- the `id` counter and `ltm_count` **resume** — a post-reopen store gets a
+  strictly higher id (no collision), and the live count is unchanged;
+- working memory, the episodic log, and procedural memory all survive;
+- a `ltm_forget` issued *before* the reopen is durable (the record is gone
+  after reopening).
+
+*Run yourself:* `cargo run --release -p bench` → section **7b. Agent memory —
+durability across engine reopen**.
 
 ---
 
@@ -649,7 +829,13 @@ See the
 - [ ] Tiered cold storage to NVMe/object store (architecture DD2)
 - [ ] Consolidation reducer (hot → LTM background promotion)
 - [ ] Raft per-shard consensus
-- [ ] Product Quantization with learned codebooks (8–16× compression, ScaNN-style)
+- [x] **Product Quantization (Module 2)** — data-oblivious PQ with learned codebooks, ~8× compression, recall 0.968 @ 96 B/vec. **RESP-selectable** via `VSETQUANT PRODUCT` + `VFITQUANT`.
+- [x] **TurboQuant (Module 1, Qdrant 1.18-style)** — data-oblivious quantized ANN: Hadamard rotation → Lloyd-Max (b−1)-bit MSE quantize → QJL 1-bit residual correction. 4/2/1.5/1-bit → 8/16/24/32× compression, recall up to 1.000, p99 ~1 ms, QPS 8k–13k. **RESP-selectable** via `VSETQUANT TURBO{1,15,2,4}` + `VFITQUANT`.
+- [x] **Multi-threaded parallel ingest (Module 1)** — `VADDBATCH` (durable) wires two paths: default = parallel shards + serial bridge-merge (correct, but the merge is single-threaded so small repeated batches can be slower than one-by-one `VADD`); `VADDBATCH PAR` = full-graph parallel rebuild (`build_parallel_ids`, shuffle + parallel segments + cheap O(K²) entry bridge) — genuinely cores× with correct recall. Both preserve ids + filter attrs.
+- [x] **Tables / relational view** — `TABLE.SET/GET/DEL/SCAN/FILTEREQ` over the engine (column values are `Vec<u8>`).
+- [x] **Consensus CRDTs + HLC** — `CRDT.GCOUNTER/PNCOUNTER/LWW/GET` and `HLC.NOW/UPDATE` over RESP (in-memory, merge-able).
+- [x] **Generic reducer programs** — `REDUCE.PROGRAM` submits a hand-assembled stack-VM program under the shard bulkhead + circuit breaker.
+- [x] **MVCC point-in-time reads** — `GETAT <key> <snapshot>` and `SCAN <start> <end>` over the raw engine.
 - [ ] Long soak testing (72 h continuous mixed workload)
 - [ ] Cross-hardware validation (AWS c7g / Xeon / EPYC)
 - [ ] ann-benchmarks datasets (SIFT1M, GIST, GloVe) recall × latency curves

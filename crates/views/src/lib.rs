@@ -11,3 +11,6 @@ pub use kv::Kv;
 pub use table::{Row, Tables};
 pub use timeseries::TimeSeries;
 pub use vector::VectorIndex;
+pub use vector::Filter;
+pub use vector::LearnedEf;
+pub use vector::QuantMode;

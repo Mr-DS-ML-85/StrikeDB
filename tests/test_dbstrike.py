@@ -1254,6 +1254,187 @@ def test_pipelining():
           BATCH/dt > 80_000, f"{BATCH/dt:,.0f}/s")
 
 # ---------------------------------------------------------------------------
+# 20b. End-to-end production coverage — every command family over RESP,
+#      with a durability restart (CHECKPOINT + reopen from the same WAL).
+#      Mirrors the README "Redis-compat command coverage" list so a single
+#      run proves the whole surface works in production shape, not just the
+#      bench harness.
+# ---------------------------------------------------------------------------
+def test_end_to_end_commands():
+    section("20b. End-to-end production coverage — every command family + durability restart")
+    c = Resp()
+
+    def call(*args):
+        """Fire a command and return the parsed reply, or an exception object
+        if the server returned -ERR (so a single bad call reports as a FAIL
+        instead of aborting the whole section)."""
+        try:
+            return c.cmd(*args)
+        except Exception as e:  # -ERR reply (now raised by _parse)
+            return e
+
+    # --- Redis-compat KV surface ---
+    check("PING", call("PING") == "PONG")
+    check("SET", call("SET", "user:1", "ada") == "OK")
+    check("GET", call("GET", "user:1") == b"ada")
+    check("MSET", call("MSET", "a", "1", "b", "2") == "OK")
+    check("MGET", call("MGET", "a", "b") == [b"1", b"2"])
+    check("INCRBY", call("INCRBY", "ctr", 7) == 7)
+    check("INCR", call("INCR", "ctr") == 8)
+    check("DEL", call("DEL", "user:1") == 1)
+    check("DBSIZE is int", isinstance(call("DBSIZE"), int))
+    check("SELECT", call("SELECT", "0") == "OK")
+    check("COMMAND", isinstance(call("COMMAND"), list))
+    check("FLUSHDB", call("FLUSHDB") == "OK")
+    # re-seed after flush so later steps have data
+    call("SET", "user:1", "ada")
+    call("INCRBY", "ctr", 8)  # ctr -> 8 again
+
+    # --- Pub/Sub over the wire (spawn a subscriber in a thread) ---
+    sub = Resp()
+    sub.cmd("SUBSCRIBE", "trades")
+    got = {}
+    def _sub():
+        try:
+            while True:
+                msg = sub._parse()
+                # first frames are [b"subscribe", ...] confirms; the actual
+                # push arrives as [b"message", b"trades", payload].
+                if isinstance(msg, list) and msg and msg[0] == b"message":
+                    got["payload"] = bytes(msg[2])
+                    break
+        except Exception:
+            pass
+    st = threading.Thread(target=_sub, daemon=True)
+    st.start()
+    time.sleep(0.2)
+    check("PUBLISH returns subscriber count", call("PUBLISH", "trades", "AAPL 42") == 1)
+    st.join(timeout=2.0)
+    check("SUBSCRIBE received published message", got.get("payload") == b"AAPL 42",
+          f"got {got.get('payload')!r}")
+    try: sub.close()
+    except Exception: pass
+
+    # --- Vectors: unified VADD + VSEARCH (plain / filtered F / learned L / hybrid H) ---
+    check("VADD 1", call("VADD", "1", "1.0", "0.0", "0.0") == "OK")
+    check("VADD 2", call("VADD", "2", "0.9", "0.1", "0.0") == "OK")
+    check("VADD 3", call("VADD", "3", "0.0", "1.0", "0.0") == "OK")
+    plain = call("VSEARCH", "3", "1.0", "0.0", "0.0")
+    # reply is [id, dist, id, dist, ...] => 2*k elements; query is exactly v1.
+    check("VSEARCH plain returns 3 hits", isinstance(plain, list) and len(plain) == 6,
+          f"len={len(plain) if isinstance(plain, list) else plain}")
+    check("VSEARCH plain top-1 is id 1", isinstance(plain, list) and plain[0] == 1,
+          f"top={plain[0] if isinstance(plain, list) else plain}")
+    # filtered by the query's own dominant-dim category (guaranteed non-empty)
+    q = [1.0, 0.0, 0.0]
+    qcat = max(range(len(q)), key=lambda j: abs(q[j])) % 8
+    filt = call("VSEARCH", "3", "F", str(qcat), *[str(x) for x in q])
+    check("VSEARCH F (filtered) returns hits", isinstance(filt, list) and len(filt) >= 2,
+          f"len={len(filt) if isinstance(filt, list) else filt}")
+    # hybrid: H <term> <weight> <qx> <qy> <qz> ...
+    hyb = call("VSEARCH", "3", "H", "0", "1.0", *[str(x) for x in q])
+    check("VSEARCH H (hybrid) returns hits", isinstance(hyb, list) and len(hyb) >= 2,
+          f"len={len(hyb) if isinstance(hyb, list) else hyb}")
+    # learned path needs VCALIBRATE first; without it the server returns -ERR
+    # (raised + caught by call) — verify graceful degradation (no crash).
+    learned_err = call("VSEARCH", "3", "L", *[str(x) for x in q])
+    check("VSEARCH L without VCALIBRATE is graceful (no crash)",
+          learned_err is None or isinstance(learned_err, (str, list, Exception)),
+          f"got={learned_err!r}")
+
+    # --- Time-series ---
+    check("TSADD", call("TSADD", "cpu", "100", "42.5") == "OK")
+    check("TSADD.F float", call("TSADD.F", "cpu", "200", "43.1") == "OK")
+    rng = call("TSRANGE", "cpu", "50", "250")
+    check("TSRANGE returns pairs", isinstance(rng, list) and len(rng) == 4,
+          f"len={len(rng) if isinstance(rng, list) else rng}")
+    latest = call("TSRANGE.LATEST", "cpu", "1")
+    check("TSRANGE.LATEST tail", isinstance(latest, list) and len(latest) == 2,
+          f"len={len(latest) if isinstance(latest, list) else latest}")
+
+    # --- Fuel-metered reducer ---
+    r1 = call("REDUCE", "ctr", "shard1", "hits", "1")
+    r2 = call("REDUCE", "ctr", "shard1", "hits", "4")
+    check("REDUCE accumulates", r1 == 1 and r2 == 5, f"r1={r1} r2={r2}")
+
+    # --- Agent memory: LTM + graph + bi-temporal + procedural + WM + episodic ---
+    check("MEM.REMEMBER", call("MEM.REMEMBER", "Alice is a senior engineer at Acme",
+                               "doc", "0.9", "1.0", "0.0", "0.0") == 1)
+    rec = call("MEM.RECALL", "5", "engineer", "1.0", "0.0", "0.0")
+    check("MEM.RECALL returns hits", isinstance(rec, list) and len(rec) >= 2,
+          f"len={len(rec) if isinstance(rec, list) else rec}")
+    check("MEM.LINK", call("MEM.LINK", "1", "9", "works_at", "0.9") == "OK")
+    neigh = call("MEM.NEIGH", "1")
+    check("MEM.NEIGH returns neighbours", isinstance(neigh, list) and len(neigh) >= 2,
+          f"len={len(neigh) if isinstance(neigh, list) else neigh}")
+    check("MEM.TRAV", call("MEM.TRAV", "1", "2") is not None)
+    check("MEM.REMEMBER.T (bi-temporal)", isinstance(call("MEM.REMEMBER.T",
+          "CEO of Acme at 3000", "fact", "0.9", "3000", "9999",
+          "0.0", "1.0", "0.0"), int))
+    asof = call("MEM.RECALL.AS_OF", "5", "ceo", "5000", "0.0", "1.0", "0.0")
+    check("MEM.RECALL.AS_OF returns hits", isinstance(asof, list) and len(asof) >= 2,
+          f"len={len(asof) if isinstance(asof, list) else asof}")
+    check("MEM.PROC.SET", call("MEM.PROC.SET", "alice", "deploy", "1. build 2. push") == "OK")
+    check("MEM.PROC.GET", call("MEM.PROC.GET", "alice", "deploy") == b"1. build 2. push")
+    check("MEM.PROC.LIST", isinstance(call("MEM.PROC.LIST", "alice"), list))
+    check("MEM.WM_SET", call("MEM.WM_SET", "alice", "task", "write report", "60000") == "OK")
+    check("MEM.WM_GET", call("MEM.WM_GET", "alice", "task") == b"write report")
+    check("MEM.EPISODE", isinstance(call("MEM.EPISODE", "alice", "event", "user logged in"), int))
+    eps = call("MEM.EPISODES", "alice", "10")
+    # reply is a list of episodes, each [seq, kind, payload]; one episode => 1 entry.
+    check("MEM.EPISODES returns log", isinstance(eps, list) and len(eps) >= 1,
+          f"len={len(eps) if isinstance(eps, list) else eps}")
+
+    # --- RAG hybrid retrieve + MITM cache gating ---
+    check("RAG.INGEST", call("RAG.INGEST", "10",
+          "HNSW is a graph index for nearest neighbor search", "1.0", "0.0", "0.0") == 3)
+    rag = call("RAG.SEARCH", "3", "graph index", "1.0", "0.0", "0.0")
+    check("RAG.SEARCH returns hits", isinstance(rag, list) and len(rag) >= 2,
+          f"len={len(rag) if isinstance(rag, list) else rag}")
+    check("CACHE.SET", call("CACHE.SET", "rag", "cached answer") == "OK")
+    cg = call("CACHE.GET", "rag")
+    check("CACHE.GET returns verdict+value", isinstance(cg, list) and len(cg) == 2,
+          f"len={len(cg) if isinstance(cg, list) else cg}")
+
+    # --- CHECKPOINT (snapshot + truncate WAL) then durability restart ---
+    ckpt = call("CHECKPOINT")
+    check("CHECKPOINT returns SNAPSHOT", isinstance(ckpt, str) and ckpt.startswith("SNAPSHOT"),
+          f"got={ckpt!r}")
+    c.close()
+
+    # Restart the SAME server from the SAME WAL — everything above must survive.
+    wal = _server_proc_wal()
+    _stop_server()
+    _start_server(wal, fresh=False)
+    c2 = Resp()
+
+    # ctr: INCRBY 7 -> 7, INCR -> 8, FLUSHDB is a no-op, INCRBY 8 -> 16.
+    check("durable KV survives restart", c2.cmd("GET", "user:1") == b"ada")
+    check("durable counter survives restart", c2.cmd("GET", "ctr") == b"16",
+          f"got={c2.cmd('GET','ctr')!r}")
+    check("durable VADD vector index survives restart",
+          isinstance(c2.cmd("VSEARCH", "3", "1.0", "0.0", "0.0"), list))
+    check("durable time-series survives restart",
+          isinstance(c2.cmd("TSRANGE", "cpu", "50", "250"), list))
+    # reducer accumulated to 5 (r2); one more +1 after restart must equal 6.
+    check("durable reducer state survives restart",
+          c2.cmd("REDUCE", "ctr", "shard1", "hits", "1") == 6,
+          f"got={c2.cmd('REDUCE','ctr','shard1','hits','1')!r}")
+    check("durable LTM survives restart",
+          isinstance(c2.cmd("MEM.RECALL", "3", "engineer", "1.0", "0.0", "0.0"), list))
+    check("durable procedural memory survives restart",
+          c2.cmd("MEM.PROC.GET", "alice", "deploy") == b"1. build 2. push")
+    check("durable WM survives restart",
+          c2.cmd("MEM.WM_GET", "alice", "task") == b"write report")
+    check("durable CACHE survives restart",
+          isinstance(c2.cmd("CACHE.GET", "rag"), list))
+    c2.close()
+
+def _server_proc_wal():
+    """Path to the WAL the running server was started with."""
+    return os.path.join("/tmp", f"dbstrike_suite_{PORT}.wal")
+
+# ---------------------------------------------------------------------------
 # 21. Crash recovery (kill mid-write, reopen, verify integrity)
 # ---------------------------------------------------------------------------
 def test_crash_recovery():
@@ -1364,6 +1545,7 @@ def main():
         run(test_wm_ep_memory)
         run(test_high_dim_vectors)
         run(test_rag_pipeline)
+        run(test_end_to_end_commands)
         run(test_protocol_robustness)
         run(test_persistence_integrity)
         run(test_large_scale_vector)

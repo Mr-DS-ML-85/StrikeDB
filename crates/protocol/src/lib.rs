@@ -232,3 +232,4 @@ mod tests {
         assert_eq!(cmd, vec![b"PING".to_vec()]);
     }
 }
+

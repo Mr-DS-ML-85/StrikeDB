@@ -513,7 +513,7 @@ redis-cli -p 6380 MEM.EPISODE_FORGET alice &lt;seq&gt;</code></pre>
   <div class="wrap">
     <div class="section-badge">Performance</div>
     <h2>Benchmarks that <span class="grad">speak for themselves</span></h2>
-    <p class="lead">Two harnesses: native Rust bench (18 sections, in-process) and Python integration
+    <p class="lead">Two harnesses: native Rust bench (27 sections, in-process) and Python integration
       (21 sections, over RESP). <strong>All numbers reproducible.</strong></p>
 
     <h3 style="margin-bottom:16px; font-size:16px; color:var(--ink);">vs Redis 8.x &mdash; measured with redis-benchmark 8.0.5</h3>
@@ -544,8 +544,10 @@ redis-cli -p 6380 MEM.EPISODE_FORGET alice &lt;seq&gt;</code></pre>
       <div class="bar"><div class="lab">1M × 768-d &mdash; Recall@10</div><div class="track"><div class="fill" style="width:99%">0.997</div></div></div>
       <div class="bar"><div class="lab">1M × 384-d &mdash; VSEARCH p99</div><div class="track"><div class="fill" style="width:5%">474us</div></div></div>
       <div class="bar"><div class="lab">1M × 384-d &mdash; Recall@10</div><div class="track"><div class="fill" style="width:96%">0.966</div></div></div>
-      <div class="bar"><div class="lab">1M × 384-d &mdash; 8-thread QPS</div><div class="track"><div class="fill" style="width:89%">8,992</div></div></div>
-      <div class="bar"><div class="lab">vs Qdrant 1M×768-d (single client)</div><div class="track"><div class="fill" style="width:30%">~450 QPS / ~8ms p99</div></div></div>
+      <div class="bar"><div class="lab">1M × 384-d &mdash; 8-thread QPS</div><div class="track"><div class="fill" style="width:89%">12,440</div></div></div>
+      <div class="bar"><div class="lab">1M × 384-d &mdash; 16-client peak QPS</div><div class="track"><div class="fill" style="width:92%">14,435</div></div></div>
+      <div class="bar"><div class="lab">vs Qdrant &mdash; 1 client (Latency case)</div><div class="track"><div class="fill" style="width:33%">4,652 QPS / 0.30ms p99 (Qdrant ~450 / ~8ms)</div></div></div>
+      <div class="bar"><div class="lab">vs Qdrant &mdash; 100 clients (RPS case)</div><div class="track"><div class="fill" style="width:97%">38,120 QPS / 8.4ms p99 (Qdrant ~13,000)</div></div></div>
     </div>
 
     <h3 style="margin:32px 0 16px; font-size:16px; color:var(--ink);">YCSB A / B / C / F (100k records, over RESP)</h3>
@@ -603,13 +605,19 @@ DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380
 redis-cli -p 6380 PING                 # -> PONG
 redis-cli -p 6380 SET user:1 ada
 redis-cli -p 6380 VADD 1 1.0 0.0 0.0
-redis-cli -p 6380 VSEARCH 5 1.0 0.0 0.0
+redis-cli -p 6380 VSEARCH 5 1.0 0.0 0.0          # dense k-NN (ef=128)
+redis-cli -p 6380 VSEARCH 5 F 3 1.0 0.0 0.0      # Module 4 filtered by category
+redis-cli -p 6380 VSEARCH 5 H 0 1.0 1.0 0.0 0.0  # Module 5 hybrid dense+sparse
+redis-cli -p 6380 VSEARCHA 5 1.0 0.0 0.0         # query-adaptive beam
+redis-cli -p 6380 VCALIBRATE 384 50 10 ...       # fit learned beam model
 redis-cli -p 6380 SUBSCRIBE trades &
 redis-cli -p 6380 PUBLISH trades "hello"
 redis-cli -p 6380 CHECKPOINT           # snapshot + WAL truncate
 
-# native Rust bench — 18 sections, YCSB, chaos
-cargo run --release -p bench
+# native Rust bench — 27 sections, YCSB, chaos, Qdrant head-to-head
+cargo run --release -p bench -- --wire-qps        # 1/100-client wire QPS
+cargo run --release -p bench -- --qdrant          # Module 6 face-off
+cargo run --release -p bench -- --large           # 1M × 128-d
 
 # Python integration + fuzz + crash recovery
 python3 tests/test_dbstrike.py</code></pre>

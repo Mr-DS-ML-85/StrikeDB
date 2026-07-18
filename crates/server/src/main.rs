@@ -24,14 +24,16 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use compute::{counter_reducer, ReducerResult, ReducerRuntime};
+use compute::{counter_reducer, vm::{Instr, Program}, ReducerResult, ReducerRuntime};
+use consensus::{hlc::Hlc, crdt::{GCounter, LwwRegister, PnCounter}};
 use mitm::CacheDebugger;
 use protocol::{try_parse, write_resp, write_resp_buf, Resp};
 use rag::Rag;
 use reactive::Reactive;
 use router::{Router, TieredMemory};
-use storage::Engine;
-use views::{Kv, TimeSeries};
+use std::collections::HashMap;
+use storage::{Engine, Value};
+use views::{Filter, Kv, LearnedEf, Row, TimeSeries};
 
 struct Db {
     engine: Arc<Engine>,
@@ -44,6 +46,25 @@ struct Db {
     cache: Arc<CacheDebugger>,
     #[allow(dead_code)]
     memory: TieredMemory,
+    /// MODULE 3 — the calibrated learned-beam-width model, populated by
+    /// `VCALIBRATE` and consumed by `VSEARCH L`. Guarded by a Mutex because the
+    /// RESP dispatch is multi-threaded; calibration is rare, search is hot.
+    learned: Mutex<Option<LearnedEf>>,
+    /// Consensus CRDTs (in-memory, merge-able). Keyed by a user-supplied name.
+    /// These back the `CRDT.*` family of RESP commands.
+    crdt: Mutex<ConsensusStore>,
+    /// Hybrid logical clock for the `HLC.*` RESP commands.
+    hlc: Hlc,
+    /// Current quantization mode for the vector index (per-process; the
+    /// in-memory HNSW holds it and it is not persisted — see `VSETQUANT`).
+    quant_mode: Mutex<views::QuantMode>,
+}
+
+/// In-memory store of all CRDTs, keyed by name. Each variant is merge-able.
+struct ConsensusStore {
+    gc: HashMap<String, GCounter>,
+    pn: HashMap<String, PnCounter>,
+    lww: HashMap<String, LwwRegister>,
 }
 
 fn main() -> std::io::Result<()> {
@@ -60,7 +81,25 @@ fn main() -> std::io::Result<()> {
     let cache = CacheDebugger::new(Arc::clone(&engine), 4096);
     let memory = TieredMemory::new(300);
 
-    let db = Arc::new(Db { engine, reactive, router, kv, ts, reducers, rag, cache, memory });
+    let db = Arc::new(Db {
+        engine,
+        reactive,
+        router,
+        kv,
+        ts,
+        reducers,
+        rag,
+        cache,
+        memory,
+        learned: Mutex::new(None),
+        crdt: Mutex::new(ConsensusStore {
+            gc: HashMap::new(),
+            pn: HashMap::new(),
+            lww: HashMap::new(),
+        }),
+        hlc: Hlc::new(),
+        quant_mode: Mutex::new(views::QuantMode::Int8),
+    });
 
     let listener = TcpListener::bind(&addr)?;
     // Large backlog so a connection storm (-c800+) queues instead of the
@@ -69,6 +108,7 @@ fn main() -> std::io::Result<()> {
     let _ = listener.set_nonblocking(false);
     println!("DB-Strike listening on {addr} (RESP wire), WAL={data_path}");
     println!("One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug");
+    println!("Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN");
 
     // Rate-limit accept-error logging: under EMFILE the accept loop would
     // otherwise spew thousands of identical lines per second. Print at most
@@ -145,14 +185,15 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
         let mut cmds: Vec<Vec<Vec<u8>>> = Vec::new();
         let mut cursor = 0usize;
         loop {
-            match try_parse(&buf[cursor..])? {
-                Some((cmd, consumed)) => {
+            match try_parse(&buf[cursor..]) {
+                Ok(Some((cmd, consumed))) => {
                     cursor += consumed;
                     if !cmd.is_empty() {
                         cmds.push(cmd);
                     }
                 }
-                None => break, // partial command; wait for more bytes
+                Ok(None) => break, // partial command; wait for more bytes
+                Err(e) => return Err(e),
             }
         }
         if cursor > 0 {
@@ -201,6 +242,7 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
             }
             if is_coalescable_set(&cmds[i]) {
                 let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut cmds_in_run = 0usize;
                 while i < cmds.len() && is_coalescable_set(&cmds[i]) {
                     // Take ownership of the command so the value bytes can be
                     // MOVED (not cloned) straight into the engine — at 16M ops/s
@@ -222,14 +264,18 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
                             kvs.push((kb, pair[1].clone()));
                         }
                     }
+                    cmds_in_run += 1;
                     i += 1;
                 }
                 let n = kvs.len();
                 match db.kv.set_batch(kvs) {
                     Ok(_) => {
-                        // One "+OK\r\n" per command, appended to the batch
-                        // output buffer — no per-reply Resp alloc / encode.
-                        for _ in 0..n {
+                        // One "+OK\r\n" per *command* (not per key), so a
+                        // coalesced run of SET/SET or a single MSET each emit
+                        // exactly one ack — preserving the per-command
+                        // reply-count invariant the client relies on.
+                        let _ = n;
+                        for _ in 0..cmds_in_run {
                             out.extend_from_slice(b"+OK\r\n");
                         }
                     }
@@ -370,10 +416,99 @@ fn parse_floats(args: &[Vec<u8>]) -> Option<Vec<f32>> {
         .collect()
 }
 
+/// Number of hardware threads — used to size the parallel-ingest shard count.
+fn num_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .max(1)
+}
+
+/// Parse a quantization-mode token (case-insensitive) into `QuantMode`.
+fn quant_mode_from_str(s: &str) -> Option<views::QuantMode> {
+    use views::QuantMode::*;
+    Some(match s {
+        "INT8" => Int8,
+        "BINARY" => Binary,
+        "BINARY2" => Binary2,
+        "BINARY15" => Binary15,
+        "TURBO1" => Turbo1,
+        "TURBO15" => Turbo15,
+        "TURBO2" => Turbo2,
+        "TURBO4" => Turbo4,
+        "PRODUCT" => Product,
+        _ => return None,
+    })
+}
+
+/// Serialize a `Row` (col -> Vec<u8>) to a flat RESP array of (col, val) pairs.
+fn row_to_resp(row: Row) -> Vec<Resp> {
+    let mut out = Vec::with_capacity(row.len() * 2);
+    for (col, val) in row {
+        out.push(Resp::Bulk(col.into_bytes()));
+        out.push(Resp::Bulk(val));
+    }
+    out
+}
+
+/// Render an optional `Value` into a RESP reply, typed by its variant.
+fn value_to_resp(v: Option<Value>) -> Resp {
+    match v {
+        None => Resp::Nil,
+        Some(Value::Bytes(b)) => Resp::Bulk(b),
+        Some(Value::Int(i)) => Resp::Int(i),
+        Some(Value::Float(f)) => Resp::Bulk(format!("{f}").into_bytes()),
+        Some(Value::Vector(vec)) => Resp::Array(
+            vec.into_iter()
+                .map(|x| Resp::Bulk(format!("{x}").into_bytes()))
+                .collect(),
+        ),
+        Some(Value::Row(row)) => Resp::Array(row_to_resp(row)),
+        Some(Value::Tombstone) => Resp::Nil,
+    }
+}
+
+/// MODULE 4/5 — deterministically DERIVE a query's filter attribute and sparse
+/// (lexical) view from its dense vector, so one `VADD` populates the dense HNSW,
+/// the filter-attr table, and the sparse/BM25 index with ZERO protocol change.
+/// attr = which dim-bucket holds the vector's strongest component (a cheap,
+/// stable category); sparse = the top-W dimensions by |value| as (term, weight).
+/// Identical derivation is used by the bench, keeping client + server consistent.
+fn derive_attr_and_sparse(vec: &[f32], n_buckets: u32, w: usize) -> (u32, Vec<(u32, f32)>) {
+    let mut best_dim = 0usize;
+    let mut best_mag = 0.0f32;
+    let mut idxs: Vec<(usize, f32)> = vec.iter().enumerate().map(|(j, &v)| (j, v.abs())).collect();
+    for (j, m) in &idxs {
+        if *m > best_mag {
+            best_mag = *m;
+            best_dim = *j;
+        }
+    }
+    let attr = (best_dim as u32) % n_buckets;
+    idxs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let sparse: Vec<(u32, f32)> = idxs.iter().take(w).map(|(j, v)| (*j as u32, *v)).collect();
+    (attr, sparse)
+}
+
 fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
     match name {
         "PING" => Resp::Simple("PONG".into()),
         "QUIT" => Resp::Simple("OK".into()),
+        // CLIENT ... — redis-benchmark 8 (and redis-cli) send `CLIENT SETINFO
+        // LIB-NAME/LIB-VER` at startup. Replying OK (no-op) keeps the pre-flight
+        // clean so no spurious 0-sample "-nan" line appears in the summary.
+        "CLIENT" => {
+            if args.is_empty() {
+                return err("CLIENT requires a subcommand");
+            }
+            let sub = String::from_utf8_lossy(&args[0]).to_uppercase();
+            match sub.as_str() {
+                "SETINFO" | "SETNAME" | "GETNAME" | "INFO" | "LIST" | "TRACKING"
+                | "PAUSE" | "UNPAUSE" | "REPLY" => Resp::Simple("OK".into()),
+                _ => err("CLIENT subcommand not supported"),
+            }
+        }
+
 
         "SET" => {
             if args.len() != 2 {
@@ -433,6 +568,50 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         "COMMAND" => Resp::Array(Vec::new()),
         // SELECT db — Redis supports N logical DBs; we always use DB 0.
         "SELECT" => Resp::Simple("OK".into()),
+        // CONFIG GET <pattern> / CONFIG SET <k> <v> — redis-benchmark probes
+        // `CONFIG GET save` (and others) at startup; an unknown command made
+        // its warmup sample divide by zero → "-nan" RPS in the summary. Reply
+        // with the real Redis-shaped key/value array so the probe succeeds.
+        "CONFIG" => {
+            if args.is_empty() {
+                return err("CONFIG requires GET/SET ...");
+            }
+            let sub = String::from_utf8_lossy(&args[0]).to_uppercase();
+            if sub == "GET" {
+                if args.len() < 2 {
+                    return err("CONFIG GET requires a pattern");
+                }
+                let pat = String::from_utf8_lossy(&args[1]).to_string();
+                // Keys redis-benchmark / redis-cli commonly probe. Pattern "*"
+                // returns all; a literal key returns just that one.
+                let known: &[(&str, &str)] = &[
+                    ("save", ""),
+                    ("maxmemory", "0"),
+                    ("maxmemory-policy", "noeviction"),
+                    ("databases", "16"),
+                    ("appendonly", "no"),
+                    ("timeout", "0"),
+                    ("tcp-keepalive", "0"),
+                    ("hz", "10"),
+                    ("lazyfree-lazy-eviction", "no"),
+                ];
+                let mut out: Vec<Resp> = Vec::new();
+                for (k, v) in known {
+                    let matches = pat == "*" || pat == *k
+                        || (pat.ends_with('*') && k.starts_with(&pat[..pat.len() - 1]));
+                    if matches {
+                        out.push(Resp::Bulk(k.as_bytes().to_vec()));
+                        out.push(Resp::Bulk(v.as_bytes().to_vec()));
+                    }
+                }
+                Resp::Array(out)
+            } else if sub == "SET" {
+                // No-op: dbstrike has no tunable runtime config surface here.
+                Resp::Simple("OK".into())
+            } else {
+                err("CONFIG subcommand must be GET or SET")
+            }
+        }
         "GET" => {
             if args.len() != 1 {
                 return err("GET requires key");
@@ -494,14 +673,332 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in vector"),
             };
-            match db.router.vectors().insert(id, vec) {
-                Ok(_) => Resp::Simple("OK".into()),
+            // TurboQuant fits a d×d rotation; inserting a mismatched dim would
+            // desync the packed storage (and panicked before this guard).
+            let vi = db.router.vectors();
+            let qd = vi.quant_dim();
+            if qd != 0 && vec.len() != qd {
+                return err(&format!("VADD dim {} != turbo index dim {}", vec.len(), qd));
+            }
+            // UNIFIED write: one command populates the dense HNSW (durable),
+            // the MODULE 4 filter-attribute, and the MODULE 5 sparse/BM25 index
+            // (both derived from the dense vector, no protocol change). This is
+            // the "one graph, many access paths" thesis at the write path.
+            let (attr, sparse) = derive_attr_and_sparse(&vec, 8, 8);
+            let vi = db.router.vectors();
+            // Graph-only insert FIRST so the node's filter-attribute is fixed
+            // (the durable `insert` below takes the update-in-place path and
+            // leaves attr untouched, so attr must be set here).
+            vi.insert_graph_only_attr(id, vec.clone(), attr);
+            if let Err(e) = vi.insert(id, vec.clone()) {
+                return err(&e.to_string());
+            }
+            vi.add_sparse(id, sparse);
+            Resp::Simple("OK".into())
+        }
+
+        // VADDBATCH [PAR] dim id0 f0..f{dim-1} id1 f0..f{dim-1} ...  -> :n
+        // Multi-core ingest (Module 1). Default: builds the batch as parallel
+        // shards and bridge-merges into the live graph via `merge_into`
+        // (serial per-node bridge — correct, but single-threaded at merge).
+        // With the `PAR` flag: combines the existing graph + batch and rebuilds
+        // the WHOLE graph in parallel via `build_parallel_ids` (shuffle + cheap
+        // O(K²) entry bridge) — a genuinely cores× build with correct recall.
+        // Each vector is still written durably to the WAL substrate. Returns the
+        // count ingested.
+        "VADDBATCH" => {
+            if args.len() < 2 {
+                return err("VADDBATCH requires [PAR] dim id f1 f2 ... [id f...]...");
+            }
+            // Optional leading "PAR" selects the parallel-rebuild ingest path.
+            let (parallel, rest) = if String::from_utf8_lossy(&args[0]).eq_ignore_ascii_case("PAR") {
+                (true, &args[1..])
+            } else {
+                (false, &args[..])
+            };
+            if rest.len() < 1 {
+                return err("VADDBATCH requires dim id f1 f2 ... [id f...]...");
+            }
+            let dim: usize = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("dim is not an integer"),
+            };
+            if dim == 0 {
+                return err("dim must be > 0");
+            }
+            if (rest.len() - 1) % (dim + 1) != 0 {
+                return err("VADDBATCH float count must be whole number of (id + dim) tuples");
+            }
+            let tuples = (rest.len() - 1) / (dim + 1);
+            let mut ids: Vec<u64> = Vec::with_capacity(tuples);
+            let mut flat: Vec<f32> = Vec::with_capacity(tuples * dim);
+            let mut ok = true;
+            let mut errmsg = String::new();
+            for t in 0..tuples {
+                let base = 1 + t * (dim + 1);
+                let id: u64 = match std::str::from_utf8(&rest[base]).ok().and_then(|s| s.parse().ok()) {
+                    Some(n) => n,
+                    None => { ok = false; errmsg = "id is not a u64".into(); break; }
+                };
+                let v = match parse_floats(&rest[base + 1..base + 1 + dim]) {
+                    Some(v) => v,
+                    None => { ok = false; errmsg = "bad float in vector".into(); break; }
+                };
+                ids.push(id);
+                flat.extend_from_slice(&v);
+            }
+            if !ok {
+                return err(&errmsg);
+            }
+            let vi = db.router.vectors();
+            // Guard dim mismatch before any WAL writes: a batch must use the
+            // same dimensionality as the existing index (any dim if empty).
+            if vi.len() > 0 && vi.dim() != dim {
+                return err(&format!("VADDBATCH dim {} != existing index dim {}", dim, vi.dim()));
+            }
+            // TurboQuant fits a d×d rotation; a mismatched batch dim desyncs the
+            // packed storage (panicked before this guard).
+            let qd = vi.quant_dim();
+            if qd != 0 && dim != qd {
+                return err(&format!("VADDBATCH dim {} != turbo index dim {}", dim, qd));
+            }
+            // Derive each vector's filter attribute + sparse terms exactly like
+            // single VADD, so the unified filtered/hybrid paths work uniformly
+            // on batched vectors too.
+            let mut attrs: Vec<u32> = Vec::with_capacity(tuples);
+            let mut sparses: Vec<Vec<(u32, f32)>> = Vec::with_capacity(tuples);
+            for i in 0..tuples {
+                let vslice = &flat[i * dim..i * dim + dim];
+                let (attr, sparse) = derive_attr_and_sparse(vslice, 8, 8);
+                attrs.push(attr);
+                sparses.push(sparse);
+            }
+            // PAR flag → parallel-rebuild path (cores×, correct recall);
+            // default → serial merge_into append (unchanged behavior).
+            let res = if parallel {
+                vi.insert_many_parallel_rebuild(&ids, &flat, dim, num_cores(), &attrs)
+            } else {
+                vi.insert_many_parallel(&ids, &flat, dim, num_cores(), &attrs)
+            };
+            match res {
+                Ok(_) => {
+                    for (i, &id) in ids.iter().enumerate() {
+                        vi.add_sparse(id, sparses[i].clone());
+                    }
+                    Resp::Int(tuples as i64)
+                }
                 Err(e) => err(&e.to_string()),
             }
         }
+
+        // VSETQUANT mode  -> OK   (Module 2 quantization selector)
+        // Selects the quantization mode for subsequent inserts. Must be called
+        // on an EMPTY index (the underlying HNSW asserts on a non-empty graph).
+        // Modes: INT8 BINARY BINARY2 BINARY15 TURBO1 TURBO15 TURBO2 TURBO4 PRODUCT
+        // For TURBO*/PRODUCT, follow with VFITQUANT on a sample before inserts.
+        "VSETQUANT" => {
+            if args.len() != 1 {
+                return err("VSETQUANT requires mode");
+            }
+            let m = match quant_mode_from_str(&String::from_utf8_lossy(&args[0]).to_uppercase()) {
+                Some(m) => m,
+                None => return err("unknown quant mode (INT8 BINARY BINARY2 BINARY15 TURBO1 TURBO15 TURBO2 TURBO4 PRODUCT)"),
+            };
+            let vi = db.router.vectors();
+            if vi.len() > 0 {
+                return err("VSETQUANT requires an empty index (flush/restart first)");
+            }
+            vi.set_quant_mode(m);
+            *db.quant_mode.lock().unwrap() = m;
+            Resp::Simple("OK".into())
+        }
+
+        // VFITQUANT dim n id0 f0..f{dim-1} ...  -> OK
+        // Fits TurboQuant / Product-Quantization parameters from a normalized
+        // sample. Required before inserts when mode ∈ {TURBO*, PRODUCT}.
+        // VQUANT  -> bulk (current quantization mode name)
+        "VQUANT" => {
+            let m = db.quant_mode.lock().unwrap();
+            Resp::Bulk(format!("{m:?}").into_bytes())
+        }
+
+        "VFITQUANT" => {
+            if args.len() < 3 {
+                return err("VFITQUANT requires dim n id f1 f2 ...");
+            }
+            let dim: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("dim is not an integer"),
+            };
+            let n: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("n is not an integer"),
+            };
+            if args.len() != 2 + n * (dim + 1) {
+                return err("VFITQUANT float count mismatch");
+            }
+            // fit_quant asserts on an empty index; return a clean error rather
+            // than panicking if vectors already exist.
+            if db.router.vectors().len() > 0 {
+                return err("VFITQUANT requires an empty index (flush/restart first)");
+            }
+            let mut sample: Vec<Vec<f32>> = Vec::with_capacity(n);
+            let mut ok = true;
+            for t in 0..n {
+                let base = 2 + t * (dim + 1);
+                let v = match parse_floats(&args[base + 1..base + 1 + dim]) {
+                    Some(v) => v,
+                    None => { ok = false; break; }
+                };
+                sample.push(v);
+            }
+            if !ok {
+                return err("bad float in VFITQUANT sample");
+            }
+            db.router.vectors().fit_quant(&sample);
+            Resp::Simple("OK".into())
+        }
+
+        // VCALIBRATE dim nq k q_f0..q_f{dim-1}(×nq) tgt0_0..tgt0_{k-1}(×nq)
+        //   → calibrate the MODULE 3 learned beam-width model from inlined
+        //     calibration queries + their ground-truth top-k ids, store it in
+        //     the server. The ONLY setup command; all query paths stay unified
+        //     under VSEARCH. Ground truth comes from the caller (e.g. the bench
+        //     knows true neighbours); we never fabricate it server-side.
+        "VCALIBRATE" => {
+            if args.len() < 3 {
+                return err("VCALIBRATE requires dim nq k ...");
+            }
+            let dim: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("dim is not an integer"),
+            };
+            let nq: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("nq is not an integer"),
+            };
+            let k: usize = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("k is not an integer"),
+            };
+            let exp = 3 + nq * dim + nq * k;
+            if args.len() != exp {
+                return err(&format!("VCALIBRATE expects {exp} args, got {}", args.len()));
+            }
+            let floats = match parse_floats(&args[3..3 + nq * dim]) {
+                Some(v) => v,
+                None => return err("bad float in calibration queries"),
+            };
+            let qvecs: Vec<Vec<f32>> = floats.chunks(dim).map(|c| c.to_vec()).collect();
+            let mut truth: Vec<Vec<u64>> = Vec::with_capacity(nq);
+            let mut off = 3 + nq * dim;
+            for _ in 0..nq {
+                let mut t = Vec::with_capacity(k);
+                for _ in 0..k {
+                    match std::str::from_utf8(&args[off]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                        Some(id) => t.push(id),
+                        None => return err("bad id in calibration truth"),
+                    }
+                    off += 1;
+                }
+                truth.push(t);
+            }
+            let model = db.router.vectors().calibrate_ef(
+                &qvecs, &truth, 0.92, &[32, 64, 96, 128, 192, 256, 384, 512], k, 32, 512,
+            );
+            *db.learned.lock().unwrap() = Some(model);
+            Resp::Simple("OK".into())
+        }
         "VSEARCH" => {
             if args.len() < 2 {
-                return err("VSEARCH requires k f1 f2 ...");
+                return err("VSEARCH requires k [F cat | L | H t w ...] f1 f2 ...");
+            }
+            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("k is not an integer"),
+            };
+            // Parse optional trailing access-path flags, then the float vector.
+            // Flags (any order, before the floats):
+            //   F <cat>  → MODULE 4 filtered ANN (attribute = cat)
+            //   L        → MODULE 3 learned-adaptive beam width (needs VCALIBRATE)
+            //   H <t> <w> ... → MODULE 5 hybrid (sparse side = term/weight pairs)
+            // No flag → plain quantized+rerank ANN. One command, every path.
+            let mut i = 1usize;
+            let mut filter: Option<Filter> = None;
+            let mut use_learned = false;
+            let mut sparse: Option<Vec<(u32, f32)>> = None;
+            while i < args.len() {
+                let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if tok == "F" {
+                    if i + 1 >= args.len() {
+                        return err("F requires a category");
+                    }
+                    let cat: u32 = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse().ok()) {
+                        Some(n) => n,
+                        None => return err("F category is not an integer"),
+                    };
+                    filter = Some(Filter::Eq(cat));
+                    i += 2;
+                } else if tok == "L" {
+                    use_learned = true;
+                    i += 1;
+                } else if tok == "H" {
+                    let mut terms = Vec::new();
+                    i += 1;
+                    while i + 1 < args.len() {
+                        let t: u32 = match std::str::from_utf8(&args[i]).ok().and_then(|s| s.parse().ok()) {
+                            Some(n) => n,
+                            None => break,
+                        };
+                        let w: f32 = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse().ok()) {
+                            Some(n) => n,
+                            None => break,
+                        };
+                        terms.push((t, w));
+                        i += 2;
+                    }
+                    if terms.is_empty() {
+                        return err("H requires at least one t w pair");
+                    }
+                    sparse = Some(terms);
+                } else {
+                    break; // first float → end of flags
+                }
+            }
+            let q = match parse_floats(&args[i..]) {
+                Some(v) => v,
+                None => return err("bad float in query"),
+            };
+            let vi = db.router.vectors();
+            let learned = if use_learned {
+                db.learned.lock().unwrap().clone()
+            } else {
+                None
+            };
+            if use_learned && learned.is_none() {
+                return err("learned search requires VCALIBRATE first");
+            }
+            let hits = vi.search_unified(
+                &q, k, 128, filter.as_ref(), learned.as_ref(), sparse.as_deref(), 50,
+            );
+            let mut out = Vec::new();
+            for (id, dist) in hits {
+                out.push(Resp::Int(id as i64));
+                out.push(Resp::Bulk(format!("{dist:.6}").into_bytes()));
+            }
+            Resp::Array(out)
+        }
+
+        // VSEARCHA k f1 f2 ...   -> query-adaptive k-NN (ruvector-style).
+        // Same protocol as VSEARCH but uses a per-query beam width: easy
+        // queries get a narrow beam (fewer distance computations → lower
+        // latency), hard queries get a wide beam (recall preserved). This is
+        // the deliberate win over Qdrant's fixed-ef search. Tuning bounds are
+        // chosen for 384/768d at 100k–1M scale; the probe beam is tiny so its
+        // cost is negligible vs the real traversal.
+        "VSEARCHA" => {
+            if args.len() < 2 {
+                return err("VSEARCHA requires k f1 f2 ...");
             }
             let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
@@ -511,7 +1008,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query"),
             };
-            let hits = db.router.vectors().search(&q, k);
+            let hits = db.router.vectors().search_adaptive(&q, k, 16, 32, 256);
             let mut out = Vec::new();
             for (id, dist) in hits {
                 out.push(Resp::Int(id as i64));
@@ -1134,6 +1631,394 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         "CACHE.CLEAR" => {
             db.cache.clear();
             Resp::Simple("OK".into())
+        }
+
+        // ── TABLES (relational view, Module: tables) ─────────────────────
+        // TABLE.SET table pk col val [col val ...]  -> OK
+        "TABLE.SET" => {
+            if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+                return err("TABLE.SET requires table pk col val [col val ...]");
+            }
+            let table = String::from_utf8_lossy(&args[0]).to_string();
+            let pk = String::from_utf8_lossy(&args[1]).to_string();
+            let mut row: Row = db.router.tables().get(&table, &pk).unwrap_or_default();
+            let mut i = 2;
+            while i + 1 < args.len() {
+                let col = String::from_utf8_lossy(&args[i]).to_string();
+                row.insert(col, args[i + 1].clone());
+                i += 2;
+            }
+            match db.router.tables().upsert(&table, &pk, row) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+        // TABLE.GET table pk  -> array of (col, val) or nil
+        "TABLE.GET" => {
+            if args.len() != 2 {
+                return err("TABLE.GET requires table pk");
+            }
+            let table = String::from_utf8_lossy(&args[0]).to_string();
+            let pk = String::from_utf8_lossy(&args[1]).to_string();
+            match db.router.tables().get(&table, &pk) {
+                Some(row) => Resp::Array(row_to_resp(row)),
+                None => Resp::Nil,
+            }
+        }
+        // TABLE.DEL table pk  -> OK
+        "TABLE.DEL" => {
+            if args.len() != 2 {
+                return err("TABLE.DEL requires table pk");
+            }
+            let table = String::from_utf8_lossy(&args[0]).to_string();
+            let pk = String::from_utf8_lossy(&args[1]).to_string();
+            match db.router.tables().delete(&table, &pk) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+        // TABLE.SCAN table  -> array of (pk, (col,val)...) per row
+        "TABLE.SCAN" => {
+            if args.len() != 1 {
+                return err("TABLE.SCAN requires table");
+            }
+            let table = String::from_utf8_lossy(&args[0]).to_string();
+            let rows = db.router.tables().scan(&table);
+            let mut out = Vec::with_capacity(rows.len());
+            for (pk, row) in rows {
+                out.push(Resp::Array({
+                    let mut a = vec![Resp::Bulk(pk.into_bytes())];
+                    a.extend(row_to_resp(row));
+                    a
+                }));
+            }
+            Resp::Array(out)
+        }
+        // TABLE.FILTEREQ table col val  -> array of (pk, (col,val)...) per match
+        "TABLE.FILTEREQ" => {
+            if args.len() != 3 {
+                return err("TABLE.FILTEREQ requires table col val");
+            }
+            let table = String::from_utf8_lossy(&args[0]).to_string();
+            let col = String::from_utf8_lossy(&args[1]).to_string();
+            let rows = db.router.tables().filter_eq(&table, &col, &args[2]);
+            let mut out = Vec::with_capacity(rows.len());
+            for (pk, row) in rows {
+                out.push(Resp::Array({
+                    let mut a = vec![Resp::Bulk(pk.into_bytes())];
+                    a.extend(row_to_resp(row));
+                    a
+                }));
+            }
+            Resp::Array(out)
+        }
+
+        // ── CONSENSUS CRDTs ──────────────────────────────────────────────
+        // CRDT.GCOUNTER name node by  -> :value   (grow-only counter)
+        "CRDT.GCOUNTER" => {
+            if args.len() != 3 {
+                return err("CRDT.GCOUNTER requires name node by");
+            }
+            let name = String::from_utf8_lossy(&args[0]).to_string();
+            let node = String::from_utf8_lossy(&args[1]).to_string();
+            let by: u64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("by is not a u64"),
+            };
+            let mut store = db.crdt.lock().unwrap();
+            let c = store.gc.entry(name).or_default();
+            c.incr(&node, by);
+            Resp::Int(c.value() as i64)
+        }
+        // CRDT.PNCOUNTER name node delta  -> :value   (PN counter; delta may be negative)
+        "CRDT.PNCOUNTER" => {
+            if args.len() != 3 {
+                return err("CRDT.PNCOUNTER requires name node delta");
+            }
+            let name = String::from_utf8_lossy(&args[0]).to_string();
+            let node = String::from_utf8_lossy(&args[1]).to_string();
+            let d: i64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("delta is not an i64"),
+            };
+            let mut store = db.crdt.lock().unwrap();
+            let c = store.pn.entry(name).or_default();
+            if d >= 0 {
+                c.incr(&node, d as u64);
+            } else {
+                c.decr(&node, (-d) as u64);
+            }
+            Resp::Int(c.value())
+        }
+        // CRDT.LWW name value ts node  -> OK   (last-write-wins register)
+        "CRDT.LWW" => {
+            if args.len() != 4 {
+                return err("CRDT.LWW requires name value ts node");
+            }
+            let name = String::from_utf8_lossy(&args[0]).to_string();
+            let ts: u64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("ts is not a u64"),
+            };
+            let node = String::from_utf8_lossy(&args[3]).to_string();
+            let mut store = db.crdt.lock().unwrap();
+            let r = store.lww.entry(name).or_insert_with(|| LwwRegister::new(args[1].clone(), 0, &node));
+            r.set(args[1].clone(), ts, &node);
+            Resp::Simple("OK".into())
+        }
+        // CRDT.GET name  -> bulk (value) for GCOUNTER/PnCounter/LWW, or nil
+        "CRDT.GET" => {
+            if args.len() != 1 {
+                return err("CRDT.GET requires name");
+            }
+            let name = String::from_utf8_lossy(&args[0]).to_string();
+            let store = db.crdt.lock().unwrap();
+            if let Some(c) = store.gc.get(&name) {
+                Resp::Bulk(c.value().to_string().into_bytes())
+            } else if let Some(c) = store.pn.get(&name) {
+                Resp::Bulk(c.value().to_string().into_bytes())
+            } else if let Some(r) = store.lww.get(&name) {
+                Resp::Bulk(r.value.clone())
+            } else {
+                Resp::Nil
+            }
+        }
+
+        // ── HYBRID LOGICAL CLOCK ─────────────────────────────────────────
+        // HLC.NOW  -> "<physical>.<logical>"
+        "HLC.NOW" => {
+            let ts = db.hlc.now();
+            Resp::Bulk(format!("{}.{}", ts.physical, ts.logical).into_bytes())
+        }
+        // HLC.UPDATE <physical> <logical>  -> "<physical>.<logical>"
+        "HLC.UPDATE" => {
+            if args.len() != 2 {
+                return err("HLC.UPDATE requires physical logical");
+            }
+            let p: u64 = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("physical is not a u64"),
+            };
+            let l: u32 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("logical is not a u32"),
+            };
+            let ts = db.hlc.update(consensus::hlc::Timestamp { physical: p, logical: l });
+            Resp::Bulk(format!("{}.{}", ts.physical, ts.logical).into_bytes())
+        }
+
+        // ── GENERIC REDUCER PROGRAM (Module: compute VM) ─────────────────
+        // REDUCE.PROGRAM name shardkey Instr...  -> :output | error
+        // Instr tokens (space separated, after name+shardkey):
+        //   PUSHINT <i64>  POP  DUP  ADD  SUB  MUL
+        //   LOADINT <key>  STOREINT <key>  JUMP <idx>  JZ <idx>  RETURN  TRAP <msg>
+        // Assembles a fuel-metered Program and invokes it in the reducer runtime.
+        "REDUCE.PROGRAM" => {
+            if args.len() < 3 {
+                return err("REDUCE.PROGRAM requires name shardkey Instr...");
+            }
+            let rname = String::from_utf8_lossy(&args[0]).to_string();
+            let shardkey = args[1].clone();
+            let mut instrs: Vec<Instr> = Vec::with_capacity(args.len() - 2);
+            let mut i = 2;
+            while i < args.len() {
+                let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
+                i += 1;
+                let need = |i: &mut usize, n: usize| -> bool { *i + n <= args.len() };
+                match tok.as_str() {
+                    "PUSHINT" => {
+                        if !need(&mut i, 1) { return err("PUSHINT requires an i64"); }
+                        let v: i64 = match std::str::from_utf8(&args[i]).ok().and_then(|s| s.parse().ok()) {
+                            Some(v) => v, None => return err("PUSHINT arg not i64"),
+                        };
+                        i += 1; instrs.push(Instr::PushInt(v));
+                    }
+                    "POP" => instrs.push(Instr::Pop),
+                    "DUP" => instrs.push(Instr::Dup),
+                    "ADD" => instrs.push(Instr::Add),
+                    "SUB" => instrs.push(Instr::Sub),
+                    "MUL" => instrs.push(Instr::Mul),
+                    "LOADINT" => {
+                        if !need(&mut i, 1) { return err("LOADINT requires a key"); }
+                        instrs.push(Instr::LoadInt(args[i].clone())); i += 1;
+                    }
+                    "STOREINT" => {
+                        if !need(&mut i, 1) { return err("STOREINT requires a key"); }
+                        instrs.push(Instr::StoreInt(args[i].clone())); i += 1;
+                    }
+                    "JUMP" => {
+                        if !need(&mut i, 1) { return err("JUMP requires an idx"); }
+                        let v: usize = match std::str::from_utf8(&args[i]).ok().and_then(|s| s.parse().ok()) {
+                            Some(v) => v, None => return err("JUMP arg not usize"),
+                        };
+                        i += 1; instrs.push(Instr::Jump(v));
+                    }
+                    "JZ" => {
+                        if !need(&mut i, 1) { return err("JZ requires an idx"); }
+                        let v: usize = match std::str::from_utf8(&args[i]).ok().and_then(|s| s.parse().ok()) {
+                            Some(v) => v, None => return err("JZ arg not usize"),
+                        };
+                        i += 1; instrs.push(Instr::JumpIfZero(v));
+                    }
+                    "RETURN" => instrs.push(Instr::Return),
+                    "TRAP" => {
+                        if !need(&mut i, 1) { return err("TRAP requires a msg"); }
+                        instrs.push(Instr::Trap(String::from_utf8_lossy(&args[i]).to_string()));
+                        i += 1;
+                    }
+                    other => return err(&format!("unknown Instr '{other}'")),
+                }
+            }
+            let prog = Program { instrs };
+            match db.reducers.invoke(&rname, &shardkey, &prog) {
+                ReducerResult::Ok { output, .. } => Resp::Int(output.unwrap_or(0)),
+                ReducerResult::Aborted(e) => err(&format!("reducer aborted: {e:?}")),
+                ReducerResult::Quarantined => err("reducer quarantined"),
+            }
+        }
+
+        // ── MEMORY PRIMITIVES (unexposed until now) ──────────────────────
+        // MEM.INCOMING id [rel]  -> array of (from, rel, weight)
+        "MEM.INCOMING" => {
+            if args.is_empty() {
+                return err("MEM.INCOMING requires id [rel]");
+            }
+            let id: u64 = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("id is not a u64"),
+            };
+            let rel = if args.len() >= 2 {
+                String::from_utf8_lossy(&args[1]).to_string()
+            } else {
+                String::new()
+            };
+            let ns = db.rag.memory().incoming(id, &rel);
+            let mut out = Vec::new();
+            for (from, r, w) in ns {
+                out.push(Resp::Int(from as i64));
+                out.push(Resp::Bulk(r.into_bytes()));
+                out.push(Resp::Bulk(format!("{w:.6}").into_bytes()));
+            }
+            Resp::Array(out)
+        }
+        // MEM.COUNT  -> :n   (live long-term memory count)
+        "MEM.COUNT" => Resp::Int(db.rag.memory().ltm_count() as i64),
+        // MEM.GET id  -> array of (text, source, salience) or nil
+        "MEM.GET" => {
+            if args.len() != 1 {
+                return err("MEM.GET requires id");
+            }
+            let id: u64 = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("id is not a u64"),
+            };
+            match db.rag.memory().ltm_get(id) {
+                Some(rec) => Resp::Array(vec![
+                    Resp::Bulk(rec.text.into_bytes()),
+                    Resp::Bulk(rec.meta.source.into_bytes()),
+                    Resp::Bulk(format!("{:.6}", rec.meta.salience).into_bytes()),
+                ]),
+                None => Resp::Nil,
+            }
+        }
+        // MEM.CONSOLIDATE id delta  -> OK   (bump salience, clamped [0,1])
+        "MEM.CONSOLIDATE" => {
+            if args.len() != 2 {
+                return err("MEM.CONSOLIDATE requires id delta");
+            }
+            let id: u64 = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("id is not a u64"),
+            };
+            let d: f32 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("delta is not a float"),
+            };
+            match db.rag.memory().touch_salience(id, d) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+        // MEM.EPISODES_CLEAR agent  -> OK   (wipe all episodes for an agent)
+        "MEM.EPISODES_CLEAR" => {
+            if args.len() != 1 {
+                return err("MEM.EPISODES_CLEAR requires agent");
+            }
+            let agent = String::from_utf8_lossy(&args[0]).to_string();
+            match db.rag.memory().episodes_clear(&agent) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+
+        // ── TIME-SERIES AGGREGATE ────────────────────────────────────────
+        // TSAVG series from to  -> bulk (avg) or nil
+        "TSAVG" => {
+            if args.len() != 3 {
+                return err("TSAVG requires series from to");
+            }
+            let series = String::from_utf8_lossy(&args[0]).to_string();
+            let from: u64 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n, None => return err("from is not a u64"),
+            };
+            let to: u64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n, None => return err("to is not a u64"),
+            };
+            match db.ts.avg(&series, from, to) {
+                Some(v) => Resp::Bulk(format!("{v}").into_bytes()),
+                None => Resp::Nil,
+            }
+        }
+
+        // ── RAG CONTEXT BLOCK ────────────────────────────────────────────
+        // RAG.CONTEXT k query f1 f2 ...  -> bulk (prompt-ready block)
+        "RAG.CONTEXT" => {
+            if args.len() < 3 {
+                return err("RAG.CONTEXT requires k query f1 f2 ...");
+            }
+            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("k is not an integer"),
+            };
+            let query = String::from_utf8_lossy(&args[1]).to_string();
+            let qvec = match parse_floats(&args[2..]) {
+                Some(v) => v,
+                None => return err("bad float in query vector"),
+            };
+            Resp::Bulk(db.rag.context_block(&query, &qvec, k).into_bytes())
+        }
+
+        // ── MVCC POINT-IN-TIME READS ─────────────────────────────────────
+        // GETAT key snapshot  -> bulk/int/float/vector/nil (typed by Value)
+        "GETAT" => {
+            if args.len() != 2 {
+                return err("GETAT requires key snapshot");
+            }
+            let snap: u64 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("snapshot is not a u64"),
+            };
+            let v = db.engine.get_at(&args[0], snap);
+            value_to_resp(v)
+        }
+        // SCAN start end  -> array of (key, value) over all shards, snapshot=now
+        "SCAN" => {
+            if args.len() != 2 {
+                return err("SCAN requires start end");
+            }
+            let snap = db.engine.snapshot();
+            // BTreeMap::range panics if start > end; tolerate inverted ranges.
+            let (lo, hi) = if args[0] <= args[1] {
+                (&args[0][..], &args[1][..])
+            } else {
+                (&args[1][..], &args[0][..])
+            };
+            let pairs = db.engine.scan(lo, hi, snap);
+            let mut out = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                out.push(Resp::Array(vec![Resp::Bulk(k), value_to_resp(Some(v))]));
+            }
+            Resp::Array(out)
         }
 
         "INFO" => {

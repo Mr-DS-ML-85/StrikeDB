@@ -214,6 +214,11 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Live count of LTM entries (resumed from the WAL on `open`).
+    pub fn ltm_count(&self) -> u64 {
+        self.ltm_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn open(engine: Arc<Engine>) -> Self {
         let vectors = VectorIndex::open(Arc::clone(&engine));
         // resume id counter + live count + salience cache from persisted LTM
