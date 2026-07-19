@@ -379,6 +379,58 @@ scenario, where the headline metric is QPS, not per-request p99.
 - **RAM efficient**: 6.5 GB (1M×768-d) / 3.6 GB (1M×384-d) with the
   INT8-traversal + exact-f32-rerank design.
 
+### 🔥 GPU / Tiered Compute (CAGRA + VUGVA)
+
+Three compute modes with auto-detection. GPU kernels are lazy-loaded via NVRTC
+(zero dependencies). When no GPU is present, the system falls back to pure CPU.
+
+```
+┌─────────────────────────────────────────┐
+│         GPU AUTO-DETECTION              │
+│  cuInit + cuDeviceGet + cuMemGetInfo    │
+├─────────────────────────────────────────┤
+│  Data ≤ VRAM?                           │
+│    YES → TURBO  (full GPU, fastest)    │
+│    NO  → HYBRID (GPU + RAM + CPU)      │
+│         VUGVA unified memory:           │
+│         GPU reads vectors from RAM      │
+│         directly — no CPU copy.         │
+├─────────────────────────────────────────┤
+│  No GPU? → CPU_ONLY (pure CPU path)    │
+└─────────────────────────────────────────┘
+```
+
+**VUGVA Unified Memory** — GPU kernels access host RAM directly via
+`cuMemAllocManaged`. The CUDA page migrator pulls hot data into VRAM on
+demand. No `cuMemcpyHtoD`, no CPU-mediated data shuttling. This is the
+"software RDMA at the virtual level" from the VUGVA paper.
+
+**GPU Kernels** (zero dependencies, compiled via NVRTC):
+- `cosine_dist` — single query × N vectors (INT8)
+- `batch_cosine_dist` — Q queries × N vectors (CAGRA distance kernel)
+- `cagra_search` — iterative graph traversal on GPU (CAGRA search)
+- `matmul` — INT8 matrix multiply
+
+**RESP Commands:**
+```
+GPU.MODE              → show current mode
+GPU.MODE turbo        → full GPU (fastest, requires NVIDIA GPU)
+GPU.MODE hybrid       → GPU + RAM + CPU auto-offload
+GPU.MODE cpu          → pure CPU (fallback)
+GPU.MODE auto         → auto-detect optimal mode
+GPU.LOAD <kernel>     → load kernel on demand
+GPU.INFO              → VRAM, kernels, mode
+GPU.UNLOAD            → release GPU resources
+```
+
+**Benchmark (1M vectors, 16 cores, RTX 4060):**
+
+| Dataset | Mode | Build | QPS | p50 | Recall@10 |
+|---|---|---|---|---|---|
+| 1M × 384-d | CPU-only | 187s | 16,695 | 607µs | 0.992 |
+| 1M × 384-d | Hybrid | 170s | 17,071 | 501µs | 0.992 |
+| 1M × 768-d | CPU-only | 243s | 10,316 | 1175µs | 0.988 |
+
 #### 🧪 TurboQuant / PQ head-to-head vs Qdrant (Module 6, 3000 × 768-d, in-process)
 
 StrikeDB's quantized ANN modes go head-to-head with Qdrant's published envelope
