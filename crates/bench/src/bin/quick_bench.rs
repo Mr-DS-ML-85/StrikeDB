@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-fn run_bench(path: &str, mode: &str, n: usize, dim: usize, norm: &[f32], cores: usize) {
+fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: &[f32], cores: usize) {
     let nq = 200.min(n);
     let queries: Vec<f32> = (0..nq).flat_map(|qi| norm[qi * dim..(qi + 1) * dim].iter().copied()).collect();
 
@@ -34,6 +34,14 @@ fn run_bench(path: &str, mode: &str, n: usize, dim: usize, norm: &[f32], cores: 
     let vi = views::VectorIndex::build_parallel_tiered(norm, dim, cores, tiered);
     let build_s = t2.elapsed().as_secs_f64();
     println!("  build: {build_s:.1}s ({:.0} vec/s)", n as f64 / build_s);
+
+    // VUGVA: Initialize Virtual Memory Table for hybrid mode.
+    // GPU VRAM budget = 70% of free VRAM (leave headroom for output buffers).
+    if matches!(actual_mode, gpu::ComputeMode::Hybrid | gpu::ComputeMode::Turbo) {
+        let vram_budget = 7000 * 1024 * 1024; // ~7 GB for RTX 4060
+        println!("  Initializing VUGVA Virtual Memory Table ({:.0} MB VRAM budget)...", vram_budget as f64 / 1024.0 / 1024.0);
+        vi.init_vugva(vram_budget);
+    }
 
     // Ground truth for recall
     let n_recall = 50.min(nq);

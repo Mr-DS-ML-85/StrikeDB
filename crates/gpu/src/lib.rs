@@ -18,6 +18,8 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+pub mod vugva;
+
 type NvrtcProgram = *mut std::ffi::c_void;
 
 extern "C" {
@@ -61,7 +63,6 @@ extern "C" {
 
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
 const CU_CTX_SCHED_BLOCKING_SYNC: u32 = 0x04;
-const CU_MEM_ALLOC_GRANULARITY_MINIMUM: u32 = 0;
 // VUGVA: CUDA uses this flag for managed memory — GPU can read RAM directly
 // without cuMemcpyHtoD. The CUDA driver handles page migration transparently.
 // GPU accesses host pointers; if page is not in VRAM, a page fault triggers
@@ -716,6 +717,9 @@ impl GpuIndex {
 
 /// Upload INT8 vectors + flat CSR graph to GPU. Returns a GpuIndex handle.
 /// Call once after building the graph. All subsequent searches use the cached GPU data.
+/// Build GPU index. VUGVA approach: vectors use unified memory (GPU reads
+/// from RAM directly via page faults), graph uses regular GPU memory.
+/// No cuMemcpyHtoD for vectors — CUDA page migrator handles transfer.
 pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], n: usize, dim: usize, degree: usize) -> Option<GpuIndex> {
     if !gpu_ensure_kernel("cagra_search") { return None; }
     if !ensure_ctx() { return None; }
@@ -724,13 +728,84 @@ pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], n: usize, dim: usi
         let g_bytes = n * degree * 4;
         let mut d_v = 0u64;
         let mut d_g = 0u64;
-        if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
+        // VUGVA: vectors in unified memory — GPU reads from RAM directly.
+        // CUDA page migrator pulls hot pages into VRAM on demand.
+        // This eliminates the cuMemcpyHtoD and makes ALL vectors accessible
+        // to GPU even when they exceed VRAM (hybrid mode).
+        if cuMemAllocManaged(&mut d_v, v_bytes, CU_MEM_ATTACH_GLOBAL) != 0 {
+            eprintln!("[GPU] cuMemAllocManaged failed, falling back to cuMemAlloc");
+            if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
+            cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
+        } else {
+            // Copy data into unified memory (one-time host→unified write)
+            std::ptr::copy_nonoverlapping(
+                vectors_i8.as_ptr(), d_v as *mut i8, v_bytes
+            );
+        }
+        // Graph is smaller — use regular GPU memory for fast access.
         if cuMemAlloc_v2(&mut d_g, g_bytes) != 0 { return None; }
-        cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
         cuMemcpyHtoD_v2(d_g, graph_flat.as_ptr() as *const std::ffi::c_void, g_bytes);
-        eprintln!("[GPU] Index built: {} vectors × {}d, degree={}, {:.1} MB VRAM",
-            n, dim, degree, (v_bytes + g_bytes) as f64 / 1024.0 / 1024.0);
+        let vectors_mb = v_bytes as f64 / 1024.0 / 1024.0;
+        let graph_mb = g_bytes as f64 / 1024.0 / 1024.0;
+        eprintln!("[GPU] Index: {} vecs × {}d, degree={} — vectors: {:.0}MB unified, graph: {:.1}MB VRAM",
+            n, dim, degree, vectors_mb, graph_mb);
         Some(GpuIndex { d_vectors: d_v, d_graph: d_g, n, dim, degree })
+    }
+}
+
+/// GPU brute-force search using GPU-resident vectors from GpuIndex.
+/// Only uploads the query (dim bytes). Vectors stay on GPU.
+/// This is the TURBO path — full GPU, zero CPU work.
+pub fn gpu_brute_force_search(
+    index: &GpuIndex,
+    query_i8: &[i8],
+    k: usize,
+) -> Option<Vec<(usize, f32)>> {
+    if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
+    let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
+    if !ensure_ctx() { return None; }
+    unsafe {
+        let dim = index.dim;
+        let n = index.n;
+        // Upload ONLY the query (dim bytes, not N*dim)
+        let mut d_q = 0u64;
+        if cuMemAlloc_v2(&mut d_q, dim) != 0 { return None; }
+        cuMemcpyHtoD_v2(d_q, query_i8.as_ptr() as *const std::ffi::c_void, dim);
+        // Output buffer: N floats
+        let mut d_d = 0u64;
+        if cuMemAlloc_v2(&mut d_d, n * 4) != 0 { cuMemFree_v2(d_q); return None; }
+        // Launch: 1 block (one query), 256 threads, vectors already on GPU
+        let mut arg0 = d_q as *mut std::ffi::c_void;
+        let mut arg1 = index.d_vectors as *mut std::ffi::c_void;  // GPU-resident!
+        let mut arg2 = d_d as *mut std::ffi::c_void;
+        let mut arg3 = 1usize as *mut std::ffi::c_void;  // Q=1
+        let mut arg4 = n as *mut std::ffi::c_void;
+        let mut arg5 = dim as *mut std::ffi::c_void;
+        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
+        let threads = 256u32;
+        let r = cuLaunchKernel(func, 1, 1, 1, threads, 1, 1, 0,
+            std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+            std::ptr::null_mut());
+        if r != 0 {
+            let mut err_str: *const i8 = std::ptr::null();
+            cuGetErrorString(r, &mut err_str);
+            let msg = if err_str.is_null() { "unknown".to_string() }
+                      else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
+            eprintln!("[GPU] brute_force_search error {}: {}", r, msg);
+            cuMemFree_v2(d_q); cuMemFree_v2(d_d);
+            return None;
+        }
+        cuCtxSynchronize();
+        // Read N distances back
+        let mut dists = vec![0.0f32; n];
+        cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, n * 4);
+        cuMemFree_v2(d_q);
+        cuMemFree_v2(d_d);
+        // Find top-k
+        let mut results: Vec<(f32, usize)> = dists.into_iter().enumerate().map(|(i, d)| (d, i)).collect();
+        results.select_nth_unstable_by(k, |a, b| a.0.partial_cmp(&b.0).unwrap());
+        results.truncate(k);
+        Some(results.into_iter().map(|(d, i)| (i, d)).collect())
     }
 }
 

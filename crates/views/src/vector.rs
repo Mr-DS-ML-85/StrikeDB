@@ -3438,7 +3438,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert(i as u64, v);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -3479,7 +3479,7 @@ impl VectorIndex {
             merged.f32_tier = Some(t);
             merged.all_f32 = Vec::new();
         }
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
+        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) }
     }
 
     /// MODULE 4 constructor: build the graph in parallel like
@@ -3528,7 +3528,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert_attr(i as u64, v, attrs[i]);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -3560,7 +3560,7 @@ impl VectorIndex {
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let merged = Hnsw::merge_segments(segments, bridge, None);
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
+        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) }
     }
 
     /// Like `build_parallel_attr`, but maps each row to an ARBITRARY client
@@ -3621,7 +3621,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert_attr(ids[i], v, attrs[i]);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -3657,7 +3657,7 @@ impl VectorIndex {
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let merged = Hnsw::merge_segments(segments, bridge, None);
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
+        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) }
     }
 
     /// MODULE 5 constructor: build the dense HNSW in parallel (like
@@ -3835,6 +3835,9 @@ pub struct VectorIndex {
     sparse: RwLock<SparseIndex>,
     /// GPU-resident index for CAGRA-style GPU search. None if no GPU or not built.
     gpu_idx: RwLock<Option<gpu::GpuIndex>>,
+    /// VUGVA Virtual Memory Table — manages GPU VRAM + CPU RAM for hybrid mode.
+    /// Splits vectors into chunks, prefetches hot chunks to GPU on demand.
+    vugva_vmt: RwLock<Option<Arc<gpu::vugva::VugvaVmt>>>,
 }
 
 impl VectorIndex {
@@ -3869,6 +3872,22 @@ impl VectorIndex {
         }
     }
 
+    /// Initialize VUGVA Virtual Memory Table for hybrid mode.
+    /// Splits all INT8 vectors into chunks, tracks which chunks are in VRAM vs RAM.
+    /// GPU reads vectors on demand via chunk prefetch — the VUGVA paper's core idea.
+    pub fn init_vugva(&self, vram_budget_bytes: usize) {
+        let g = self.hnsw.read().unwrap();
+        let vectors_i8 = g.all_i8.clone();
+        let dim = g.dim;
+        let n_nodes = g.nodes.len();
+        drop(g);
+        let chunk_size = (vram_budget_bytes / dim / 2).max(1024); // ~50% VRAM per chunk
+        let vmt = gpu::vugva::VugvaVmt::new(&vectors_i8, dim, chunk_size, vram_budget_bytes);
+        let stats = gpu::vugva::vugva_stats(&vmt);
+        eprintln!("[VUGVA] Initialized for {n_nodes} vectors: {:?}", stats);
+        *self.vugva_vmt.write().unwrap() = Some(Arc::new(vmt));
+    }
+
     /// Open the index and rebuild the graph from any persisted raw f32 vectors.
     /// Quantization is done here so the substrate stays f32-exact.
     pub fn open(engine: Arc<Engine>) -> Self {
@@ -3879,7 +3898,7 @@ impl VectorIndex {
                 hnsw.insert(id, v);
             }
         }
-        Self { engine, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
+        Self { engine, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) }
     }
 
     /// Insert/replace a vector: durable f32 write + graph update with a
@@ -4203,12 +4222,64 @@ impl VectorIndex {
         let mut q = query.to_vec();
         l2_normalize(&mut q);
         let qq = quantize(&q);
+
+        // ── TURBO: Full GPU brute-force — vectors stay on GPU, only query uploaded ──
+        if gpu::gpu_available() && gpu::gpu_get_mode() == gpu::ComputeMode::Turbo {
+            let guard = self.gpu_idx.read().unwrap();
+            if let Some(ref idx) = *guard {
+                if let Some(results) = gpu::gpu_brute_force_search(idx, &qq, k) {
+                    let g = self.hnsw.read().unwrap();
+                    return results.into_iter().filter_map(|(idx, _dist)| {
+                        let node = g.nodes.get(idx)?;
+                        if node.deleted { return None; }
+                        let dot = dot_f32(&q, g.vec_at_f32(idx));
+                        let d = (1.0 - dot).max(0.0).min(2.0);
+                        Some((node.id, d))
+                    }).collect();
+                }
+            }
+            // GPU index not built yet — fall through (first search builds it)
+        }
+
+        // ── HYBRID: CPU graph walks + GPU distance via VUGVA ──
+        // CPU traverses the graph (fast pointer chasing).
+        // GPU computes distances to candidate vectors (batch parallel).
         let g = self.hnsw.read().unwrap();
         let qf = g.query_f32(&q);
         let rerank_k = (k * 4).max(64);
-        // Stage 1: int8 traversal.
+
+        // CPU graph walk — get candidates
         let candidates = g.search_indices(&qq, rerank_k, ef.max(rerank_k), &qf);
-        // Stage 2: f32 rerank.
+
+        // If VUGVA VMT is available, use GPU for distance computation
+        let vmt_guard = self.vugva_vmt.read().unwrap();
+        if vmt_guard.is_some() && gpu::gpu_available() && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly {
+            let vmt = vmt_guard.as_ref().unwrap();
+            let dim = g.dim;
+            let chunk_indices: Vec<usize> = candidates.iter().map(|&(idx, _)| vmt.chunk_of(idx)).collect();
+            let prefetched = vmt.prefetch_batch(&chunk_indices);
+
+            // GPU batch distance: query vs all vectors in prefetched chunks
+            let mut results: Vec<(u64, f32)> = Vec::with_capacity(candidates.len());
+            for chunk in &prefetched {
+                let chunk_n = chunk.chunk_len;
+                if let Some(dists) = gpu::gpu_cosine_dist(&qq, &[], chunk_n, dim) {
+                    for (i, &d) in dists.iter().enumerate() {
+                        let global_idx = chunk.chunk_offset + i;
+                        if let Some(node) = g.nodes.get(global_idx) {
+                            if !node.deleted {
+                                results.push((node.id, d));
+                            }
+                        }
+                    }
+                }
+            }
+            results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            results.truncate(k);
+            return results;
+        }
+
+        // ── CPU fallback: per-candidate f32 rerank ──
         let mut rescored: Vec<(u64, f32)> = candidates
             .into_iter()
             .filter_map(|(idx, _int8_dist)| {
