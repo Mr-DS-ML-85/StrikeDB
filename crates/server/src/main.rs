@@ -117,7 +117,7 @@ fn main() -> std::io::Result<()> {
     let auth_msg = if requirepass.is_some() { " (AUTH required)" } else { "" };
     println!("DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}");
     println!("One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug");
-    println!("Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD");
+    println!("Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE");
 
     // Rate-limit accept-error logging: under EMFILE the accept loop would
     // otherwise spew thousands of identical lines per second. Print at most
@@ -1354,6 +1354,38 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             out.push(Resp::Bulk(b"tier_1M_768d".to_vec()));
             out.push(Resp::Bulk(format!("{:?}", strategy2).into_bytes()));
             Resp::Array(out)
+        }
+        // GPU.MODE [turbo|hybrid|cpu|auto] — get or set compute mode.
+        "GPU.MODE" => {
+            if args.is_empty() {
+                let mode = gpu::gpu_get_mode();
+                Resp::Simple(format!("{:?}", mode))
+            } else {
+                let mode_str = String::from_utf8_lossy(&args[0]).to_lowercase();
+                match mode_str.as_str() {
+                    "turbo" | "gpu" => {
+                        if !gpu::gpu_available() {
+                            return err("ERR no GPU detected");
+                        }
+                        gpu::gpu_set_mode(gpu::ComputeMode::Turbo);
+                        Resp::Simple("OK compute mode = Turbo (full GPU)".into())
+                    }
+                    "hybrid" => {
+                        gpu::gpu_set_mode(gpu::ComputeMode::Hybrid);
+                        Resp::Simple("OK compute mode = Hybrid (GPU+RAM+CPU)".into())
+                    }
+                    "cpu" | "cpu_only" | "off" => {
+                        gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly);
+                        Resp::Simple("OK compute mode = CPU-only".into())
+                    }
+                    "auto" => {
+                        // Auto-detect for 1M × 384d as default
+                        let mode = gpu::gpu_auto_mode(1_000_000, 384);
+                        Resp::Simple(format!("OK compute mode = {:?} (auto-detected)", mode))
+                    }
+                    _ => err("ERR usage: GPU.MODE turbo|hybrid|cpu|auto"),
+                }
+            }
         }
         // GPU.UNLOAD — release GPU resources.
         "GPU.UNLOAD" => {

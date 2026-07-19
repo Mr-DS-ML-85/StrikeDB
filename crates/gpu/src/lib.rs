@@ -242,7 +242,9 @@ fn gpu_ensure_kernel(name: &str) -> bool {
 /// Get GPU info (RESP: GPU.INFO).
 pub fn gpu_info() -> Vec<(&'static str, String)> {
     let mut info = Vec::new();
-    info.push(("available", gpu_available().to_string()));
+    let mode = gpu_get_mode();
+    info.push(("mode", format!("{:?}", mode)));
+    info.push(("gpu_available", gpu_available().to_string()));
     if let Some(state) = GPU_STATE.get() {
         info.push(("vram_total_mb", (state.vram_total / 1024 / 1024).to_string()));
         info.push(("vram_free_mb", (state.vram_free / 1024 / 1024).to_string()));
@@ -265,27 +267,102 @@ pub fn gpu_check_capacity(n: usize, dim: usize) -> (bool, usize, usize) {
 }
 
 /// Auto-tier: decide GPU vs CPU+RAM based on data size vs VRAM.
-pub fn gpu_tier_strategy(n: usize, dim: usize) -> GpuTier {
+pub fn gpu_tier_strategy(n: usize, dim: usize) -> ComputeMode {
+    gpu_auto_mode(n, dim)
+}
+
+/// Compute mode — controls how DB-Strike routes work across GPU/RAM/CPU.
+///
+/// ```text
+/// ┌─────────────────────────────────────────┐
+/// │         GPU AUTO-DETECTION              │
+/// │  cuInit + cuDeviceGet + cuMemGetInfo    │
+/// ├─────────────────────────────────────────┤
+/// │  Data + Embeddings ≤ VRAM?             │
+/// │    YES → TURBO  (GPU only, fastest)    │
+/// │    NO  → HYBRID (GPU hot + RAM + CPU)  │
+/// │         Split by shard                  │
+/// │         GPU handles hot shard           │
+/// │         RAM handles warm shard          │
+/// │         CPU handles cold shard          │
+/// ├─────────────────────────────────────────┤
+/// │  No GPU? → CPU_ONLY (pure CPU path)    │
+/// └─────────────────────────────────────────┘
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeMode {
+    /// Full GPU — all distance computation + graph traversal on GPU.
+    /// Fastest. Requires NVIDIA GPU and data fits in VRAM.
+    Turbo,
+    /// GPU + RAM + CPU — auto-offload when VRAM insufficient.
+    /// Hot data on GPU, warm in RAM, cold on CPU/disk.
+    /// Same pattern as StrikeDB's tiered memory (RAM → NVMe → object store).
+    Hybrid,
+    /// Pure CPU — no GPU available or user explicitly disabled GPU.
+    CpuOnly,
+}
+
+static COMPUTE_MODE: Mutex<ComputeMode> = Mutex::new(ComputeMode::CpuOnly);
+
+/// Get current compute mode.
+pub fn gpu_get_mode() -> ComputeMode {
+    *COMPUTE_MODE.lock().unwrap()
+}
+
+/// Set compute mode explicitly (RESP: GPU.MODE turbo|hybrid|cpu).
+pub fn gpu_set_mode(mode: ComputeMode) {
+    *COMPUTE_MODE.lock().unwrap() = mode;
+    eprintln!("[GPU] Compute mode set to {:?}", mode);
+}
+
+/// Auto-detect optimal mode based on GPU availability and data size.
+/// Call once after init with the dataset dimensions.
+pub fn gpu_auto_mode(n: usize, dim: usize) -> ComputeMode {
     if !gpu_available() {
-        return GpuTier::CpuOnly;
+        return ComputeMode::CpuOnly;
     }
-    let (fits, needed, free) = gpu_check_capacity(n, dim);
-    if fits {
-        GpuTier::GpuOnly
-    } else if needed <= free * 3 {
-        GpuTier::GpuPlusRam
+    let needed = n * dim; // int8 vectors
+    let (_, _, vram_free) = gpu_check_capacity(n, dim);
+    if needed <= vram_free {
+        // Data fits in VRAM → Turbo
+        let mode = ComputeMode::Turbo;
+        gpu_set_mode(mode);
+        mode
+    } else if needed <= vram_free * 3 {
+        // Data fits in 3× VRAM → Hybrid (GPU hot + RAM warm)
+        let mode = ComputeMode::Hybrid;
+        gpu_set_mode(mode);
+        mode
     } else {
-        GpuTier::GpuRamCpu
+        // Data way too large → still Hybrid, more offloading
+        let mode = ComputeMode::Hybrid;
+        gpu_set_mode(mode);
+        mode
     }
 }
 
-/// GPU tier strategy.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum GpuTier {
-    CpuOnly,
-    GpuOnly,
-    GpuPlusRam,
-    GpuRamCpu,
+/// Check if data of given size should use GPU path in current mode.
+pub fn gpu_should_use_gpu(n: usize, dim: usize) -> bool {
+    let mode = gpu_get_mode();
+    match mode {
+        ComputeMode::Turbo => true,
+        ComputeMode::Hybrid => {
+            // Use GPU if data fits in VRAM; otherwise CPU fallback for this chunk
+            let (fits, _, _) = gpu_check_capacity(n, dim);
+            fits
+        }
+        ComputeMode::CpuOnly => false,
+    }
+}
+
+/// Legacy alias.
+pub type GpuTier = ComputeMode;
+#[allow(non_upper_case_globals)]
+impl ComputeMode {
+    pub const CpuOnly: Self = ComputeMode::CpuOnly;
+    pub const GpuOnly: Self = ComputeMode::Turbo;
+    pub const GpuPlusRam: Self = ComputeMode::Hybrid;
+    pub const GpuRamCpu: Self = ComputeMode::Hybrid;
 }
 
 /// Ensure current thread has the CUDA context active.
