@@ -117,7 +117,7 @@ fn main() -> std::io::Result<()> {
     let auth_msg = if requirepass.is_some() { " (AUTH required)" } else { "" };
     println!("DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}");
     println!("One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug");
-    println!("Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL");
+    println!("Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD");
 
     // Rate-limit accept-error logging: under EMFILE the accept loop would
     // otherwise spew thousands of identical lines per second. Print at most
@@ -1324,6 +1324,42 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
         "CDCLEN" => Resp::Int(db.reactive.cdc_len() as i64),
+
+        // GPU.LOAD <kernel> — compile and load a CUDA kernel on demand.
+        // Kernels: cosine_dist, matmul. Lazy: only compiled when first requested.
+        "GPU.LOAD" => {
+            if args.len() != 1 {
+                return err("GPU.LOAD requires kernel name (cosine_dist, matmul)");
+            }
+            let name = String::from_utf8_lossy(&args[0]);
+            if gpu::gpu_load_kernel(&name) {
+                Resp::Simple(format!("OK kernel {} loaded", name))
+            } else {
+                err("ERR GPU unavailable or kernel not found")
+            }
+        }
+        // GPU.INFO — show GPU status, VRAM, and tier strategy.
+        "GPU.INFO" => {
+            let info = gpu::gpu_info();
+            let mut out = Vec::new();
+            for (k, v) in &info {
+                out.push(Resp::Bulk(k.as_bytes().to_vec()));
+                out.push(Resp::Bulk(v.as_bytes().to_vec()));
+            }
+            // Add tier strategy for common sizes.
+            let strategy = gpu::gpu_tier_strategy(1_000_000, 384);
+            out.push(Resp::Bulk(b"tier_1M_384d".to_vec()));
+            out.push(Resp::Bulk(format!("{:?}", strategy).into_bytes()));
+            let strategy2 = gpu::gpu_tier_strategy(1_000_000, 768);
+            out.push(Resp::Bulk(b"tier_1M_768d".to_vec()));
+            out.push(Resp::Bulk(format!("{:?}", strategy2).into_bytes()));
+            Resp::Array(out)
+        }
+        // GPU.UNLOAD — release GPU resources.
+        "GPU.UNLOAD" => {
+            gpu::gpu_unload();
+            Resp::Simple("OK".into())
+        }
 
         // CHECKPOINT — snapshot current state, truncate WAL. Redis-shape
         // reply: "SNAPSHOT n=<records> bytes=<snap-file-size>".

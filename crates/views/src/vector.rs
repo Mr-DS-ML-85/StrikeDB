@@ -3060,38 +3060,71 @@ impl Hnsw {
         merged.entry = Some(best_entry);
         merged.max_level = best_lvl;
 
-        // INTER-SEGMENT BRIDGE — batch matrix multiply + per-node graph walks.
-        // Phase 1: GPU/CPU batch matrix multiply to find nearest entry per node.
-        // Phase 2: Per-node graph walks for bridge connections.
+        // INTER-SEGMENT BRIDGE — GPU-accelerated batch distance + CPU graph walks.
+        // Phase 1: Nearest-entry per node (GPU or CPU).
+        let gpu_ready = gpu::gpu_init();
         let k_seg = segments.len();
         let total = merged.nodes.len();
-
-        // Phase 1: Batch distance computation (GPU or CPU).
-        // Build entry matrix [K x D] and compute [N x K] distances.
-        let mut entry_idxs: Vec<usize> = Vec::with_capacity(k_seg);
-        let mut entry_flat: Vec<i8> = Vec::with_capacity(k_seg * dim);
-        for b in 0..k_seg {
-            let gb = offsets[b] + segments[b].entry.unwrap_or(0);
-            entry_idxs.push(gb);
-            entry_flat.extend_from_slice(&merged.all_i8[gb * dim..gb * dim + dim]);
-        }
-
-        // Try GPU batch matmul first, fall back to CPU.
-        // GPU batch matmul available for distance computation (RTX 4060+).
-        // CPU fallback for systems without CUDA.
-        // Phase 1: compute nearest entry per node.
-        // Phase 2: graph walk for bridge connections.
-        for ga in 0..total {
-            let own = Self::seg_of(ga, &offsets, &n_per);
-            let q = &merged.all_i8[ga * dim..ga * dim + dim];
-            let mut best_d = f32::MAX;
-            let mut best_b = 0usize;
+        let nearest_b: Vec<usize> = if gpu_ready {
+            // GPU batch: compute distances from all nodes to all entries.
+            let mut entry_flat: Vec<i8> = Vec::with_capacity(k_seg * dim);
             for b in 0..k_seg {
-                if b == own { continue; }
-                let d = cos_dist_q(q, &merged.all_i8[entry_idxs[b] * dim..entry_idxs[b] * dim + dim]);
-                if d < best_d { best_d = d; best_b = b; }
+                let gb = offsets[b] + segments[b].entry.unwrap_or(0);
+                entry_flat.extend_from_slice(&merged.all_i8[gb * dim..gb * dim + dim]);
             }
-            // Phase 2: graph walk for bridge connections.
+            let mut all_dists: Vec<f32> = vec![f32::MAX; total * k_seg];
+            for b in 0..k_seg {
+                if let Some(dists) = gpu::gpu_cosine_dist(
+                    &merged.all_i8, &entry_flat[b * dim..(b + 1) * dim], total, dim)
+                {
+                    for (i, &d) in dists.iter().enumerate() {
+                        all_dists[i * k_seg + b] = d;
+                    }
+                }
+            }
+            let mut result = vec![0usize; total];
+            for i in 0..total {
+                let own = Self::seg_of(i, &offsets, &n_per);
+                let mut best_d = f32::MAX;
+                let mut best_b = 0usize;
+                for b in 0..k_seg {
+                    if b == own { continue; }
+                    if all_dists[i * k_seg + b] < best_d {
+                        best_d = all_dists[i * k_seg + b];
+                        best_b = b;
+                    }
+                }
+                result[i] = best_b;
+            }
+            eprintln!("  [GPU] bridge distances: {total} nodes × {k_seg} entries");
+            result
+        } else {
+            // CPU fallback.
+            let mut entry_idxs: Vec<usize> = Vec::with_capacity(k_seg);
+            for b in 0..k_seg {
+                entry_idxs.push(offsets[b] + segments[b].entry.unwrap_or(0));
+            }
+            let mut result = vec![0usize; total];
+            for ga in 0..total {
+                let own = Self::seg_of(ga, &offsets, &n_per);
+                let q = &merged.all_i8[ga * dim..ga * dim + dim];
+                let mut best_d = f32::MAX;
+                let mut best_b = 0usize;
+                for b in 0..k_seg {
+                    if b == own { continue; }
+                    let d = cos_dist_q(q, &merged.all_i8[entry_idxs[b] * dim..entry_idxs[b] * dim + dim]);
+                    if d < best_d { best_d = d; best_b = b; }
+                }
+                result[ga] = best_b;
+            }
+            result
+        };
+
+        let _ = k_seg; // used in GPU/CPU branches above
+        // Phase 2: Graph walks for bridge connections (CPU).
+        for ga in 0..total {
+            let best_b = nearest_b[ga];
+            let q = &merged.all_i8[ga * dim..ga * dim + dim];
             let cand = segments[best_b].search_local(q, bridge);
             for (_d, local) in cand {
                 let gb = offsets[best_b] + local;

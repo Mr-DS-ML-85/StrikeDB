@@ -19,3 +19,4 @@ memory = { path = "../memory" }
 mitm = { path = "../mitm" }
 rag = { path = "../rag" }
 protocol = { path = "../protocol" }
+gpu = { path = "../gpu" }
