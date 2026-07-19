@@ -1830,8 +1830,9 @@ impl Hnsw {
             return;
         }
         l2_normalize(&mut vector);
-        let mut q = Vec::with_capacity(vector.len());
-        quantize_into(&vector, &mut q);
+        self.qbuf.clear();
+        self.qbuf.reserve(vector.len());
+        quantize_into(&vector, &mut self.qbuf);
 
         let _ins_t0 = if std::env::var_os("DBSTRIKE_DEBUG").is_some() {
             Some(std::time::Instant::now())
@@ -1859,9 +1860,10 @@ impl Hnsw {
         if self.attr_entry[attr as usize].is_none() {
             self.attr_entry[attr as usize] = Some(idx);
         }
-        self.all_i8.extend_from_slice(&q);
+        let q = &self.qbuf;
+        self.all_i8.extend_from_slice(q);
         if self.quant != QuantMode::Int8 {
-            let bytes = pack_current(self.quant, self.turbo.as_deref(), self.pq.as_deref(), &vector, &q, &mut self.bin_scratch, &mut self.turbo_rot, &mut self.turbo_idx, &mut self.turbo_deq, &mut self.turbo_r, &mut self.turbo_qjl);
+            let bytes = pack_current(self.quant, self.turbo.as_deref(), self.pq.as_deref(), &vector, &self.qbuf, &mut self.bin_scratch, &mut self.turbo_rot, &mut self.turbo_idx, &mut self.turbo_deq, &mut self.turbo_r, &mut self.turbo_qjl);
             if bytes > 0 {
                 self.all_bin.extend_from_slice(&self.bin_scratch);
             }
@@ -3074,7 +3076,7 @@ impl Hnsw {
         let total = merged.nodes.len();
         for ga in 0..total {
             let own = Self::seg_of(ga, &offsets, &n_per);
-            let q = merged.all_i8[ga * dim..ga * dim + dim].to_vec();
+            let q = &merged.all_i8[ga * dim..ga * dim + dim];
             // (1) nearest other-segment entries
             let mut scored: Vec<(f32, usize)> = Vec::new();
             for b in 0..k_seg {
@@ -3230,7 +3232,7 @@ impl Hnsw {
                     None => 0,
                 }
             };
-            let q = self.all_i8[ga * dim..ga * dim + dim].to_vec();
+            let q = &self.all_i8[ga * dim..ga * dim + dim];
             let mut scored: Vec<(f32, usize)> = Vec::new();
             for s in 0..k_seg {
                 if s == own {
