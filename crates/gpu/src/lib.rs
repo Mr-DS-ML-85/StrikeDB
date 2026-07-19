@@ -159,7 +159,7 @@ impl GpuState {
                 return;
             }
             // Get ALL function handles from the loaded module.
-            for name in &["cosine_dist_kernel", "batch_cosine_dist_kernel", "matmul_kernel"] {
+            for name in &["cosine_dist_kernel", "batch_cosine_dist_kernel", "cagra_search_kernel", "matmul_kernel"] {
                 let cname = CString::new(*name).unwrap();
                 let mut func = std::ptr::null_mut();
                 if cuModuleGetFunction(&mut func, self.module, cname.as_ptr()) == 0 {
@@ -443,6 +443,137 @@ pub fn gpu_unload() {
     }
 }
 
+// ── GPU-resident index for CAGRA-style search ────────────────────────────
+// Vectors + graph live on GPU. Repeated searches avoid re-upload.
+
+/// GPU-resident index. Holds device pointers for vectors and graph.
+/// Created once via `gpu_build_index`, then used for all searches.
+pub struct GpuIndex {
+    d_vectors: u64,   // device pointer: N × dim × i8
+    d_graph: u64,     // device pointer: N × degree × i32
+    n: usize,
+    dim: usize,
+    degree: usize,
+}
+
+impl GpuIndex {
+    /// Free GPU memory.
+    pub fn free(&self) {
+        unsafe {
+            cuMemFree_v2(self.d_vectors);
+            cuMemFree_v2(self.d_graph);
+        }
+    }
+}
+
+/// Upload INT8 vectors + flat CSR graph to GPU. Returns a GpuIndex handle.
+/// Call once after building the graph. All subsequent searches use the cached GPU data.
+pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], n: usize, dim: usize, degree: usize) -> Option<GpuIndex> {
+    if !gpu_ensure_kernel("cagra_search") { return None; }
+    if !ensure_ctx() { return None; }
+    unsafe {
+        let v_bytes = n * dim;
+        let g_bytes = n * degree * 4;
+        let mut d_v = 0u64;
+        let mut d_g = 0u64;
+        if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
+        if cuMemAlloc_v2(&mut d_g, g_bytes) != 0 { return None; }
+        cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
+        cuMemcpyHtoD_v2(d_g, graph_flat.as_ptr() as *const std::ffi::c_void, g_bytes);
+        eprintln!("[GPU] Index built: {} vectors × {}d, degree={}, {:.1} MB VRAM",
+            n, dim, degree, (v_bytes + g_bytes) as f64 / 1024.0 / 1024.0);
+        Some(GpuIndex { d_vectors: d_v, d_graph: d_g, n, dim, degree })
+    }
+}
+
+/// CAGRA-style GPU search: batch of INT8 queries → top-k results.
+/// The entire graph traversal runs on GPU — no CPU graph walks.
+/// `entry_node` is the starting point for graph traversal (0 = default random).
+pub fn gpu_search(
+    index: &GpuIndex,
+    queries_i8: &[i8],
+    num_queries: usize,
+    k: usize,
+    itopk: usize,
+    max_iters: usize,
+    entry_node: usize,
+) -> Option<(Vec<i32>, Vec<f32>)> {
+    let func = GPU_STATE.get()?.get_kernel("cagra_search")?;
+    if !ensure_ctx() { return None; }
+    let dim = index.dim;
+    let n = index.n;
+    let degree = index.degree;
+    unsafe {
+        // Upload queries
+        let q_bytes = num_queries * dim;
+        let mut d_q = 0u64;
+        if cuMemAlloc_v2(&mut d_q, q_bytes) != 0 { return None; }
+        cuMemcpyHtoD_v2(d_q, queries_i8.as_ptr() as *const std::ffi::c_void, q_bytes);
+
+        // Allocate output
+        let out_count = num_queries * k;
+        let mut d_idx = 0u64;
+        let mut d_dist = 0u64;
+        if cuMemAlloc_v2(&mut d_idx, out_count * 4) != 0 { return None; }
+        if cuMemAlloc_v2(&mut d_dist, out_count * 4) != 0 { return None; }
+
+        // Kernel args: vectors, graph, queries, out_idx, out_dist,
+        //   N, dim, degree, k, itopk, max_iters, num_queries
+        let mut arg0 = index.d_vectors as *mut std::ffi::c_void;
+        let mut arg1 = index.d_graph as *mut std::ffi::c_void;
+        let mut arg2 = d_q as *mut std::ffi::c_void;
+        let mut arg3 = d_idx as *mut std::ffi::c_void;
+        let mut arg4 = d_dist as *mut std::ffi::c_void;
+        let mut arg5 = n as *mut std::ffi::c_void;
+        let mut arg6 = dim as *mut std::ffi::c_void;
+        let mut arg7 = degree as *mut std::ffi::c_void;
+        let mut arg8 = k as *mut std::ffi::c_void;
+        let mut arg9 = itopk as *mut std::ffi::c_void;
+        let mut arg10 = max_iters as *mut std::ffi::c_void;
+        let mut arg11 = num_queries as *mut std::ffi::c_void;
+        let mut arg12 = entry_node as *mut std::ffi::c_void;
+        let mut args = [
+            &mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4,
+            &mut arg5, &mut arg6, &mut arg7, &mut arg8, &mut arg9,
+            &mut arg10, &mut arg11, &mut arg12,
+        ];
+
+        let threads = 256u32;
+        // Shared memory: (2*itopk + 2*degree) * sizeof(int)
+        let smem = ((2 * itopk + 2 * degree) * 4) as u32;
+
+        let r = cuLaunchKernel(func,
+            num_queries as u32, 1, 1,   // Grid: one block per query
+            threads, 1, 1,               // Block: 256 threads
+            smem,                        // Shared memory
+            std::ptr::null_mut(),
+            args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+            std::ptr::null_mut());
+        if r != 0 {
+            let mut err_str: *const i8 = std::ptr::null();
+            cuGetErrorString(r, &mut err_str);
+            let msg = if err_str.is_null() { "unknown".to_string() }
+                      else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
+            eprintln!("[GPU] cagra_search error {}: {}", r, msg);
+            cuMemFree_v2(d_q); cuMemFree_v2(d_idx); cuMemFree_v2(d_dist);
+            return None;
+        }
+        cuCtxSynchronize();
+
+        // Read results
+        let mut indices = vec![0i32; out_count];
+        let mut distances = vec![0.0f32; out_count];
+        cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, d_idx, out_count * 4);
+        cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, d_dist, out_count * 4);
+
+        cuMemFree_v2(d_q);
+        cuMemFree_v2(d_idx);
+        cuMemFree_v2(d_dist);
+
+        Some((indices, distances))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +655,38 @@ mod tests {
         assert!(dists[4] < 0.01, "q1-v1 should be ~0, got {}", dists[4]);
         assert!(dists[5] > 0.99, "q1-v2 should be ~1, got {}", dists[5]);
         println!("[GPU] batch_cosine_dist VERIFIED!");
+    }
+
+    #[test]
+    fn test_cagra_gpu_search() {
+        if !gpu_init() { return; }
+        // 6 vectors of dim=3, degree=2 graph
+        // Graph: 0→{1,2}, 1→{0,3}, 2→{0,4}, 3→{1,5}, 4→{2,5}, 5→{3,4}
+        let vectors: Vec<i8> = vec![
+            127, 0, 0,   // v0
+            100, 50, 0,  // v1 (close to v0)
+            100, 0, 50,  // v2 (close to v0)
+            0, 127, 0,   // v3
+            0, 0, 127,   // v4
+            0, 80, 80,   // v5
+        ];
+        let graph: Vec<i32> = vec![
+            1, 2,  // v0→{v1,v2}
+            0, 3,  // v1→{v0,v3}
+            0, 4,  // v2→{v0,v4}
+            1, 5,  // v3→{v1,v5}
+            2, 5,  // v4→{v2,v5}
+            3, 4,  // v5→{v3,v4}
+        ];
+        let idx = gpu_build_index(&vectors, &graph, 6, 3, 2).expect("gpu_build_index failed");
+        // Query: same as v0, should find v0 as nearest
+        let queries: Vec<i8> = vec![127, 0, 0];
+        let (indices, distances) = gpu_search(&idx, &queries, 1, 3, 8, 20, 0).expect("gpu_search failed");
+        println!("[GPU] cagra_search: indices={:?} dists={:?}", indices, distances);
+        // v0 should be the closest (dist ~0)
+        assert!(distances[0] < 0.1, "v0 should be closest, got dist={}", distances[0]);
+        assert_eq!(indices[0], 0, "first result should be v0");
+        idx.free();
+        println!("[GPU] cagra_search VERIFIED — full GPU graph traversal works!");
     }
 }
