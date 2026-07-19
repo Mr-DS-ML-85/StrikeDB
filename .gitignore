@@ -8,3 +8,4 @@ __pycache__/
 Cargo.lock
 
 .mimocode/
+bench_ingest.sh

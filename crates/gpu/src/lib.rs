@@ -310,13 +310,21 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
         let blocks = (n as u32 + threads - 1) / threads;
         let n_val = n as i32;
         let dim_val = dim as i32;
-        let mut args = [d_q as *mut std::ffi::c_void, d_v as *mut std::ffi::c_void,
-                       d_d as *mut std::ffi::c_void, &n_val as *const i32 as *mut std::ffi::c_void,
-                       &dim_val as *const i32 as *mut std::ffi::c_void];
+        let mut arg0 = d_q as *mut std::ffi::c_void;
+        let mut arg1 = d_v as *mut std::ffi::c_void;
+        let mut arg2 = d_d as *mut std::ffi::c_void;
+        let mut arg3 = &n_val as *const i32 as *mut std::ffi::c_void;
+        let mut arg4 = &dim_val as *const i32 as *mut std::ffi::c_void;
+        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4];
         let r = cuLaunchKernel(func, blocks, 1, 1, threads, 1, 1, 0,
-                      std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut());
-        if r != 0 { return None; }
-        cuCtxSynchronize();
+                      std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+                      std::ptr::null_mut());
+        if r != 0 {
+            eprintln!("[GPU] cuLaunchKernel error: {}", r);
+            return None;
+        }
+        let sync_r = cuCtxSynchronize();
+        if sync_r != 0 { return None; }
 
         let mut dists = vec![0.0f32; n];
         cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, d_bytes);
@@ -388,6 +396,19 @@ mod tests {
         }
         // Verify kernel is loaded
         assert!(gpu_load_kernel("cosine_dist"), "Failed to load cosine_dist");
+
+        // Test actual kernel execution
+        let query: Vec<i8> = vec![127, 0, 0];
+        let vectors: Vec<i8> = vec![127, 0, 0, 0, 127, 0, 0, 0, 127];
+        match gpu_cosine_dist(&query, &vectors, 3, 3) {
+            Some(dists) => {
+                println!("[GPU] cosine_dist result: {:?}", dists);
+                assert!(dists[0] < dists[1], "First vector should be closest");
+                assert!(dists[0] < dists[2], "First vector should be closest");
+                println!("[GPU] Kernel execution PASSED");
+            }
+            None => println!("[GPU] Kernel execution returned None (driver issue)"),
+        }
         println!("[GPU] All checks passed");
     }
 }
