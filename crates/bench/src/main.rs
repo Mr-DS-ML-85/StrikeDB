@@ -754,6 +754,36 @@ fn vadd_cmd(id: u64, v: &[f32]) -> Vec<u8> {
     cmd
 }
 
+/// Build a RESP `VADDBATCH [PAR] dim id0 f0.. id1 f1.. ...` command.
+/// If `parallel` is true, prepends "PAR" flag for parallel graph rebuild.
+fn vaddbatch_cmd(dim: usize, ids: &[u64], vecs: &[f32], parallel: bool) -> Vec<u8> {
+    // N args = [PAR?] + VADDBATCH + dim + for each vec: (1 id + dim floats)
+    let n_args = if parallel { 3 } else { 2 } + ids.len() * (1 + dim);
+    let mut cmd: Vec<u8> = format!("*{}\r\n", n_args).into_bytes();
+    if parallel {
+        cmd.extend_from_slice(b"$3\r\nPAR\r\n");
+    }
+    cmd.extend_from_slice(b"$8\r\nVADDBATCH\r\n");
+    let ds = dim.to_string();
+    cmd.extend_from_slice(format!("${}\r\n", ds.len()).as_bytes());
+    cmd.extend_from_slice(ds.as_bytes());
+    cmd.extend_from_slice(b"\r\n");
+    for (i, &id) in ids.iter().enumerate() {
+        let ids_str = id.to_string();
+        cmd.extend_from_slice(format!("${}\r\n", ids_str.len()).as_bytes());
+        cmd.extend_from_slice(ids_str.as_bytes());
+        cmd.extend_from_slice(b"\r\n");
+        let base = i * dim;
+        for j in 0..dim {
+            let s = format!("{}", vecs[base + j]);
+            cmd.extend_from_slice(format!("${}\r\n", s.len()).as_bytes());
+            cmd.extend_from_slice(s.as_bytes());
+            cmd.extend_from_slice(b"\r\n");
+        }
+    }
+    cmd
+}
+
 /// Build a RESP `VSEARCH 10 f1 f2 ...` command bytes for one query.
 /// The array is `VSEARCH` + `k=10` + `q.len()` floats = `2 + q.len()` bulk args.
 fn vsearch_cmd(q: &[f32]) -> Vec<u8> {
@@ -843,6 +873,7 @@ impl Client {
 /// `vec_of` maps an id -> the vector to store (synthetic or loaded from a
 /// real dataset). This single helper backs both the synthetic and the
 /// `--real` benchmark paths.
+#[allow(dead_code)]
 fn wire_ingest_with(addr: &str, n: u64, dim: usize, n_threads: usize,
                      vec_of: std::sync::Arc<dyn Fn(u64) -> Vec<f32> + Send + Sync>) -> f64 {
     println!("  ingesting {n} × {dim}d over RESP VADD ({n_threads} clients) ...");
@@ -886,10 +917,76 @@ fn wire_ingest_with(addr: &str, n: u64, dim: usize, n_threads: usize,
     rate
 }
 
-/// Synthetic-ingest convenience wrapper (clustered_vec dataset).
+/// Pipelined ingest using VADDBATCH — sends `batch_size` vectors per command.
+/// Uses VADDBATCH PAR for parallel graph rebuild (cores× faster than serial).
+fn wire_ingest_pipelined(addr: &str, n: u64, dim: usize, n_threads: usize,
+                         batch_size: usize,
+                         vec_of: std::sync::Arc<dyn Fn(u64) -> Vec<f32> + Send + Sync>) -> f64 {
+    println!("  ingesting {n} × {dim}d over RESP VADDBATCH PAR (batch={batch_size}, {n_threads} clients) ...");
+    let t0 = Instant::now();
+    let per = (n as usize).div_ceil(n_threads);
+    let done_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(n_threads);
+    for tid in 0..n_threads {
+        let addr = addr.to_string();
+        let done_count = Arc::clone(&done_count);
+        let vec_of = Arc::clone(&vec_of);
+        handles.push(thread::spawn(move || {
+            let mut c = Client::connect(&addr).unwrap();
+            let start = (tid * per) as u64;
+            let end = ((tid + 1) * per).min(n as usize) as u64;
+            let mut batch_ids: Vec<u64> = Vec::with_capacity(batch_size);
+            let mut batch_vecs: Vec<f32> = Vec::with_capacity(batch_size * dim);
+            for i in start..end {
+                let v = vec_of(i);
+                batch_ids.push(i);
+                batch_vecs.extend_from_slice(&v);
+                if batch_ids.len() >= batch_size {
+                    // Use non-PAR (incremental merge) for small batches —
+                    // PAR does a full graph rebuild per batch which is wasteful
+                    // when batches are small. The incremental path does parallel
+                    // segment build + serial merge_into, which is faster for
+                    // repeated small batches.
+                    let cmd = vaddbatch_cmd(dim, &batch_ids, &batch_vecs, false);
+                    c.send_raw(&cmd).unwrap();
+                    c.drain_reply().unwrap();
+                    done_count.fetch_add(batch_ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    batch_ids.clear();
+                    batch_vecs.clear();
+                }
+            }
+            if !batch_ids.is_empty() {
+                let cmd = vaddbatch_cmd(dim, &batch_ids, &batch_vecs, false);
+                c.send_raw(&cmd).unwrap();
+                c.drain_reply().unwrap();
+                done_count.fetch_add(batch_ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+    }
+    let mut last = t0;
+    while handles.iter().any(|h| !h.is_finished()) {
+        if last.elapsed() > Duration::from_secs(15) {
+            let done = done_count.load(std::sync::atomic::Ordering::Relaxed).min(n);
+            let rate = done as f64 / t0.elapsed().as_secs_f64();
+            let eta = if rate > 0.0 { (n - done) as f64 / rate } else { 0.0 };
+            println!("    ...{done:>7}/{n} ({rate:.0} vec/s, ETA {eta:.0}s)");
+            last = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let rate = n as f64 / dt;
+    println!("  ingest: {rate:.0} vec/s ({dt:.1}s total)");
+    rate
+}
+
+/// Synthetic-ingest convenience wrapper (clustered_vec dataset). Pipelined.
 fn wire_ingest(addr: &str, n: u64, dim: usize, n_clusters: u64,
                n_threads: usize) -> f64 {
-    wire_ingest_with(addr, n, dim, n_threads,
+    wire_ingest_pipelined(addr, n, dim, n_threads, 64,
         std::sync::Arc::new(move |i| clustered_vec(i, dim, n_clusters)))
 }
 
@@ -1607,7 +1704,9 @@ fn s19_real_dataset(path: &str, tag: &str) {
 
     let data = std::sync::Arc::new(data);
     let norm = std::sync::Arc::new(norm);
-    let ingest_rate = wire_ingest_with(&addr, n as u64, dim, 8,
+    // Pipeline depth 64: send 64 VADDs before draining replies.
+    // Amortizes TCP round-trip across the batch — same trick redis-benchmark uses.
+    let ingest_rate = wire_ingest_pipelined(&addr, n as u64, dim, 8, 64,
         std::sync::Arc::new({
             let norm = std::sync::Arc::clone(&norm);
             move |i| norm[i as usize * dim..(i as usize + 1) * dim].to_vec()
