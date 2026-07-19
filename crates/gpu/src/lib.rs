@@ -55,11 +55,18 @@ extern "C" {
     fn cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: i32) -> i32;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
     fn cuGetErrorString(error: i32, str: *mut *const i8) -> i32;
+    fn cuMemAllocManaged(dptr: *mut u64, bytesize: usize, flags: u32) -> i32;
     fn cuCtxSetCurrent(ctx: *mut std::ffi::c_void) -> i32;
 }
 
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
 const CU_CTX_SCHED_BLOCKING_SYNC: u32 = 0x04;
+const CU_MEM_ALLOC_GRANULARITY_MINIMUM: u32 = 0;
+// VUGVA: CUDA uses this flag for managed memory — GPU can read RAM directly
+// without cuMemcpyHtoD. The CUDA driver handles page migration transparently.
+// GPU accesses host pointers; if page is not in VRAM, a page fault triggers
+// async DMA transfer. This is the software RDMA the VUGVA paper describes.
+const CU_MEM_ATTACH_GLOBAL: u32 = 0x01;
 
 /// Compiled kernel handle.
 struct CompiledKernel {
@@ -372,6 +379,74 @@ fn ensure_ctx() -> bool {
         unsafe { cuCtxSetCurrent(state.ctx) == 0 }
     } else {
         false
+    }
+}
+
+// ── VUGVA Unified Memory: GPU reads RAM directly ─────────────────────────
+// The VUGVA paper's core insight: eliminate CPU-mediated data shuttling.
+// cuMemAllocManaged allocates unified memory that both GPU and CPU can access.
+// The GPU kernel dereferences a host pointer; if the page isn't in VRAM,
+// CUDA's page-migrator pulls it via DMA — no CPU involvement.
+// This is "software RDMA at the virtual level" (VUGVA Section 3.2).
+
+/// Allocate unified memory — GPU can read directly from host RAM.
+/// No cuMemcpyHtoD needed. GPU kernels receive the same pointer;
+/// CUDA handles page migration transparently.
+pub fn gpu_alloc_managed(size: usize) -> Option<u64> {
+    if !ensure_ctx() { return None; }
+    unsafe {
+        let mut d = 0u64;
+        let ret = cuMemAllocManaged(&mut d, size, CU_MEM_ATTACH_GLOBAL);
+        if ret == 0 { Some(d) } else { None }
+    }
+}
+
+/// Free unified memory.
+pub fn gpu_free_managed(ptr: u64) {
+    unsafe { cuMemFree_v2(ptr); }
+}
+
+/// VUGVA-style batch search: GPU reads vectors directly from RAM.
+/// Queries are on CPU, vectors live in unified memory.
+/// The GPU kernel reads query from CPU, vectors from RAM — no copies.
+pub fn gpu_vugva_batch_dist(
+    query_i8: &[i8],
+    vectors_unified: u64,
+    n: usize,
+    dim: usize,
+) -> Option<Vec<f32>> {
+    if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
+    let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
+    if !ensure_ctx() { return None; }
+    unsafe {
+        // Only upload the query (tiny: dim bytes). Vectors stay in RAM.
+        let mut d_q = 0u64;
+        if cuMemAlloc_v2(&mut d_q, query_i8.len()) != 0 { return None; }
+        cuMemcpyHtoD_v2(d_q, query_i8.as_ptr() as *const std::ffi::c_void, query_i8.len());
+        // Output buffer
+        let mut d_d = 0u64;
+        if cuMemAlloc_v2(&mut d_d, n * 4) != 0 { cuMemFree_v2(d_q); return None; }
+        // Launch: Q=1, vectors in unified memory (GPU reads from RAM directly)
+        let mut arg0 = d_q as *mut std::ffi::c_void;
+        let mut arg1 = vectors_unified as *mut std::ffi::c_void; // RAM pointer!
+        let mut arg2 = d_d as *mut std::ffi::c_void;
+        let mut arg3 = 1usize as *mut std::ffi::c_void;
+        let mut arg4 = n as *mut std::ffi::c_void;
+        let mut arg5 = dim as *mut std::ffi::c_void;
+        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
+        let threads = 256u32;
+        let r = cuLaunchKernel(func, 1, 1, 1, threads, 1, 1, 0,
+            std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+            std::ptr::null_mut());
+        if r != 0 {
+            cuMemFree_v2(d_q); cuMemFree_v2(d_d);
+            return None;
+        }
+        cuCtxSynchronize();
+        let mut dists = vec![0.0f32; n];
+        cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, n * 4);
+        cuMemFree_v2(d_q); cuMemFree_v2(d_d);
+        Some(dists)
     }
 }
 

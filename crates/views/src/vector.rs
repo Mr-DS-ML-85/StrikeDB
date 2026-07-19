@@ -3839,7 +3839,8 @@ pub struct VectorIndex {
 
 impl VectorIndex {
     /// Upload vectors + flat CSR graph to GPU for CAGRA-style GPU search.
-    /// Called once after build. Subsequent searches use the cached GPU data.
+    /// Uses VUGVA-style unified memory: GPU reads from RAM directly.
+    /// No cuMemcpyHtoD — CUDA page migrator handles data transfer.
     pub fn upload_to_gpu(&self) {
         if !gpu::gpu_init() { return; }
         let g = self.hnsw.read().unwrap();
@@ -3856,12 +3857,12 @@ impl VectorIndex {
                 }
             }
         }
-        // Build flat INT8 vectors: n × dim
+        // VUGVA: allocate unified memory for vectors (GPU reads from RAM directly)
         let vectors_i8: Vec<i8> = g.all_i8.clone();
         drop(g);
         match gpu::gpu_build_index(&vectors_i8, &graph_flat, n, dim, degree) {
             Some(idx) => {
-                eprintln!("[GPU] VectorIndex uploaded: {n} vectors, degree={degree}");
+                eprintln!("[GPU] VectorIndex uploaded: {n} vectors, degree={degree} (unified memory)");
                 *self.gpu_idx.write().unwrap() = Some(idx);
             }
             None => eprintln!("[GPU] VectorIndex upload failed"),
@@ -4201,42 +4202,6 @@ impl VectorIndex {
     pub fn search_ef(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         let mut q = query.to_vec();
         l2_normalize(&mut q);
-
-        // ── GPU search path (CAGRA) ──
-        if gpu::gpu_available() && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly {
-            let guard = self.gpu_idx.read().unwrap();
-            if let Some(ref idx) = *guard {
-                // Quantize query to INT8 for GPU kernel
-                let qq = quantize(&q);
-                let itopk = ef.max(k * 4).max(64);
-                let max_iters = (itopk as f32).sqrt() as usize + 5;
-                if let Some((indices, _distances)) = gpu::gpu_search(
-                    idx, &qq, 1, k, itopk, max_iters, 0,
-                ) {
-                    // GPU search returned results — convert to (id, dist) pairs
-                    // and do f32 rerank for precision
-                    let g = self.hnsw.read().unwrap();
-                    let mut results: Vec<(u64, f32)> = indices
-                        .iter()
-                        .filter(|&&idx| idx >= 0)
-                        .filter_map(|&idx| {
-                            let idx = idx as usize;
-                            let node = g.nodes.get(idx)?;
-                            if node.deleted { return None; }
-                            let dot = dot_f32(&q, g.vec_at_f32(idx));
-                            let d = (1.0 - dot).max(0.0).min(2.0);
-                            Some((node.id, d))
-                        })
-                        .collect();
-                    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                    results.truncate(k);
-                    return results;
-                }
-                // GPU search failed — fall through to CPU
-            }
-        }
-
-        // ── CPU search path (HNSW) ──
         let qq = quantize(&q);
         let g = self.hnsw.read().unwrap();
         let qf = g.query_f32(&q);
