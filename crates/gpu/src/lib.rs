@@ -698,11 +698,11 @@ pub fn gpu_unload() {
 /// GPU-resident index. Holds device pointers for vectors and graph.
 /// Created once via `gpu_build_index`, then used for all searches.
 pub struct GpuIndex {
-    d_vectors: u64,   // device pointer: N × dim × i8
-    d_graph: u64,     // device pointer: N × degree × i32
-    n: usize,
-    dim: usize,
-    degree: usize,
+    pub d_vectors: u64,
+    pub d_graph: u64,
+    pub n: usize,
+    pub dim: usize,
+    pub degree: usize,
 }
 
 impl GpuIndex {
@@ -717,38 +717,44 @@ impl GpuIndex {
 
 /// Upload INT8 vectors + flat CSR graph to GPU. Returns a GpuIndex handle.
 /// Call once after building the graph. All subsequent searches use the cached GPU data.
-/// Build GPU index. VUGVA approach: vectors use unified memory (GPU reads
-/// from RAM directly via page faults), graph uses regular GPU memory.
-/// No cuMemcpyHtoD for vectors — CUDA page migrator handles transfer.
+/// Build GPU index. Mode-aware memory allocation:
+/// - Turbo: vectors in VRAM (fast access, cuMemAlloc + copy)
+/// - Hybrid: vectors in unified memory (GPU reads from RAM via page faults)
 pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], n: usize, dim: usize, degree: usize) -> Option<GpuIndex> {
-    if !gpu_ensure_kernel("cagra_search") { return None; }
+    if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
     if !ensure_ctx() { return None; }
+    let mode = gpu_get_mode();
     unsafe {
         let v_bytes = n * dim;
         let g_bytes = n * degree * 4;
         let mut d_v = 0u64;
         let mut d_g = 0u64;
-        // VUGVA: vectors in unified memory — GPU reads from RAM directly.
-        // CUDA page migrator pulls hot pages into VRAM on demand.
-        // This eliminates the cuMemcpyHtoD and makes ALL vectors accessible
-        // to GPU even when they exceed VRAM (hybrid mode).
-        if cuMemAllocManaged(&mut d_v, v_bytes, CU_MEM_ATTACH_GLOBAL) != 0 {
-            eprintln!("[GPU] cuMemAllocManaged failed, falling back to cuMemAlloc");
-            if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
-            cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
-        } else {
-            // Copy data into unified memory (one-time host→unified write)
-            std::ptr::copy_nonoverlapping(
-                vectors_i8.as_ptr(), d_v as *mut i8, v_bytes
-            );
+        match mode {
+            ComputeMode::Turbo => {
+                // Turbo: vectors IN VRAM for fast kernel access.
+                // Full copy once, then kernel reads at VRAM speed (~1TB/s).
+                if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
+                cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
+                eprintln!("[GPU] Turbo: vectors in VRAM ({:.0} MB)", v_bytes as f64 / 1024.0 / 1024.0);
+            }
+            _ => {
+                // Hybrid/CPU: unified memory — GPU reads from RAM.
+                // VUGVA-style: CUDA page migrator pulls hot pages on demand.
+                if cuMemAllocManaged(&mut d_v, v_bytes, CU_MEM_ATTACH_GLOBAL) != 0 {
+                    // Fallback: regular alloc + copy
+                    if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
+                    cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
+                    eprintln!("[GPU] Hybrid: vectors in VRAM (fallback, unified alloc failed)");
+                } else {
+                    std::ptr::copy_nonoverlapping(vectors_i8.as_ptr(), d_v as *mut i8, v_bytes);
+                    eprintln!("[GPU] Hybrid: vectors in unified memory ({:.0} MB, GPU reads from RAM)", v_bytes as f64 / 1024.0 / 1024.0);
+                }
+            }
         }
-        // Graph is smaller — use regular GPU memory for fast access.
+        // Graph always in VRAM (small: degree × 4 bytes per node)
         if cuMemAlloc_v2(&mut d_g, g_bytes) != 0 { return None; }
         cuMemcpyHtoD_v2(d_g, graph_flat.as_ptr() as *const std::ffi::c_void, g_bytes);
-        let vectors_mb = v_bytes as f64 / 1024.0 / 1024.0;
-        let graph_mb = g_bytes as f64 / 1024.0 / 1024.0;
-        eprintln!("[GPU] Index: {} vecs × {}d, degree={} — vectors: {:.0}MB unified, graph: {:.1}MB VRAM",
-            n, dim, degree, vectors_mb, graph_mb);
+        eprintln!("[GPU] Index: {} vecs × {}d, degree={}", n, dim, degree);
         Some(GpuIndex { d_vectors: d_v, d_graph: d_g, n, dim, degree })
     }
 }
@@ -853,8 +859,8 @@ pub fn gpu_search(
         let mut arg8 = k as *mut std::ffi::c_void;
         let mut arg9 = itopk as *mut std::ffi::c_void;
         let mut arg10 = max_iters as *mut std::ffi::c_void;
-        let mut arg11 = num_queries as *mut std::ffi::c_void;
-        let mut arg12 = entry_node as *mut std::ffi::c_void;
+        let mut arg11 = entry_node as *mut std::ffi::c_void;
+        let mut arg12 = num_queries as *mut std::ffi::c_void;
         let mut args = [
             &mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4,
             &mut arg5, &mut arg6, &mut arg7, &mut arg8, &mut arg9,
@@ -862,8 +868,8 @@ pub fn gpu_search(
         ];
 
         let threads = 256u32;
-        // Shared memory: (2*itopk + 2*degree) * sizeof(int)
-        let smem = ((2 * itopk + 2 * degree) * 4) as u32;
+        // Shared memory: 2 * itopk * sizeof(int) for topk_dot + topk_idx
+        let smem = (2 * itopk * 4) as u32;
 
         let r = cuLaunchKernel(func,
             num_queries as u32, 1, 1,   // Grid: one block per query

@@ -4222,14 +4222,25 @@ impl VectorIndex {
         let mut q = query.to_vec();
         l2_normalize(&mut q);
         let qq = quantize(&q);
+        let mode = gpu::gpu_get_mode();
+        static SEARCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = SEARCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // ── TURBO: Full GPU brute-force — vectors stay on GPU, only query uploaded ──
-        if gpu::gpu_available() && gpu::gpu_get_mode() == gpu::ComputeMode::Turbo {
+        // ── TURBO: Real GPU graph traversal (CAGRA) ──
+        if mode == gpu::ComputeMode::Turbo && gpu::gpu_available() {
             let guard = self.gpu_idx.read().unwrap();
             if let Some(ref idx) = *guard {
-                if let Some(results) = gpu::gpu_brute_force_search(idx, &qq, k) {
+                let itopk = ef.max(k * 4).max(64);
+                let max_iters = (itopk as f32).sqrt() as usize + 5;
+                if let Some((indices, _distances)) = gpu::gpu_search(
+                    idx, &qq, 1, k, itopk, max_iters, 0,
+                ) {
+                    if count % 100 == 0 {
+                        eprintln!("[MITM] search_ef#{count} mode=Turbo GPU_CAGRA n={}", idx.n);
+                    }
                     let g = self.hnsw.read().unwrap();
-                    return results.into_iter().filter_map(|(idx, _dist)| {
+                    return indices.iter().filter(|&&i| i >= 0).filter_map(|&i| {
+                        let idx = i as usize;
                         let node = g.nodes.get(idx)?;
                         if node.deleted { return None; }
                         let dot = dot_f32(&q, g.vec_at_f32(idx));
@@ -4238,28 +4249,26 @@ impl VectorIndex {
                     }).collect();
                 }
             }
-            // GPU index not built yet — fall through (first search builds it)
+            if count % 100 == 0 {
+                eprintln!("[MITM] search_ef#{count} mode=Turbo NO_GPU_IDX → CPU fallback");
+            }
         }
 
-        // ── HYBRID: CPU graph walks + GPU distance via VUGVA ──
-        // CPU traverses the graph (fast pointer chasing).
-        // GPU computes distances to candidate vectors (batch parallel).
+        // ── HYBRID: CPU graph walk + VUGVA prefetch + GPU distance ──
         let g = self.hnsw.read().unwrap();
         let qf = g.query_f32(&q);
         let rerank_k = (k * 4).max(64);
-
-        // CPU graph walk — get candidates
         let candidates = g.search_indices(&qq, rerank_k, ef.max(rerank_k), &qf);
 
-        // If VUGVA VMT is available, use GPU for distance computation
         let vmt_guard = self.vugva_vmt.read().unwrap();
-        if vmt_guard.is_some() && gpu::gpu_available() && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly {
+        if vmt_guard.is_some() && gpu::gpu_available() && mode != gpu::ComputeMode::CpuOnly {
             let vmt = vmt_guard.as_ref().unwrap();
             let dim = g.dim;
+            if count % 100 == 0 {
+                eprintln!("[MITM] search_ef#{count} mode={mode:?} VUGVA_PREFETCH candidates={}", candidates.len());
+            }
             let chunk_indices: Vec<usize> = candidates.iter().map(|&(idx, _)| vmt.chunk_of(idx)).collect();
             let prefetched = vmt.prefetch_batch(&chunk_indices);
-
-            // GPU batch distance: query vs all vectors in prefetched chunks
             let mut results: Vec<(u64, f32)> = Vec::with_capacity(candidates.len());
             for chunk in &prefetched {
                 let chunk_n = chunk.chunk_len;
@@ -4267,9 +4276,7 @@ impl VectorIndex {
                     for (i, &d) in dists.iter().enumerate() {
                         let global_idx = chunk.chunk_offset + i;
                         if let Some(node) = g.nodes.get(global_idx) {
-                            if !node.deleted {
-                                results.push((node.id, d));
-                            }
+                            if !node.deleted { results.push((node.id, d)); }
                         }
                     }
                 }
@@ -4280,6 +4287,9 @@ impl VectorIndex {
         }
 
         // ── CPU fallback: per-candidate f32 rerank ──
+        if count % 100 == 0 {
+            eprintln!("[MITM] search_ef#{count} mode={mode:?} CPU_FALLBACK candidates={}", candidates.len());
+        }
         let mut rescored: Vec<(u64, f32)> = candidates
             .into_iter()
             .filter_map(|(idx, _int8_dist)| {
