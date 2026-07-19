@@ -7,6 +7,11 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).map(|s| s.as_str()).unwrap_or("/home/irfan/datasets/real_384_1M.fbin");
 
+    // GPU tier detection
+    gpu::gpu_init();
+    let gpu_info = gpu::gpu_info();
+    println!("[GPU] {}", gpu_info.iter().map(|(k,v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", "));
+
     // Load .fbin
     println!("Loading {path}...");
     let t0 = Instant::now();

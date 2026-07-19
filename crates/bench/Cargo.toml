@@ -19,3 +19,4 @@ reactive = { path = "../reactive" }
 router = { path = "../router" }
 mitm = { path = "../mitm" }
 protocol = { path = "../protocol" }
+gpu = { path = "../gpu" }

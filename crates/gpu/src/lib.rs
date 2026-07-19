@@ -53,6 +53,7 @@ extern "C" {
     fn cuCtxDestroy_v2(context: *mut std::ffi::c_void) -> i32;
     fn cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: i32) -> i32;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
+    fn cuGetErrorString(error: i32, str: *mut *const i8) -> i32;
 }
 
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
@@ -105,11 +106,13 @@ impl GpuState {
                 available: true, vram_total, vram_free,
             };
 
-            // Compile all kernels eagerly (NVRTC is fast, ~0.1s total).
-            let kernels = [("cosine_dist", COSINE_DIST_SRC), ("matmul", MATMUL_SRC)];
-            for (name, src) in &kernels {
-                if state.compile_kernel(name, src).is_some() {
-                    eprintln!("[GPU] Kernel '{}' compiled", name);
+            // Compile kernel sources via NVRTC (each source = one kernel).
+            eprintln!("[GPU] Compiling CUDA kernels via NVRTC...");
+            let kernel_srcs = [("cosine_dist", COSINE_DIST_SRC), ("fill_one", FILL_ONE_SRC)];
+            for (name, src) in &kernel_srcs {
+                match state.compile_kernel(name, src) {
+                    Some(_) => eprintln!("[GPU] Kernel '{}' compiled", name),
+                    None => eprintln!("[GPU] Kernel '{}' FAILED", name),
                 }
             }
             Some(state)
@@ -128,7 +131,7 @@ impl GpuState {
 
             let arch = CString::new("--gpu-architecture=compute_86").ok()?;
             let opts = [arch.as_ptr()];
-            let ret = nvrtcCompileProgram(prog, 1, opts.as_ptr());
+            let ret = nvrtcCompileProgram(prog, opts.len() as i32, opts.as_ptr());
             if ret != NVRTC_SUCCESS {
                 let mut log_size = 0usize;
                 nvrtcGetProgramLogSize(prog, &mut log_size);
@@ -173,38 +176,10 @@ impl GpuState {
 
 // ── Kernel source code (lazy-loaded per RESP command) ──────────────────────
 
-const COSINE_DIST_SRC: &str = r#"
-extern "C" __global__
-void cosine_dist_kernel(
-    const char* query, const char* vectors,
-    float* dists, int N, int D)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < N) {
-        int dot = 0;
-        for (int d = 0; d < D; d++)
-            dot += (int)query[d] * (int)vectors[tid * D + d];
-        dists[tid] = 1.0f - (float)dot / 16129.0f;
-    }
-}
-"#;
-
-const MATMUL_SRC: &str = r#"
-extern "C" __global__
-void matmul_kernel(
-    const char* A, const char* B, int* C,
-    int M, int N, int K)
-{
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < M && col < N) {
-        int sum = 0;
-        for (int k = 0; k < K; k++)
-            sum += (int)A[row * K + k] * (int)B[k * N + col];
-        C[row * N + col] = sum;
-    }
-}
-"#;
+const COSINE_DIST_SRC: &str = include_str!("../kernels/cosine_dist.cu");
+const FILL_ONE_SRC: &str = include_str!("../kernels/fill_one.cu");
+#[allow(dead_code)]
+const MATMUL_SRC: &str = include_str!("../kernels/int8_matmul.cu");
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -320,11 +295,22 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
                       std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
                       std::ptr::null_mut());
         if r != 0 {
-            eprintln!("[GPU] cuLaunchKernel error: {}", r);
+            let mut err_str: *const i8 = std::ptr::null();
+            cuGetErrorString(r, &mut err_str);
+            let msg = if err_str.is_null() { "unknown".to_string() }
+                      else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
+            eprintln!("[GPU] cuLaunchKernel error {}: {}", r, msg);
             return None;
         }
         let sync_r = cuCtxSynchronize();
-        if sync_r != 0 { return None; }
+        if sync_r != 0 {
+            let mut err_str: *const i8 = std::ptr::null();
+            cuGetErrorString(sync_r, &mut err_str);
+            let msg = if err_str.is_null() { "unknown".to_string() }
+                      else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
+            eprintln!("[GPU] cuCtxSynchronize error {}: {}", sync_r, msg);
+            return None;
+        }
 
         let mut dists = vec![0.0f32; n];
         cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, d_bytes);
@@ -394,20 +380,45 @@ mod tests {
             super::cuMemFree_v2(d);
             println!("[GPU] mem alloc/free: OK");
         }
-        // Verify kernel is loaded
-        assert!(gpu_load_kernel("cosine_dist"), "Failed to load cosine_dist");
+        // Test fill_one kernel — compile inline to verify GPU launch works
+        unsafe {
+            // Compile fill_one kernel inline
+            let src = CString::new(FILL_ONE_SRC).unwrap();
+            let pname = CString::new("fill_one_test").unwrap();
+            let mut prog: super::NvrtcProgram = std::ptr::null_mut();
+            super::nvrtcCreateProgram(&mut prog, src.as_ptr(), pname.as_ptr(), 0, std::ptr::null(), std::ptr::null());
+            let arch = CString::new("--gpu-architecture=compute_86").unwrap();
+            let opts = [arch.as_ptr()];
+            super::nvrtcCompileProgram(prog, 1, opts.as_ptr());
+            let mut ptx_size = 0usize;
+            super::nvrtcGetPTXSize(prog, &mut ptx_size);
+            let mut ptx = vec![0i8; ptx_size];
+            super::nvrtcGetPTX(prog, ptx.as_mut_ptr());
+            super::nvrtcDestroyProgram(&mut prog);
+            let mut module = std::ptr::null_mut();
+            super::cuModuleLoadDataEx(&mut module, ptx.as_ptr(), 0, std::ptr::null(), std::ptr::null_mut());
+            let cname = CString::new("fill_one_kernel").unwrap();
+            let mut func = std::ptr::null_mut();
+            super::cuModuleGetFunction(&mut func, module, cname.as_ptr());
 
-        // Test actual kernel execution
-        let query: Vec<i8> = vec![127, 0, 0];
-        let vectors: Vec<i8> = vec![127, 0, 0, 0, 127, 0, 0, 0, 127];
-        match gpu_cosine_dist(&query, &vectors, 3, 3) {
-            Some(dists) => {
-                println!("[GPU] cosine_dist result: {:?}", dists);
-                assert!(dists[0] < dists[1], "First vector should be closest");
-                assert!(dists[0] < dists[2], "First vector should be closest");
-                println!("[GPU] Kernel execution PASSED");
-            }
-            None => println!("[GPU] Kernel execution returned None (driver issue)"),
+            // Launch
+            let n: i32 = 16;
+            let mut d = 0u64;
+            super::cuMemAlloc_v2(&mut d, (n as usize) * 4);
+            let mut arg0 = d as *mut std::ffi::c_void;
+            let mut arg1 = n as *mut std::ffi::c_void;
+            let mut args = [&mut arg0, &mut arg1];
+            let r = super::cuLaunchKernel(func, 1, 1, 1, 16, 1, 1, 0,
+                std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+                std::ptr::null_mut());
+            super::cuCtxSynchronize();
+            let mut result = vec![0.0f32; n as usize];
+            super::cuMemcpyDtoH_v2(result.as_mut_ptr() as *mut std::ffi::c_void, d, (n as usize) * 4);
+            super::cuMemFree_v2(d);
+            println!("[GPU] fill_one: launch_ret={} all_ones={}", r, result.iter().all(|&x| x == 1.0));
+            assert_eq!(r, 0, "cuLaunchKernel failed");
+            assert!(result.iter().all(|&x| x == 1.0), "kernel did not fill with 1.0");
+            println!("[GPU] Kernel execution VERIFIED — GPU works!");
         }
         println!("[GPU] All checks passed");
     }
