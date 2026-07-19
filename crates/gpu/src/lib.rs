@@ -109,40 +109,35 @@ impl GpuState {
                 available: true, vram_total, vram_free,
             };
 
-            // Compile each kernel source into its own PTX, then load all into one module.
-            // NVRTC: one program per source file. Each source = one kernel function.
+            // Compile ALL kernels from one source file via NVRTC.
+            // One compile → one PTX → one module → all function handles.
             eprintln!("[GPU] Compiling CUDA kernels via NVRTC...");
-            let kernel_srcs = [("cosine_dist", COSINE_DIST_SRC), ("fill_one", FILL_ONE_SRC)];
-            let mut all_ptx = Vec::new();
-            for (name, src) in &kernel_srcs {
-                let src_cstr = CString::new(*src).unwrap();
-                let name_cstr = CString::new(*name).unwrap();
-                let mut prog: NvrtcProgram = std::ptr::null_mut();
-                let ret = nvrtcCreateProgram(&mut prog, src_cstr.as_ptr(), name_cstr.as_ptr(), 0, std::ptr::null(), std::ptr::null());
-                if ret != 0 { eprintln!("[GPU] NVRTC create '{}' failed: {}", name, ret); continue; }
-                let arch = CString::new("--gpu-architecture=compute_86").unwrap();
-                let opts = [arch.as_ptr()];
-                let ret = nvrtcCompileProgram(prog, 1, opts.as_ptr());
-                if ret != 0 {
-                    eprintln!("[GPU] NVRTC compile '{}' failed: {}", name, ret);
-                    nvrtcDestroyProgram(&mut prog);
-                    continue;
+            let src_cstr = CString::new(KERNEL_SRC).unwrap();
+            let name_cstr = CString::new("dbstrike_kernels").unwrap();
+            let mut prog: NvrtcProgram = std::ptr::null_mut();
+            nvrtcCreateProgram(&mut prog, src_cstr.as_ptr(), name_cstr.as_ptr(), 0, std::ptr::null(), std::ptr::null());
+            let arch = CString::new("--gpu-architecture=compute_86").unwrap();
+            let opts = [arch.as_ptr()];
+            let ret = nvrtcCompileProgram(prog, 1, opts.as_ptr());
+            if ret != 0 {
+                let mut log_size = 0usize;
+                nvrtcGetProgramLogSize(prog, &mut log_size);
+                if log_size > 1 {
+                    let mut log = vec![0i8; log_size];
+                    nvrtcGetProgramLog(prog, log.as_mut_ptr());
+                    eprintln!("[GPU] NVRTC compile error:\n{}", String::from_utf8_lossy(&log.iter().map(|&c| c as u8).collect::<Vec<_>>()));
                 }
-                let mut ptx_size = 0usize;
-                nvrtcGetPTXSize(prog, &mut ptx_size);
-                let mut ptx = vec![0i8; ptx_size];
-                nvrtcGetPTX(prog, ptx.as_mut_ptr());
-                nvrtcDestroyProgram(&mut prog);
-                all_ptx.push(ptx);
-                eprintln!("[GPU] Kernel '{}' compiled", name);
             }
-            // Load all PTX into one module.
-            for ptx in &all_ptx {
-                let ret = cuModuleLoadDataEx(&mut state.module, ptx.as_ptr(), 0, std::ptr::null(), std::ptr::null_mut());
-                if ret != 0 { eprintln!("[GPU] cuModuleLoadDataEx failed: {}", ret); }
-            }
-            // Get function handles from the loaded module.
-            for name in &["cosine_dist_kernel", "fill_one_kernel"] {
+            let mut ptx_size = 0usize;
+            nvrtcGetPTXSize(prog, &mut ptx_size);
+            let mut ptx = vec![0i8; ptx_size];
+            nvrtcGetPTX(prog, ptx.as_mut_ptr());
+            nvrtcDestroyProgram(&mut prog);
+            eprintln!("[GPU] PTX compiled ({} bytes)", ptx_size);
+            let ret = cuModuleLoadDataEx(&mut state.module, ptx.as_ptr(), 0, std::ptr::null(), std::ptr::null_mut());
+            if ret != 0 { eprintln!("[GPU] cuModuleLoadDataEx failed: {}", ret); }
+            // Get ALL function handles from the loaded module.
+            for name in &["cosine_dist_kernel", "fill_one_kernel", "matmul_kernel"] {
                 let cname = CString::new(*name).unwrap();
                 let mut func = std::ptr::null_mut();
                 if cuModuleGetFunction(&mut func, state.module, cname.as_ptr()) == 0 {
@@ -213,8 +208,7 @@ impl GpuState {
 
 // ── Kernel source code (lazy-loaded per RESP command) ──────────────────────
 
-const COSINE_DIST_SRC: &str = include_str!("../kernels/cosine_dist.cu");
-const FILL_ONE_SRC: &str = include_str!("../kernels/fill_one.cu");
+const KERNEL_SRC: &str = include_str!("../kernels/all_kernels.cu");
 #[allow(dead_code)]
 const MATMUL_SRC: &str = include_str!("../kernels/int8_matmul.cu");
 
@@ -417,28 +411,10 @@ mod tests {
             cuMemFree_v2(d);
             println!("[GPU] mem alloc/free: OK");
         }
-        // Test fill_one kernel — compile inline to verify GPU launch works
+        // Test fill_one kernel from the loaded module
         unsafe {
-            // Compile fill_one kernel inline
-            let src = CString::new(FILL_ONE_SRC).unwrap();
-            let pname = CString::new("fill_one_test").unwrap();
-            let mut prog: NvrtcProgram = std::ptr::null_mut();
-            nvrtcCreateProgram(&mut prog, src.as_ptr(), pname.as_ptr(), 0, std::ptr::null(), std::ptr::null());
-            let arch = CString::new("--gpu-architecture=compute_86").unwrap();
-            let opts = [arch.as_ptr()];
-            nvrtcCompileProgram(prog, 1, opts.as_ptr());
-            let mut ptx_size = 0usize;
-            nvrtcGetPTXSize(prog, &mut ptx_size);
-            let mut ptx = vec![0i8; ptx_size];
-            nvrtcGetPTX(prog, ptx.as_mut_ptr());
-            nvrtcDestroyProgram(&mut prog);
-            let mut module = std::ptr::null_mut();
-            cuModuleLoadDataEx(&mut module, ptx.as_ptr(), 0, std::ptr::null(), std::ptr::null_mut());
-            let cname = CString::new("fill_one_kernel").unwrap();
-            let mut func = std::ptr::null_mut();
-            cuModuleGetFunction(&mut func, module, cname.as_ptr());
-
-            // Launch
+            let state = GPU_STATE.get().unwrap();
+            let func = state.get_kernel("fill_one").expect("fill_one kernel not found");
             let n: i32 = 16;
             let mut d = 0u64;
             cuMemAlloc_v2(&mut d, (n as usize) * 4);
