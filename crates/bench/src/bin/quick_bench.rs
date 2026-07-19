@@ -46,8 +46,25 @@ fn main() {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     println!("Building HNSW graph ({cores} cores, {n} vectors, {dim}d)...");
     let t2 = Instant::now();
-    let vi = views::VectorIndex::build_parallel(&norm, dim, cores);
-    // norm is needed for recall brute-force, keep it alive.
+    let vi = views::VectorIndex::build_parallel_tiered(&norm, dim, cores, true);
+    // Pre-extract recall ground truth BEFORE dropping norm.
+    // Compute top-10 brute-force for the first n_recall queries.
+    let n_recall = 50.min(nq);
+    println!("Computing recall ground truth ({n_recall} queries)...");
+    let t_bf = Instant::now();
+    let ground_truth: Vec<Vec<u64>> = (0..n_recall).map(|qi| {
+        let q = &norm[qi * dim..(qi + 1) * dim];
+        let mut truth: Vec<(f32, u64)> = (0..n as u64).map(|i| {
+            let mut dot = 0.0f32;
+            for j in 0..dim { dot += q[j] * norm[i as usize * dim + j]; }
+            ((1.0 - dot).max(0.0).min(2.0), i)
+        }).collect();
+        truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        truth.iter().take(10).map(|(_, id)| *id).collect()
+    }).collect();
+    println!("  brute-force: {:.1}s", t_bf.elapsed().as_secs_f64());
+    // NOW we can drop norm — the graph has its own copies for rerank.
+    drop(norm);
     let build_s = t2.elapsed().as_secs_f64();
     println!("  TOTAL build: {build_s:.1}s ({:.0} vec/s)", n as f64 / build_s);
     let (ml, per_level, avg_neigh) = vi.debug_shape();
@@ -89,22 +106,14 @@ fn main() {
     let qps = qps_n as f64 / t3.elapsed().as_secs_f64();
     println!("  {cores}-thread QPS: {qps:.0}");
 
-    // Recall (limit to 50 queries for speed) — brute-force over full norm dataset
-    let n_recall = 50.min(nq);
+    // Recall — use precomputed ground truth (norm is dropped)
     let mut hits = 0usize;
     for qi in 0..n_recall {
         let q = &queries_arc[qi * dim..(qi + 1) * dim];
-        let mut truth: Vec<(f32, u64)> = (0..n as u64).map(|i| {
-            let mut dot = 0.0f32;
-            for j in 0..dim { dot += q[j] * norm[i as usize * dim + j]; }
-            ((1.0 - dot).max(0.0).min(2.0), i)
-        }).collect();
-        truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let gt: std::collections::BTreeSet<u64> = truth.iter().take(10).map(|(_, id)| *id).collect();
+        let gt: std::collections::BTreeSet<u64> = ground_truth[qi].iter().copied().collect();
         let res = vi.search_ef(q, 10, 128);
         hits += res.iter().take(10).filter(|(id, _)| gt.contains(id)).count();
     }
-    drop(norm);
     let recall = hits as f64 / (n_recall * 10) as f64;
     println!("  Recall@10: {recall:.3}");
 

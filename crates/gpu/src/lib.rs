@@ -159,7 +159,7 @@ impl GpuState {
                 return;
             }
             // Get ALL function handles from the loaded module.
-            for name in &["cosine_dist_kernel", "matmul_kernel"] {
+            for name in &["cosine_dist_kernel", "batch_cosine_dist_kernel", "matmul_kernel"] {
                 let cname = CString::new(*name).unwrap();
                 let mut func = std::ptr::null_mut();
                 if cuModuleGetFunction(&mut func, self.module, cname.as_ptr()) == 0 {
@@ -347,6 +347,55 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
     }
 }
 
+/// Batch INT8 cosine distance: Q queries × N vectors → Q×N distances.
+/// This is the CAGRA distance kernel — Q blocks, one per query.
+/// Returns None if GPU unavailable.
+pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize, dim: usize) -> Option<Vec<f32>> {
+    if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
+    let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
+    if !ensure_ctx() { return None; }
+    unsafe {
+        let q_bytes = q * dim;
+        let v_bytes = n * dim;
+        let out_bytes = q * n * 4;
+        let mut d_q = 0u64; let mut d_v = 0u64; let mut d_d = 0u64;
+        if cuMemAlloc_v2(&mut d_q, q_bytes) != 0 { return None; }
+        if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
+        if cuMemAlloc_v2(&mut d_d, out_bytes) != 0 { return None; }
+        cuMemcpyHtoD_v2(d_q, queries.as_ptr() as *const std::ffi::c_void, q_bytes);
+        cuMemcpyHtoD_v2(d_v, vectors.as_ptr() as *const std::ffi::c_void, v_bytes);
+        let threads = 256u32;
+        let q_val = q as i32;
+        let n_val = n as i32;
+        let dim_val = dim as i32;
+        let mut arg0 = d_q as *mut std::ffi::c_void;
+        let mut arg1 = d_v as *mut std::ffi::c_void;
+        let mut arg2 = d_d as *mut std::ffi::c_void;
+        let mut arg3 = q_val as *mut std::ffi::c_void;
+        let mut arg4 = n_val as *mut std::ffi::c_void;
+        let mut arg5 = dim_val as *mut std::ffi::c_void;
+        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
+        // Grid: Q blocks (one per query), Block: 256 threads
+        let r = cuLaunchKernel(func, q as u32, 1, 1, threads, 1, 1, 0,
+            std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+            std::ptr::null_mut());
+        if r != 0 {
+            let mut err_str: *const i8 = std::ptr::null();
+            cuGetErrorString(r, &mut err_str);
+            let msg = if err_str.is_null() { "unknown".to_string() }
+                      else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
+            eprintln!("[GPU] batch_cosine_dist error {}: {}", r, msg);
+            cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
+            return None;
+        }
+        cuCtxSynchronize();
+        let mut dists = vec![0.0f32; q * n];
+        cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, out_bytes);
+        cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
+        Some(dists)
+    }
+}
+
 /// INT8 matmul on GPU. Auto-loads kernel if needed.
 pub fn gpu_matmul(a: &[i8], b: &[i8], m: usize, k: usize, n: usize) -> Option<Vec<i32>> {
     if !gpu_ensure_kernel("matmul") { return None; }
@@ -413,6 +462,7 @@ mod tests {
 
         // Test memory alloc/free
         unsafe {
+            ensure_ctx();
             let mut d = 0u64;
             let r = cuMemAlloc_v2(&mut d, 1024);
             assert_eq!(r, 0, "GPU mem alloc failed");
@@ -450,5 +500,29 @@ mod tests {
         let loaded2 = gpu_load_kernel("matmul");
         println!("[GPU] GPU.LOAD matmul: {}", loaded2);
         assert!(loaded2, "gpu_load_kernel matmul should succeed");
+    }
+
+    #[test]
+    fn test_batch_cosine_dist() {
+        if !gpu_init() { return; }
+        // 2 queries × 3 vectors, dim=3
+        let queries: Vec<i8> = vec![
+            127, 0, 0,
+            0, 127, 0,
+        ];
+        let vectors: Vec<i8> = vec![
+            127, 0, 0,
+            0, 127, 0,
+            0, 0, 127,
+        ];
+        let dists = gpu_batch_cosine_dist(&queries, &vectors, 2, 3, 3).expect("batch_cosine_dist failed");
+        println!("[GPU] batch_cosine_dist: {:?}", dists);
+        assert!(dists[0] < 0.01, "q0-v0 should be ~0, got {}", dists[0]);
+        assert!(dists[1] > 0.99, "q0-v1 should be ~1, got {}", dists[1]);
+        assert!(dists[2] > 0.99, "q0-v2 should be ~1, got {}", dists[2]);
+        assert!(dists[3] > 0.99, "q1-v0 should be ~1, got {}", dists[3]);
+        assert!(dists[4] < 0.01, "q1-v1 should be ~0, got {}", dists[4]);
+        assert!(dists[5] > 0.99, "q1-v2 should be ~1, got {}", dists[5]);
+        println!("[GPU] batch_cosine_dist VERIFIED!");
     }
 }

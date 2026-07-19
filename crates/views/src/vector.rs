@@ -4172,17 +4172,15 @@ impl VectorIndex {
         let qq = quantize(&q);
         let g = self.hnsw.read().unwrap();
         let qf = g.query_f32(&q);
-        let rerank_k = (k * 4).max(64); // over-fetch pool for rerank
-        // Stage 1: int8 traversal returns raw node indices + int8 distances.
+        let rerank_k = (k * 4).max(64);
+        // Stage 1: int8 traversal.
         let candidates = g.search_indices(&qq, rerank_k, ef.max(rerank_k), &qf);
-        // Stage 2: rerank with exact f32 dot from the mirror.
+        // Stage 2: f32 rerank.
         let mut rescored: Vec<(u64, f32)> = candidates
             .into_iter()
             .filter_map(|(idx, _int8_dist)| {
                 let node = g.nodes.get(idx)?;
-                if node.deleted {
-                    return None;
-                }
+                if node.deleted { return None; }
                 let dot = dot_f32(&q, g.vec_at_f32(idx));
                 let d = (1.0 - dot).max(0.0).min(2.0);
                 Some((node.id, d))
