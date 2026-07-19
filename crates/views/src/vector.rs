@@ -2929,6 +2929,19 @@ impl Hnsw {
         h
     }
 
+    /// Build a segment using index indirection: reads `data[perm[off+i]]` instead
+    /// of contiguous rows. Avoids the 1.5-3 GB shuffled copy.
+    fn build_segment_indexed(data: &[f32], dim: usize, perm: &[usize], off: usize, count: usize, base_id: u64, attrs: &[u32]) -> Hnsw {
+        let mut h = Hnsw::new();
+        h.dim = dim;
+        for row in 0..count {
+            let true_row = perm[off + row];
+            let v: Vec<f32> = data[true_row * dim..(true_row + 1) * dim].to_vec();
+            h.insert_attr(base_id + row as u64, v, attrs[off + row]);
+        }
+        h
+    }
+
     /// Merge K independent segments into ONE HNSW. `segments` are moved in
     /// (consumed). Node-local indices in each segment are remapped to a global
     /// arena; `id_to_idx`/`all_i8`/`all_f32` are concatenated; then a BRIDGE
@@ -3399,11 +3412,11 @@ impl VectorIndex {
             let j = (s >> 33) as usize % (i + 1);
             perm.swap(i, j);
         }
-        let shuffled: Vec<f32> = perm.iter().flat_map(|&r| {
-            data[r * dim..(r + 1) * dim].iter().copied()
-        }).collect();
+        // INDEX INDIRECTION: read rows from original data via perm[] instead of
+        // creating a full shuffled copy. Saves 1.5 GB for 1M×384d, 3 GB for 768d.
+        // Each shard thread reads `data[perm[lo+i] * dim ..]` on demand.
 
-        // Split the SHUFFLED matrix into `shards` contiguous, as-even ranges.
+        // Split into contiguous shard ranges over the permuted index space.
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(shards);
         let per = (n as f64 / shards as f64).ceil() as usize;
         let mut start = 0usize;
@@ -3431,43 +3444,32 @@ impl VectorIndex {
         let dim = dim;
         let bridge = 16usize; // 16 cross-shard edges per node (target recall 1.000)
         let zero_attr: Vec<u32> = vec![0u32; n]; // Module-4 attrs: none for this path
-        // Share data across threads via Arc instead of cloning per thread.
-        // At 1M × 768d this saves ~K × 3 GB of redundant copies.
-        let shared_data: Arc<Vec<f32>> = Arc::new(shuffled);
-        let shared_perm: Arc<Vec<usize>> = Arc::new(perm);
-        let shared_attr: Arc<Vec<u32>> = Arc::new(zero_attr);
-        // Note: shared_data holds 1.5GB. Drop it after segments are created
-        // to free memory before merge (segments have their own copies).
-        let handles: Vec<_> = ranges
-            .into_iter()
-            .enumerate()
-            .map(|(_si, (lo, hi))| {
-                let data_ptr = Arc::clone(&shared_data);
-                let perm_ptr = Arc::clone(&shared_perm);
-                let attr_ptr = Arc::clone(&shared_attr);
-                let dim = dim;
-                // The TRUE id of shuffled row `r` is `perm[r]`; build_segment
-                // assigns ids as base + local row, so pass the perm offset.
-                std::thread::spawn(move || {
-                    let mut h = Hnsw::build_segment(&data_ptr, dim, lo, hi - lo, lo as u64, &attr_ptr);
-                    // Remap local ids -> true ids using the permutation slice.
-                    for (local, node) in h.nodes.iter_mut().enumerate() {
-                        let true_row = perm_ptr[lo + local];
-                        node.id = true_row as u64;
-                    }
-                    h.id_to_idx.clear();
-                    for (local, node) in h.nodes.iter().enumerate() {
-                        h.id_to_idx.insert(node.id, local);
-                    }
-                    h
+        // INDEX INDIRECTION: each shard reads data[perm[i]] — no shuffled copy.
+        let perm_arc: Arc<Vec<usize>> = Arc::new(perm);
+        let attr_arc: Arc<Vec<u32>> = Arc::new(zero_attr);
+        let segments: Vec<Hnsw> = std::thread::scope(|s| {
+            let handles: Vec<_> = ranges
+                .into_iter()
+                .enumerate()
+                .map(|(_si, (lo, hi))| {
+                    let perm_clone = Arc::clone(&perm_arc);
+                    let attr_clone = Arc::clone(&attr_arc);
+                    s.spawn(move || {
+                        let mut h = Hnsw::build_segment_indexed(data, dim, &perm_clone, lo, hi - lo, lo as u64, &attr_clone);
+                        for (local, node) in h.nodes.iter_mut().enumerate() {
+                            let true_row = perm_clone[lo + local];
+                            node.id = true_row as u64;
+                        }
+                        h.id_to_idx.clear();
+                        for (local, node) in h.nodes.iter().enumerate() {
+                            h.id_to_idx.insert(node.id, local);
+                        }
+                        h
+                    })
                 })
-            })
-            .collect();
-        let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        // Free shuffled data early (segments have their own copies).
-        drop(shared_data);
-        drop(shared_perm);
-        drop(shared_attr);
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
         // For tiered mode, pre-allocate the mmap BEFORE merge so merge_segments
         // can write f32 data directly to it — avoids the ~N×dim×4 RAM intermediate.
         let mut pre_tier = if tiered { MmapTier::new(n * dim) } else { None };
