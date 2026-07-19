@@ -3393,7 +3393,7 @@ impl VectorIndex {
         }
 
         let dim = dim;
-        let bridge = 6usize; // 6 cross-shard edges per node (balance recall vs speed)
+        let bridge = 8usize; // 8 cross-shard edges per node (max recall)
         let zero_attr: Vec<u32> = vec![0u32; n]; // Module-4 attrs: none for this path
         // Share data across threads via Arc instead of cloning per thread.
         // At 1M × 768d this saves ~K × 3 GB of redundant copies.
