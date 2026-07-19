@@ -32,7 +32,7 @@
 use std::cell::UnsafeCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use storage::{Engine, Value};
 
 /// MODULE 4 — a predicate over a node's `attr` (its category id). Qdrant forces
@@ -3447,8 +3447,10 @@ impl VectorIndex {
         let perm_arc: Arc<Vec<usize>> = Arc::new(perm);
         let attr_arc: Arc<Vec<u32>> = Arc::new(zero_attr);
 
-        // GPU graph construction (Turbo/Hybrid): batch kNN on GPU per shard.
-        // CPU graph construction (CpuOnly): sequential HNSW insert.
+        // GPU graph construction: serialize with Mutex to prevent VRAM OOM.
+        // Each gpu_build_knn_graph call allocates ~534MB GPU RAM.
+        // Multiple concurrent calls would exceed 8GB VRAM.
+        let gpu_build_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let use_gpu_build = gpu::gpu_available() && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly;
         if use_gpu_build {
             eprintln!("[GPU] GPU graph construction enabled — building kNN on GPU");
@@ -3461,10 +3463,12 @@ impl VectorIndex {
                 .map(|(_si, (lo, hi))| {
                     let perm_clone = Arc::clone(&perm_arc);
                     let attr_clone = Arc::clone(&attr_arc);
+                    let lock_clone = Arc::clone(&gpu_build_lock);
                     s.spawn(move || {
                         let base_id = lo as u64;
                         if use_gpu_build {
-                            // GPU path: compute kNN graph on GPU, then build HNSW from edges
+                            // Serialize GPU access: only one shard builds at a time
+                            let _gpu_guard = lock_clone.lock().unwrap();
                             let count = hi - lo;
                             // Collect INT8 vectors for this shard
                             let mut shard_i8: Vec<i8> = Vec::with_capacity(count * dim);
@@ -4294,8 +4298,10 @@ impl VectorIndex {
                 }
             }
             if count % 100 == 0 {
-                eprintln!("[MITM] search_ef#{count} mode=Turbo NO_GPU_IDX → CPU fallback");
+                eprintln!("[MITM] search_ef#{count} mode=Turbo NO_GPU_IDX → auto-downgrade to Hybrid");
             }
+            // Auto-downgrade: GPU index unavailable, switch to Hybrid
+            gpu::gpu_set_mode(gpu::ComputeMode::Hybrid);
         }
 
         // ── HYBRID: CPU graph walk + VUGVA prefetch + GPU distance ──

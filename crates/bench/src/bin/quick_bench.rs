@@ -16,7 +16,14 @@ fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: &[f32], cores:
 
     // Set compute mode
     match mode {
-        "turbo" => gpu::gpu_set_mode(gpu::ComputeMode::Turbo),
+        "turbo" => {
+            let detected = gpu::gpu_auto_mode(n, dim);
+            if detected != gpu::ComputeMode::Turbo {
+                eprintln!("[GPU] WARNING: --mode turbo requested but data may exceed VRAM build budget. Using {:?} (auto-detected)", detected);
+            } else {
+                gpu::gpu_set_mode(gpu::ComputeMode::Turbo);
+            }
+        }
         "hybrid" => gpu::gpu_set_mode(gpu::ComputeMode::Hybrid),
         "cpu" => gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly),
         _ => { gpu::gpu_auto_mode(n, dim); }

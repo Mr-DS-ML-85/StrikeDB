@@ -333,20 +333,22 @@ pub fn gpu_auto_mode(n: usize, dim: usize) -> ComputeMode {
     if !gpu_available() {
         return ComputeMode::CpuOnly;
     }
-    let needed = n * dim; // int8 vectors
     let (_, _, vram_free) = gpu_check_capacity(n, dim);
-    if needed <= vram_free {
-        // Data fits in VRAM → Turbo
+    // Peak VRAM: vectors + kNN build distance matrix + graph + 500MB overhead
+    let shards = 16usize;
+    let shard_n = (n + shards - 1) / shards;
+    let build_peak = shard_n * dim + 1024 * shard_n * 4 + shard_n * 80 * 4 + 500 * 1024 * 1024;
+    let data_only = n * dim + n * 80 * 4;
+
+    if build_peak <= vram_free {
         let mode = ComputeMode::Turbo;
         gpu_set_mode(mode);
         mode
-    } else if needed <= vram_free * 3 {
-        // Data fits in 3× VRAM → Hybrid (GPU hot + RAM warm)
+    } else if data_only <= vram_free {
         let mode = ComputeMode::Hybrid;
         gpu_set_mode(mode);
         mode
     } else {
-        // Data way too large → still Hybrid, more offloading
         let mode = ComputeMode::Hybrid;
         gpu_set_mode(mode);
         mode
@@ -575,10 +577,10 @@ unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_i
 
     let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
 
-    // Process in batches. Q × N × 4 bytes for output must fit in VRAM.
-    // RTX 4060 has ~7GB free. For N=1M, dim=384: Q × 1M × 4 = Q × 4MB.
-    // Max Q = 7000 / 4 = 1750. Use Q=1024 for safety.
-    let batch_q = 1024.min(n);
+    // Adaptive batch size: fit output in available VRAM.
+    // Output = batch_q * n * 4 bytes. Cap at 500MB to leave headroom.
+    let max_output_bytes = 500 * 1024 * 1024; // 500MB
+    let batch_q = (max_output_bytes / (n * 4).max(1)).max(1).min(n).min(512);
     let mut knn_graph: Vec<Vec<usize>> = vec![vec![0usize; k_init]; n];
     let mut q_buf: Vec<i8> = vec![0i8; batch_q * dim];
     let mut d_d = 0u64;
