@@ -57,6 +57,7 @@ licenses, five release cadences, and five places for drift to hide.
 | **Procedural memory** | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ per-agent namespace |
 | **MITM cache debugging** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ **built-in** |
 | Logic *in* the DB | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ **fuel-metered** |
+| **ACL + password auth** | ⚠️ 6.x+ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ **SHA-256 + salt** |
 | One consistency model | ❌ | ✅ | ✅ | ⚠️ | ❌ | ❌ | ⚠️ | ✅ MVCC |
 | One license | BSD | PostgreSQL | Apache-2.0 | Apache-2.0 | MIT | Apache-2.0 | BSL | ✅ Apache-2.0 |
 
@@ -75,6 +76,9 @@ ulimit -n 100000
 
 # start the server on the RESP wire (talk to it with any Redis client)
 DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380
+
+# optional: enable password auth (no auth by default)
+DBSTRIKE_PASS=mypassword DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380
 ```
 
 Talk to it with `redis-cli`, `nc`, or the bundled harnesses:
@@ -87,6 +91,10 @@ redis-cli -p 6380 VSEARCH 5 1.0 0.0 0.0
 redis-cli -p 6380 SUBSCRIBE trades &
 redis-cli -p 6380 PUBLISH trades "hello"
 redis-cli -p 6380 CHECKPOINT   # snapshot current state + truncate WAL
+
+# with password auth enabled:
+redis-cli -a mypassword -p 6380 PING
+redis-benchmark -h 127.0.0.1 -p 6380 -a mypassword -P 64 -c 100 -n 200000 -t set,get
 
 # native Rust bench harness — in-process, 29 sections in ~22s
 cargo run --release -p bench
@@ -509,7 +517,8 @@ regression vs the `-P64` number (5.71M/s) and a **~261×** regression vs the
 
 **Redis-compat command coverage** (all pipelined-coalesced when applicable):
 `PING · SET · GET · MSET · MGET · DEL · INCR · INCRBY · KEYS · DBSIZE ·
-SELECT · COMMAND · FLUSHALL · FLUSHDB · SUBSCRIBE · PUBLISH · QUIT`
+SELECT · COMMAND · FLUSHALL · FLUSHDB · SUBSCRIBE · PUBLISH · QUIT ·
+AUTH · ACL`
 plus StrikeDB-native: `VADD · VADDBATCH · VSETQUANT · VFITQUANT · VQUANT ·
 VSEARCH · VSEARCHA · VSEARCH.MANY · VCALIBRATE · TABLE.* · TSADD · TSADD.F ·
 TSRANGE · TSAVG · TSRANGE.LATEST · CDCLEN · CRDT.* · HLC.* · REDUCE ·
@@ -571,6 +580,9 @@ and `SCAN <start> <end>` (raw-engine MVCC point-in-time reads).
 
 **Env knobs:**
 - `DBSTRIKE_WAL=<path>` — WAL file location (default: `dbstrike.wal`)
+- `DBSTRIKE_PASS=<password>` — enable password authentication. When set, clients
+  must authenticate before executing commands: `redis-cli -a <password> -p 6380`.
+  Default: no auth required (all commands accessible without authentication).
 - `DBSTRIKE_SYNC=0` — skip WAL entirely; writes apply directly to sharded maps with no
   fsync, no flusher round-trip. Reads still see the write (same process), but crash
   durability is dropped. Default is `true` (fsync every batch). Ideal for sessions,

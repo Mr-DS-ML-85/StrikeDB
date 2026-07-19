@@ -1160,8 +1160,8 @@ kill -9 $SVR; wait 2>/dev/null; true</code></pre>
 // ---- Search ----
 const DOCS = [
   {t:"Introduction — why StrikeDB exists", g:"intro", b:"unified storage substrate, zero external crates, pure rust, single license apache"},
-  {t:"Quick Start — build and serve", g:"install", b:"cargo build, dbstrike binary, DBSTRIKE_WAL, DBSTRIKE_SYNC, redis-cli, bench --tcp --ycsb --chaos, test_dbstrike.py"},
-  {t:"RESP Wire — 40+ Redis commands", g:"wire", b:"RESP PING SET GET DEL MSET MGET INCR KEYS DBSIZE VADD VSEARCH VSEARCHA VSEARCH.MANY VCALIBRATE TSADD TSRANGE TSRANGE.LATEST REDUCE CHECKPOINT SUBSCRIBE PUBLISH MEM RAG CACHE"},
+  {t:"Quick Start — build and serve", g:"install", b:"cargo build, dbstrike binary, DBSTRIKE_WAL, DBSTRIKE_PASS, DBSTRIKE_SYNC, redis-cli, redis-benchmark, bench --tcp --ycsb --chaos, test_dbstrike.py"},
+  {t:"RESP Wire — 40+ Redis commands", g:"wire", b:"RESP PING SET GET DEL MSET MGET INCR KEYS DBSIZE VADD VSEARCH VSEARCHA VSEARCH.MANY VCALIBRATE TSADD TSRANGE TSRANGE.LATEST REDUCE CHECKPOINT SUBSCRIBE PUBLISH MEM RAG CACHE AUTH ACL"},
   {t:"Unified Substrate — MVCC + WAL", g:"substrate", b:"MVCC, write ahead log, snapshot isolation, optimistic concurrency, 32 shards, hash-tag routing, group commit"},
   {t:"Views — KV, Table, Vector, Time-series", g:"views", b:"key value, relational, HNSW, INT8 quantization, f32 rerank, AVX2 SIMD, filtered ANN, TSRANGE.LATEST, hash-tag, TSADD.F"},
   {t:"Speed of Light — fix SpacetimeDB stall", g:"speed", b:"in-database logic, reducer stall, bulkhead, fuel metering, circuit breaker"},
