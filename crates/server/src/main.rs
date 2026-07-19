@@ -20,10 +20,13 @@
 //!   INFO                                   -> bulk (engine stats)
 //!   QUIT                                   -> OK, closes
 
+mod acl;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+use acl::{AclStore, command_category};
 use compute::{counter_reducer, vm::{Instr, Program}, ReducerResult, ReducerRuntime};
 use consensus::{hlc::Hlc, crdt::{GCounter, LwwRegister, PnCounter}};
 use mitm::CacheDebugger;
@@ -58,6 +61,8 @@ struct Db {
     /// Current quantization mode for the vector index (per-process; the
     /// in-memory HNSW holds it and it is not persisted — see `VSETQUANT`).
     quant_mode: Mutex<views::QuantMode>,
+    /// ACL store — manages users, passwords, and command permissions.
+    acl: Arc<AclStore>,
 }
 
 /// In-memory store of all CRDTs, keyed by name. Each variant is merge-able.
@@ -70,6 +75,7 @@ struct ConsensusStore {
 fn main() -> std::io::Result<()> {
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:6380".to_string());
     let data_path = std::env::var("DBSTRIKE_WAL").unwrap_or_else(|_| "dbstrike.wal".to_string());
+    let requirepass = std::env::var("DBSTRIKE_PASS").ok();
 
     let engine = Engine::open(&data_path)?;
     let reactive = Reactive::attach(&engine);
@@ -80,6 +86,7 @@ fn main() -> std::io::Result<()> {
     let rag = Rag::open(Arc::clone(&engine));
     let cache = CacheDebugger::new(Arc::clone(&engine), 4096);
     let memory = TieredMemory::new(300);
+    let acl = AclStore::new(requirepass.clone());
 
     let db = Arc::new(Db {
         engine,
@@ -99,6 +106,7 @@ fn main() -> std::io::Result<()> {
         }),
         hlc: Hlc::new(),
         quant_mode: Mutex::new(views::QuantMode::Int8),
+        acl,
     });
 
     let listener = TcpListener::bind(&addr)?;
@@ -106,9 +114,10 @@ fn main() -> std::io::Result<()> {
     // kernel dropping SYNs; the real ceiling is the per-process fd limit
     // (ulimit -n), which must be raised on the host for very high -c.
     let _ = listener.set_nonblocking(false);
-    println!("DB-Strike listening on {addr} (RESP wire), WAL={data_path}");
+    let auth_msg = if requirepass.is_some() { " (AUTH required)" } else { "" };
+    println!("DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}");
     println!("One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug");
-    println!("Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN");
+    println!("Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL");
 
     // Rate-limit accept-error logging: under EMFILE the accept loop would
     // otherwise spew thousands of identical lines per second. Print at most
@@ -169,6 +178,13 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
     // clearer and just as fast.
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut tmp = [0u8; 32 * 1024];
+    // ACL: track which user this connection is authenticated as.
+    // If no requirepass, default user is pre-authenticated.
+    let mut current_user: String = if db.acl.requires_auth() {
+        String::new() // not authenticated yet
+    } else {
+        "default".to_string()
+    };
 
     loop {
         // Block until we have SOMETHING to parse (or the client closes).
@@ -214,6 +230,36 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
         while i < cmds.len() {
             let name = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
             let args = &cmds[i][1..];
+
+            // ── ACL: handle AUTH/ACL before permission check ──────────
+            if name == "AUTH" {
+                let resp = dispatch_auth(&db, args, &mut current_user);
+                write_resp_buf(&mut out, &resp)?;
+                if name == "QUIT" { quit = true; break; }
+                i += 1;
+                continue;
+            }
+            if name == "ACL" {
+                let resp = dispatch_acl(&db, args, &current_user);
+                write_resp_buf(&mut out, &resp)?;
+                i += 1;
+                continue;
+            }
+
+            // ── ACL: permission check ─────────────────────────────────
+            if db.acl.requires_auth() && current_user.is_empty() {
+                write_resp_buf(&mut out, &err("NOAUTH Authentication required"))?;
+                i += 1;
+                continue;
+            }
+            if !current_user.is_empty() {
+                let cat = command_category(&name);
+                if !db.acl.can_command(&current_user, &name, cat) {
+                    write_resp_buf(&mut out, &err("ERR permission denied"))?;
+                    i += 1;
+                    continue;
+                }
+            }
 
             // SUBSCRIBE hijacks the connection AFTER we finish the current
             // batch (need to write acks + stream events, no more parsing).
@@ -488,6 +534,145 @@ fn derive_attr_and_sparse(vec: &[f32], n_buckets: u32, w: usize) -> (u32, Vec<(u
     idxs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let sparse: Vec<(u32, f32)> = idxs.iter().take(w).map(|(j, v)| (*j as u32, *v)).collect();
     (attr, sparse)
+}
+
+/// Handle AUTH command: `AUTH password` or `AUTH username password`.
+/// Updates `current_user` on success.
+fn dispatch_auth(db: &Db, args: &[Vec<u8>], current_user: &mut String) -> Resp {
+    match args.len() {
+        1 => {
+            // AUTH password — authenticate as default user.
+            let raw = String::from_utf8_lossy(&args[0]);
+            let password = raw.strip_prefix('>').unwrap_or(&raw);
+            if db.acl.auth_default(password) {
+                *current_user = "default".to_string();
+                db.acl.set_user_enabled("default", true);
+                Resp::Simple("OK".into())
+            } else {
+                err("ERR invalid password")
+            }
+        }
+        2 => {
+            // AUTH username password — authenticate as specific user.
+            let username = String::from_utf8_lossy(&args[0]);
+            let raw = String::from_utf8_lossy(&args[1]);
+            let password = raw.strip_prefix('>').unwrap_or(&raw);
+            if db.acl.auth_user(&username, password) {
+                *current_user = username.to_string();
+                // Enable the user after successful auth so commands work.
+                db.acl.set_user_enabled(&username, true);
+                Resp::Simple("OK".into())
+            } else {
+                err("ERR invalid username or password")
+            }
+        }
+        _ => err("AUTH requires a password"),
+    }
+}
+
+/// Handle ACL command: `ACL subcommand [args...]`.
+fn dispatch_acl(db: &Db, args: &[Vec<u8>], current_user: &str) -> Resp {
+    if args.is_empty() {
+        return err("ACL requires a subcommand");
+    }
+    let sub = String::from_utf8_lossy(&args[0]).to_uppercase();
+    match sub.as_str() {
+        "WHOAMI" => Resp::Bulk(current_user.as_bytes().to_vec()),
+        "LIST" => {
+            let users = db.acl.list_users();
+            Resp::Array(users.into_iter().map(|u| Resp::Bulk(u.into_bytes())).collect())
+        }
+        "SETUSER" => {
+            if args.len() < 2 {
+                return err("ACL SETUSER requires a username");
+            }
+            let username = String::from_utf8_lossy(&args[1]).to_string();
+            // Parse optional flags: >password, on, off, ~key, +command, +@category, -@category
+            let mut password: Option<String> = None;
+            let mut enabled: Option<bool> = None;
+            let mut categories = Vec::new();
+            let mut key_patterns = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                let token = String::from_utf8_lossy(&args[i]).to_string();
+                if token.starts_with('>') {
+                    // >password — set password
+                    password = Some(token[1..].to_string());
+                } else if token == "on" {
+                    enabled = Some(true);
+                } else if token == "off" {
+                    enabled = Some(false);
+                } else if token.starts_with('~') {
+                    // ~pattern — key pattern
+                    key_patterns.push(token[1..].to_string());
+                } else if token.starts_with('+') {
+                    // +command or +@category
+                    let rest = &token[1..];
+                    if rest.starts_with('@') {
+                        if let Some(cat) = acl::PermCategory::from_str(&rest[1..]) {
+                            categories.push(cat);
+                        }
+                    }
+                    // Individual command permissions not yet implemented.
+                } else if token.starts_with('-') {
+                    // -@category — remove category (not yet implemented)
+                } else if token == "reset" {
+                    // Reset user to defaults.
+                    categories.clear();
+                    key_patterns.clear();
+                }
+                i += 1;
+            }
+            // Apply changes.
+            if let Some(pw) = password {
+                db.acl.set_user_password(&username, &pw);
+            }
+            if let Some(en) = enabled {
+                db.acl.set_user_enabled(&username, en);
+            }
+            if !categories.is_empty() {
+                db.acl.set_user_categories(&username, categories);
+            }
+            Resp::Simple("OK".into())
+        }
+        "GETUSER" => {
+            if args.len() < 2 {
+                return err("ACL GETUSER requires a username");
+            }
+            let username = String::from_utf8_lossy(&args[1]);
+            match db.acl.get_user_info(&username) {
+                Some(info) => {
+                    // Parse the info string into a RESP array of alternating key/value.
+                    let parts: Vec<&str> = info.split_whitespace().collect();
+                    let mut out = Vec::new();
+                    let mut j = 0;
+                    while j + 1 < parts.len() {
+                        out.push(Resp::Bulk(parts[j].as_bytes().to_vec()));
+                        out.push(Resp::Bulk(parts[j + 1].as_bytes().to_vec()));
+                        j += 2;
+                    }
+                    Resp::Array(out)
+                }
+                None => Resp::Nil,
+            }
+        }
+        "DELUSER" => {
+            if args.len() < 2 {
+                return err("ACL DELUSER requires a username");
+            }
+            let username = String::from_utf8_lossy(&args[1]);
+            if db.acl.del_user(&username) {
+                Resp::Int(1)
+            } else {
+                Resp::Int(0)
+            }
+        }
+        "SAVE" | "LOAD" => {
+            // In-memory only for now — reply OK.
+            Resp::Simple("OK".into())
+        }
+        _ => err("ACL subcommand not supported (USE WHOAMI LIST SETUSER GETUSER DELUSER SAVE LOAD)"),
+    }
 }
 
 fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {

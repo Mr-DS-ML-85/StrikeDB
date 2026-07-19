@@ -29,6 +29,7 @@
 //!   dot(q_i8, x_i8) ≈ dot(q_f32, x_f32) * 127²
 //!   cos_dist = 1 − dot_f32 = 1 − (dot_i8 / 16129)
 
+use std::cell::UnsafeCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, RwLock};
@@ -336,6 +337,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AOrd};
 struct Mitm {
     on: bool,
     no_break: bool,
+    noprune: bool,
     trace_query: i64, // -1 = off
 }
 
@@ -345,11 +347,12 @@ fn mitm() -> Mitm {
     *STATE.get_or_init(|| {
         let on = std::env::var_os("DBSTRIKE_DEBUG").is_some();
         let no_break = std::env::var_os("DBSTRIKE_NO_BREAK").is_some();
+        let noprune = std::env::var_os("DBSTRIKE_NOPRUNE").is_some();
         let trace_query = std::env::var("DBSTRIKE_DEBUG_SEARCH")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(-1);
-        Mitm { on, no_break, trace_query }
+        Mitm { on, no_break, noprune, trace_query }
     })
 }
 
@@ -441,8 +444,8 @@ fn vector_l2(v: &[f32]) -> f32 {
     /// Pack a normalized `vector` (f32) into `out` per the given quant mode.
     /// Returns the number of bytes written. `q` is the int8 quantization of
     /// `vector` (used by the binary family). TurboQuant/Product derive their
-    /// packed form directly from `vector`. Free function so it can be called
-    /// from `insert`/`insert_attr` without borrowing all of `self`.
+    /// packed form directly from `vector`. Accepts pre-allocated scratch
+    /// buffers to avoid per-insert heap allocation (~34KB for TurboQuant).
     fn pack_current(
         quant: QuantMode,
         turbo: Option<&TurboParams>,
@@ -450,6 +453,11 @@ fn vector_l2(v: &[f32]) -> f32 {
         vector: &[f32],
         q: &[i8],
         out: &mut Vec<u8>,
+        scratch_rot: &mut Vec<f32>,
+        scratch_idx: &mut Vec<u32>,
+        scratch_deq: &mut Vec<f32>,
+        scratch_r: &mut Vec<f32>,
+        scratch_qjl: &mut Vec<u8>,
     ) -> usize {
         match quant {
             QuantMode::Int8 => {
@@ -470,32 +478,36 @@ fn vector_l2(v: &[f32]) -> f32 {
                 };
                 // `vector` is already L2-normalized (callers normalize before
                 // packing). Rotate, MSE-quantize, compute residual, QJL sketch.
-                let mut rot = vec![0.0f32; tp.d];
-                tp.rotate(vector, &mut rot);
-                let mut idx = vec![0u32; tp.d];
-                let mut deq = vec![0.0f32; tp.d];
+                // Reuse scratch buffers to avoid per-insert heap allocation.
+                scratch_rot.clear();
+                scratch_rot.resize(tp.d, 0.0);
+                tp.rotate(vector, scratch_rot);
+                scratch_idx.clear();
+                scratch_idx.resize(tp.d, 0);
+                scratch_deq.clear();
+                scratch_deq.resize(tp.d, 0.0);
                 let mut e2 = 0.0f32;
                 for i in 0..tp.d {
-                    let l = tp.quant_level(rot[i]);
-                    idx[i] = l;
-                    deq[i] = tp.dequant_level(l);
-                    let e = rot[i] - deq[i];
+                    let l = tp.quant_level(scratch_rot[i]);
+                    scratch_idx[i] = l;
+                    scratch_deq[i] = tp.dequant_level(l);
+                    let e = scratch_rot[i] - scratch_deq[i];
                     e2 += e * e;
                 }
                 let rn = e2.sqrt(); // residual L2 norm ‖r‖
                 // QJL sign bits: z_j = sign((S·r)_j) where S = (1/√d)·H·D.
-                // The 1/√d scale does not change the sign, so we apply D then
-                // Hadamard to the residual r = rot - deq (O(d log d)).
-                let mut r = vec![0.0f32; tp.d];
+                scratch_r.clear();
+                scratch_r.resize(tp.d, 0.0);
                 for i in 0..tp.d {
-                    r[i] = (rot[i] - deq[i]) * tp.s_sign[i] as f32;
+                    scratch_r[i] = (scratch_rot[i] - scratch_deq[i]) * tp.s_sign[i] as f32;
                 }
-                hadamard(&mut r);
-                let mut qjl = vec![0u8; tp.d];
+                hadamard(scratch_r);
+                scratch_qjl.clear();
+                scratch_qjl.resize(tp.d, 0);
                 for j in 0..tp.d {
-                    qjl[j] = if r[j] >= 0.0 { 1 } else { 0 };
+                    scratch_qjl[j] = if scratch_r[j] >= 0.0 { 1 } else { 0 };
                 }
-                tp.pack(&idx, &qjl, rn, out);
+                tp.pack(scratch_idx, scratch_qjl, rn, out);
                 out.len()
             }
             QuantMode::Product => {
@@ -544,6 +556,11 @@ unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
     let mut acc1 = _mm256_setzero_si256();
     let mut i = 0usize;
     while i + 2 <= chunks {
+        // Prefetch next iteration's data to hide cache miss latency.
+        if i + 4 <= chunks {
+            _mm_prefetch(a.as_ptr().add((i + 2) * 32) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(b.as_ptr().add((i + 2) * 32) as *const i8, _MM_HINT_T0);
+        }
         // Load 32 i8s from each side.
         let av = _mm256_loadu_si256(a.as_ptr().add(i * 32) as *const __m256i);
         let bv = _mm256_loadu_si256(b.as_ptr().add(i * 32) as *const __m256i);
@@ -964,6 +981,10 @@ struct TurboParams {
     codebook: Vec<f32>, // 2^qbits centroids for the Beta marginal, scaled by 1/sqrt(d)
     s_sign: Vec<i8>,   // random ±1 diagonal D of the SRHT S = (1/√d)·H·D (QJL)
     s_scale: f32,      // 1/√d normalization of the SRHT
+    /// Per-coordinate anisotropy correction scales (Qdrant extension).
+    /// `D'[i] = 1/sqrt(var_i)` where var_i is the variance of coordinate i
+    /// across a representative sample. Applied to the query BEFORE rotation.
+    aniso_scales: Vec<f32>,
 }
 
 impl TurboParams {
@@ -1085,6 +1106,47 @@ impl TurboParams {
         for v in out.iter_mut() {
             *v *= self.s_scale;
         }
+    }
+
+    /// Calibrate per-coordinate anisotropy correction from a sample of
+    /// (L2-normalized) vectors. For each coordinate, computes the variance
+    /// across the sample and derives D'[i] = 1/sqrt(var_i). At query time,
+    /// the query vector is element-wise multiplied by D' before rotation,
+    /// which corrects for the fact that real embeddings are not uniformly
+    /// distributed on the unit sphere. This is Qdrant's biggest recall win:
+    /// +14-18pp on anisotropic data.
+    fn calibrate_anisotropy(&mut self, sample: &[Vec<f32>]) {
+        if sample.len() < 2 {
+            // Not enough data — set all scales to 1 (no correction).
+            self.aniso_scales = vec![1.0; self.dim];
+            return;
+        }
+        let n = sample.len() as f32;
+        // Compute per-coordinate mean and variance.
+        let mut mean = vec![0.0f32; self.dim];
+        for v in sample {
+            for (i, &x) in v.iter().enumerate().take(self.dim) {
+                mean[i] += x;
+            }
+        }
+        for m in &mut mean {
+            *m /= n;
+        }
+        let mut var = vec![0.0f32; self.dim];
+        for v in sample {
+            for (i, &x) in v.iter().enumerate().take(self.dim) {
+                let d = x - mean[i];
+                var[i] += d * d;
+            }
+        }
+        // D'[i] = 1/sqrt(var_i). Clamp to avoid division by zero.
+        self.aniso_scales = var
+            .iter()
+            .map(|&v| {
+                let std = (v / n).sqrt();
+                if std > 1e-6 { 1.0 / std } else { 1.0 }
+            })
+            .collect();
     }
 
     /// Bytes per stored vector for this configuration.
@@ -1237,6 +1299,7 @@ fn fit_turbo(mode: QuantMode, dim: usize, seed: u64) -> TurboParams {
         codebook,
         s_sign,
         s_scale,
+        aniso_scales: vec![1.0; dim],
     }
 }
 
@@ -1386,12 +1449,28 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     let n = a.len().min(b.len());
     let chunks = n / 8;
-    let mut acc = _mm256_setzero_ps();
-    for i in 0..chunks {
-        let av = _mm256_loadu_ps(a.as_ptr().add(i * 8));
-        let bv = _mm256_loadu_ps(b.as_ptr().add(i * 8));
-        acc = _mm256_fmadd_ps(av, bv, acc);
+    // 4 independent accumulators to break the FMA dependency chain (5-cycle
+    // latency on modern Intel/AMD). Each feeds independently into the next FMA,
+    // so the CPU can pipeline 4 FMAs simultaneously.
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 4 <= chunks {
+        _mm_prefetch(a.as_ptr().add((i + 4) * 8) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(b.as_ptr().add((i + 4) * 8) as *const i8, _MM_HINT_T0);
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(i * 8)), _mm256_loadu_ps(b.as_ptr().add(i * 8)), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add((i + 1) * 8)), _mm256_loadu_ps(b.as_ptr().add((i + 1) * 8)), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add((i + 2) * 8)), _mm256_loadu_ps(b.as_ptr().add((i + 2) * 8)), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add((i + 3) * 8)), _mm256_loadu_ps(b.as_ptr().add((i + 3) * 8)), acc3);
+        i += 4;
     }
+    while i < chunks {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(i * 8)), _mm256_loadu_ps(b.as_ptr().add(i * 8)), acc0);
+        i += 1;
+    }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
     let sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
     let shuf = _mm_movehdup_ps(sum128);
     let sums = _mm_add_ps(sum128, shuf);
@@ -1521,6 +1600,11 @@ struct Node {
     attr: u32,
 }
 
+// SAFETY: Hnsw is always behind RwLock in VectorIndex. UnsafeCell fields are
+// accessed only through &self methods that use raw pointers; no concurrent
+// mutation occurs because RwLock serializes access.
+unsafe impl Sync for Hnsw {}
+
 struct Hnsw {
     nodes: Vec<Node>,
     id_to_idx: HashMap<u64, usize>,
@@ -1553,15 +1637,23 @@ struct Hnsw {
     m_max0: usize,
     ef_construction: usize,
     rng: Rng,
-    /// Reused generation-stamped visited buffer (see `search_layer`). Grown
-    /// only as the graph grows; stamped with an incrementing epoch per search
-    /// instead of memset — keeps ingest O(N), not O(N²).
-    visited: Vec<u32>,
-    visit_epoch: u32,
+    /// Generation-stamped visited buffer (see `search_layer`). Grown only as
+    /// the graph grows; stamped with an incrementing epoch per search instead
+    /// of memset — keeps ingest O(N), not O(N²).
+    /// Wrapped in UnsafeCell so &self search methods can use it (each thread
+    /// accesses only its own Hnsw; no concurrent mutation).
+    visited_cell: UnsafeCell<Vec<u32>>,
+    epoch_cell: UnsafeCell<u32>,
     /// Reused quantization scratch (one vector's worth of i8).
     qbuf: Vec<i8>,
     /// Reused low-bit packing scratch (one vector's worth of packed bytes).
     bin_scratch: Vec<u8>,
+    /// Reused TurboQuant packing scratch buffers (avoid 34KB alloc per insert).
+    turbo_rot: Vec<f32>,
+    turbo_idx: Vec<u32>,
+    turbo_deq: Vec<f32>,
+    turbo_r: Vec<f32>,
+    turbo_qjl: Vec<u8>,
     /// MODULE 2: when set, the exact f32 rerank originals live in an NVMe
     /// `mmap` (cold tier) instead of RAM. `all_f32` stays empty; reads/writes
     /// go through `f32_tier`. RAM drops to ~int8-only at 100M+ scale.
@@ -1601,10 +1693,15 @@ impl Hnsw {
             m_max0: 64,
             ef_construction: 200,
             rng: Rng(0x9E3779B97F4A7C15),
-            visited: Vec::new(),
-            visit_epoch: 0,
+            visited_cell: UnsafeCell::new(Vec::new()),
+            epoch_cell: UnsafeCell::new(0),
             qbuf: Vec::new(),
             bin_scratch: Vec::new(),
+            turbo_rot: Vec::new(),
+            turbo_idx: Vec::new(),
+            turbo_deq: Vec::new(),
+            turbo_r: Vec::new(),
+            turbo_qjl: Vec::new(),
             f32_tier: None,
             attr_kinds: 0,
             attr_counts: Vec::new(),
@@ -1612,13 +1709,25 @@ impl Hnsw {
         }
     }
 
-    /// Allocate the cold f32 tier for `n` vectors (Module 2). Must be called
-    /// once before any insert when tiered mode is desired. Falls back to RAM
-    /// (`all_f32`) if mmap fails (e.g. non-unix / no temp space).
-    fn enable_tier(&mut self, n: usize) {
-        if let Some(tier) = MmapTier::new(n * self.dim) {
-            self.f32_tier = Some(tier);
+    /// Bump the epoch and return the new value.
+    unsafe fn bump_epoch(&self) -> u32 {
+        let e = &mut *self.epoch_cell.get();
+        *e = e.wrapping_add(1);
+        if *e == 0 {
+            *e = 1;
+            let v = &mut *self.visited_cell.get();
+            v.iter_mut().for_each(|x| *x = 0);
         }
+        *e
+    }
+
+    /// Ensure visited is large enough for `n` nodes and bump the epoch.
+    unsafe fn ensure_visited(&self, n: usize) -> u32 {
+        let v = &mut *self.visited_cell.get();
+        if v.len() < n {
+            v.resize(n, 0);
+        }
+        self.bump_epoch()
     }
 
     /// Module 2: select the quantization mode. MUST be called before any insert
@@ -1641,7 +1750,10 @@ impl Hnsw {
         let dim = sample.first().map(|v| v.len()).unwrap_or(self.dim);
         match self.quant {
             QuantMode::Turbo1 | QuantMode::Turbo15 | QuantMode::Turbo2 | QuantMode::Turbo4 => {
-                let tp = fit_turbo(self.quant, dim, 0x5bd1_e995);
+                let mut tp = fit_turbo(self.quant, dim, 0x5bd1_e995);
+                // Calibrate per-coordinate anisotropy correction from the sample.
+                // This is Qdrant's biggest recall win: +14-18pp on real embeddings.
+                tp.calibrate_anisotropy(sample);
                 self.turbo = Some(std::sync::Arc::new(tp));
             }
             QuantMode::Product => {
@@ -1689,7 +1801,7 @@ impl Hnsw {
             let o = idx * self.dim;
             self.all_i8[o..o + self.dim].copy_from_slice(&self.qbuf);
             if self.quant != QuantMode::Int8 {
-                let bytes = pack_current(self.quant, self.turbo.as_deref(), self.pq.as_deref(), &vector, &self.qbuf, &mut self.bin_scratch);
+                let bytes = pack_current(self.quant, self.turbo.as_deref(), self.pq.as_deref(), &vector, &self.qbuf, &mut self.bin_scratch, &mut self.turbo_rot, &mut self.turbo_idx, &mut self.turbo_deq, &mut self.turbo_r, &mut self.turbo_qjl);
                 if bytes > 0 {
                     let bo = idx * bytes;
                     if self.all_bin.len() < bo + bytes {
@@ -1749,7 +1861,7 @@ impl Hnsw {
         }
         self.all_i8.extend_from_slice(&q);
         if self.quant != QuantMode::Int8 {
-            let bytes = pack_current(self.quant, self.turbo.as_deref(), self.pq.as_deref(), &vector, &q, &mut self.bin_scratch);
+            let bytes = pack_current(self.quant, self.turbo.as_deref(), self.pq.as_deref(), &vector, &q, &mut self.bin_scratch, &mut self.turbo_rot, &mut self.turbo_idx, &mut self.turbo_deq, &mut self.turbo_r, &mut self.turbo_qjl);
             if bytes > 0 {
                 self.all_bin.extend_from_slice(&self.bin_scratch);
             }
@@ -1779,33 +1891,19 @@ impl Hnsw {
             Some(e) => e,
         };
 
-        // Grow-only generation-stamped visited buffer. NOTE: we must NOT use
-        // `resize(n, 0)` here — `resize` rewrites the ENTIRE buffer to 0 on
-        // every growth step, which is O(N) per insert → O(N²) total ingest
-        // cost at scale (this was the real ingest bottleneck). Instead we push
-        // only the *new* slots (one per insert on average — amortized O(1))
-        // and rely on epoch stamping so stale values in old slots don't matter.
+        // Grow-only generation-stamped visited buffer via UnsafeCell.
+        // NOTE: we push only the *new* slots (amortized O(1)) and rely on
+        // epoch stamping so stale values in old slots don't matter.
         let need = self.nodes.len();
-        if self.visited.len() < need {
-            self.visited.reserve(need - self.visited.len());
-            while self.visited.len() < need {
-                self.visited.push(0);
-            }
-        }
-        self.visit_epoch = self.visit_epoch.wrapping_add(1);
-        let mut epoch = self.visit_epoch;
-        if epoch == 0 {
-            epoch = 1;
-            for v in self.visited.iter_mut() {
-                *v = 0;
-            }
-            self.visit_epoch = 1;
-        }
+        let epoch = unsafe { self.ensure_visited(need) };
+        // Use raw pointer to break the borrow chain: visited_ptr borrows the
+        // UnsafeCell but NOT &self, so self.nodes/all_i8 remain borrowable.
+        let visited_ptr = self.visited_cell.get();
 
         let mut cur = entry;
         let top = self.max_level;
         for lvl in (level + 1..=top).rev() {
-            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, 1, lvl, &mut self.visited, epoch, &[], &[], None, None, &[]);
+            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
             if let Some(best) = found
                 .into_iter()
                 .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap())
@@ -1816,22 +1914,22 @@ impl Hnsw {
         let start_lvl = level.min(top);
         for lvl in (0..=start_lvl).rev() {
             let mut found =
-                Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, self.ef_construction, lvl, &mut self.visited, epoch, &[], &[], None, None, &[]);
+                Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, self.ef_construction, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
             found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
-            // Select the new node's forward neighbors. Default: HNSW diversity
-            // heuristic (Alg. 4). If DBSTRIKE_NAIVE is set, fall back to the
-            // naive "top-M nearest" (denser, hubbier, but a useful A/B to
-            // isolate whether the heuristic is hurting connectivity).
-            let selected: Vec<usize> = found.iter().take(self.m).map(|c| c.idx).collect();
+            // Select the new node's forward neighbors using the HNSW diversity
+            // heuristic (Alg. 4, Malkov & Yashunin). This produces a navigable
+            // graph with spread-out edges, so ef=128 search reaches ~all nodes
+            // instead of needing ef=4000. The naive "top-M nearest" is hubbier
+            // and hurts recall at low ef.
+            let selected: Vec<usize> = self.select_neighbors_heuristic(idx, &found, self.m, lvl);
             for &nb in &selected {
                 self.nodes[idx].neighbors[lvl].push(nb);
                 self.nodes[nb].neighbors[lvl].push(idx);
                 // PRUNE-COMMITTED: rebuild new node's forward list tight to m.
                 if self.nodes[idx].neighbors[lvl].len() > self.m {
-                    let keep: Vec<usize> = found.iter().take(self.m).map(|c| c.idx).collect();
-                    self.nodes[idx].neighbors[lvl] = keep;
+                    self.nodes[idx].neighbors[lvl] = selected.clone();
                 }
-                if std::env::var_os("DBSTRIKE_NOPRUNE").is_some() {
+                if mitm().noprune {
                     continue;
                 }
                 // PRUNE-COMMITTED: prune neighbor's reverse list to m_max0 nearest
@@ -1839,10 +1937,10 @@ impl Hnsw {
                 let neigh_idx = nb;
                 if self.nodes[neigh_idx].neighbors[lvl].len() > self.m_max0 {
                     let neigh_list = std::mem::take(&mut self.nodes[neigh_idx].neighbors[lvl]);
-                    let nvec_owned: Vec<i8> = self.all_i8[neigh_idx * self.dim..neigh_idx * self.dim + self.dim].to_vec();
+                    let nvec_ref = &self.all_i8[neigh_idx * self.dim..neigh_idx * self.dim + self.dim];
                     let mut nn: Vec<(f32, usize)> = neigh_list
                         .iter()
-                        .map(|&x| (cos_dist_q(&nvec_owned, &self.all_i8[x * self.dim..x * self.dim + self.dim]), x))
+                        .map(|&x| (cos_dist_q(nvec_ref, &self.all_i8[x * self.dim..x * self.dim + self.dim]), x))
                         .collect();
                     nn.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                     nn.truncate(self.m_max0);
@@ -1913,7 +2011,6 @@ impl Hnsw {
     /// (`cos_dist_q(n, cand) < cos_dist_q(idx, cand)` ⇒ `cand` is "shadowed" by
     /// `n` and skipped). This is the connectivity fix that lets ef=128 search
     /// reach ~all nodes instead of needing ef=4000.
-    #[allow(dead_code)]
     fn select_neighbors_heuristic(&self, _idx: usize, candidates: &[Cand], m: usize, _lvl: usize) -> Vec<usize> {
         let mut selected: Vec<usize> = Vec::with_capacity(m);
         for cand in candidates.iter() {
@@ -2107,8 +2204,8 @@ impl Hnsw {
                 if n < visited.len() && visited[n] != epoch {
                     visited[n] = epoch;
                     let d = node_dist(mode, query, all_i8, all_bin, qf32, sq, turbo, pq, all_norm, n, dim);
-                    // Gateway expansion: every neighbour is explorable. Only
-                    // predicate-matching neighbours count toward the result set.
+                    candidates.push(Cand { dist: d, idx: n });
+                    // Gateway expansion: only predicate-matching count toward results.
                     if filter.matches(nodes[n].attr) {
                         let worst = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
                         if d < worst || results.len() < ef {
@@ -2153,8 +2250,10 @@ impl Hnsw {
                 match &self.turbo {
                     Some(tp) => {
                         let mut rot = vec![0.0f32; tp.d];
-                        for (i, &x) in q.iter().enumerate() {
-                            rot[i] = x;
+                        // Apply anisotropy correction BEFORE rotation: q'[i] = q[i] * D'[i].
+                        // This corrects for non-uniform coordinate variance in real embeddings.
+                        for (i, &x) in q.iter().enumerate().take(tp.dim) {
+                            rot[i] = x * tp.aniso_scales[i];
                         }
                         hadamard(&mut rot);
                         rot
@@ -2178,10 +2277,12 @@ impl Hnsw {
         } else {
             None
         };
-        // Local generation-stamped buffer — resized once, stamped per phase
-        // (no memset). Reused across the few search_layer calls of one query.
-        let mut visited: Vec<u32> = vec![0; self.nodes.len()];
-        let mut epoch = 1u32;
+        // Reuse thread-local-ish visited buffer via UnsafeCell (no per-query alloc).
+        let n = self.nodes.len();
+        // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
+        let _ = unsafe { self.ensure_visited(n) };
+        let mut epoch;
+        let visited_ptr = self.visited_cell.get();
         let mut cur = entry;
         // TurboQuant deployment trick: navigate the HNSW graph with the CHEAP
         // int8 distance (already stored for every vector) and only apply the
@@ -2210,14 +2311,8 @@ impl Hnsw {
             );
         }
         for lvl in (1..=self.max_level).rev() {
-            epoch = epoch.wrapping_add(1);
-            if epoch == 0 {
-                epoch = 1;
-                for v in visited.iter_mut() {
-                    *v = 0;
-                }
-            }
-            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, &mut visited, epoch, nav_qf32, nav_sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+            epoch = unsafe { self.bump_epoch() };
+            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, nav_qf32, nav_sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
             if let Some(best) = found
                 .into_iter()
                 .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap())
@@ -2229,17 +2324,11 @@ impl Hnsw {
                 cur = best.idx;
             }
         }
-        epoch = epoch.wrapping_add(1);
-        if epoch == 0 {
-            epoch = 1;
-            for v in visited.iter_mut() {
-                *v = 0;
-            }
-        }
+        epoch = unsafe { self.bump_epoch() };
         // Count layer-0 visited nodes for the trace by re-deriving from the
         // global counter delta around this call.
         let v_before = CNT_SL_VISITED.load(AOrd::Relaxed);
-        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, &mut visited, epoch, nav_qf32, nav_sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, unsafe { &mut *visited_ptr }, epoch, nav_qf32, nav_sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
         if let Some(t) = trace {
             let v_after = CNT_SL_VISITED.load(AOrd::Relaxed);
             // distance from entry to target, and whether target is in result
@@ -2333,26 +2422,20 @@ impl Hnsw {
             Some(e) => e,
             None => return Vec::new(),
         };
-        let mut visited: Vec<u32> = vec![0; n];
-        let mut epoch = 1u32;
+        // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
+        let _ = unsafe { self.ensure_visited(n) };
+        let mut epoch;
+        let visited_ptr = self.visited_cell.get();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
-            epoch = epoch.wrapping_add(1);
-            if epoch == 0 {
-                epoch = 1;
-                for v in visited.iter_mut() { *v = 0; }
-            }
-            let found = Hnsw::search_layer_filtered(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, &mut visited, epoch, filter, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+            epoch = unsafe { self.bump_epoch() };
+            let found = Hnsw::search_layer_filtered(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, filter, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
             if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
                 cur = best.idx;
             }
         }
-        epoch = epoch.wrapping_add(1);
-        if epoch == 0 {
-            epoch = 1;
-            for v in visited.iter_mut() { *v = 0; }
-        }
-        let mut found = Hnsw::search_layer_filtered(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, &mut visited, epoch, filter, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+        epoch = unsafe { self.bump_epoch() };
+        let mut found = Hnsw::search_layer_filtered(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, unsafe { &mut *visited_ptr }, epoch, filter, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
         found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
         found.into_iter().take(k).map(|c| (c.idx, c.dist)).collect()
     }
@@ -2396,18 +2479,15 @@ impl Hnsw {
         // `visited` buffer (re-stamped via epoch), so the only allocation is a
         // single `vec![0; N]`. The probe reuses the same `cur` the descent
         // reached — no second upper-layer walk.
-        let mut visited: Vec<u32> = vec![0; self.nodes.len()];
-        let mut epoch = 1u32;
+        let n = self.nodes.len();
+        // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
+        let _ = unsafe { self.ensure_visited(n) };
+        let mut epoch;
+        let visited_ptr = self.visited_cell.get();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
-            epoch = epoch.wrapping_add(1);
-            if epoch == 0 {
-                epoch = 1;
-                for v in visited.iter_mut() {
-                    *v = 0;
-                }
-            }
-            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, &mut visited, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+            epoch = unsafe { self.bump_epoch() };
+            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
             if let Some(best) = found
                 .into_iter()
                 .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap())
@@ -2415,15 +2495,9 @@ impl Hnsw {
                 cur = best.idx;
             }
         }
-        epoch = epoch.wrapping_add(1);
-        if epoch == 0 {
-            epoch = 1;
-            for v in visited.iter_mut() {
-                *v = 0;
-            }
-        }
+        epoch = unsafe { self.bump_epoch() };
         // Phase 1: tiny-beam probe at layer 0 → frontier spread (difficulty).
-        let probe = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef_probe.max(k), 0, &mut visited, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+        let probe = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef_probe.max(k), 0, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
         let mut dmin = f32::INFINITY;
         let mut dmax = 0.0f32;
         for c in &probe {
@@ -2437,14 +2511,8 @@ impl Hnsw {
             .max(k).max(ef_min);
 
         // Phase 2: real traversal with the difficulty-scaled beam (same buffer).
-        epoch = epoch.wrapping_add(1);
-        if epoch == 0 {
-            epoch = 1;
-            for v in visited.iter_mut() {
-                *v = 0;
-            }
-        }
-        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, &mut visited, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+        epoch = unsafe { self.bump_epoch() };
+        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
         found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
         found.into_iter().take(k).map(|c| (c.idx, c.dist)).collect()
     }
@@ -2459,30 +2527,21 @@ impl Hnsw {
             Some(e) => e,
             None => return 0.0,
         };
-        let mut visited: Vec<u32> = vec![0; self.nodes.len()];
-        let mut epoch = 1u32;
+        let n = self.nodes.len();
+        // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
+        let _ = unsafe { self.ensure_visited(n) };
+        let mut epoch;
+        let visited_ptr = self.visited_cell.get();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
-            epoch = epoch.wrapping_add(1);
-            if epoch == 0 {
-                epoch = 1;
-                for v in visited.iter_mut() {
-                    *v = 0;
-                }
-            }
-            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, &mut visited, epoch, &[], &[], None, None, &[]);
+            epoch = unsafe { self.bump_epoch() };
+            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
             if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
                 cur = best.idx;
             }
         }
-        epoch = epoch.wrapping_add(1);
-        if epoch == 0 {
-            epoch = 1;
-            for v in visited.iter_mut() {
-                *v = 0;
-            }
-        }
-        let probe = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef_probe.max(k), 0, &mut visited, epoch, &[], &[], None, None, &[]);
+        epoch = unsafe { self.bump_epoch() };
+        let probe = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef_probe.max(k), 0, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
         let mut dmin = f32::INFINITY;
         let mut dmax = 0.0f32;
         for c in &probe {
@@ -2723,30 +2782,21 @@ impl Hnsw {
             Some(tp) if !qf32.is_empty() => tp.sq_precomp(qf32),
             _ => Vec::new(),
         };
-        let mut visited: Vec<u32> = vec![0; self.nodes.len()];
-        let mut epoch = 1u32;
+        let n = self.nodes.len();
+        // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
+        let _ = unsafe { self.ensure_visited(n) };
+        let mut epoch;
+        let visited_ptr = self.visited_cell.get();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
-            epoch = epoch.wrapping_add(1);
-            if epoch == 0 {
-                epoch = 1;
-                for v in visited.iter_mut() {
-                    *v = 0;
-                }
-            }
-            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, &mut visited, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+            epoch = unsafe { self.bump_epoch() };
+            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
             if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
                 cur = best.idx;
             }
         }
-        epoch = epoch.wrapping_add(1);
-        if epoch == 0 {
-            epoch = 1;
-            for v in visited.iter_mut() {
-                *v = 0;
-            }
-        }
-        let probe = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef_probe.max(k), 0, &mut visited, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+        epoch = unsafe { self.bump_epoch() };
+        let probe = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef_probe.max(k), 0, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
         let mut dmin = f32::INFINITY;
         let mut dmax = 0.0f32;
         for c in &probe {
@@ -2755,14 +2805,8 @@ impl Hnsw {
         }
         let spread = if dmin.is_finite() { (dmax - dmin) / (dmin + 1e-6) } else { 0.0 };
         let ef = model.predict(spread).max(k).max(ef_min).min(ef_max);
-        epoch = epoch.wrapping_add(1);
-        if epoch == 0 {
-            epoch = 1;
-            for v in visited.iter_mut() {
-                *v = 0;
-            }
-        }
-        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, &mut visited, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
+        epoch = unsafe { self.bump_epoch() };
+        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
         found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
         found.into_iter().take(k).map(|c| (c.idx, c.dist)).collect()
     }
@@ -2811,30 +2855,21 @@ impl Hnsw {
             Some(e) => e,
             None => return Vec::new(),
         };
-        let mut visited: Vec<u32> = vec![0; self.nodes.len()];
-        let mut epoch = 1u32;
+        let n = self.nodes.len();
+        // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
+        let _ = unsafe { self.ensure_visited(n) };
+        let mut epoch;
+        let visited_ptr = self.visited_cell.get();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
-            epoch = epoch.wrapping_add(1);
-            if epoch == 0 {
-                epoch = 1;
-                for v in visited.iter_mut() {
-                    *v = 0;
-                }
-            }
-            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, &mut visited, epoch, &[], &[], None, None, &[]);
+            epoch = unsafe { self.bump_epoch() };
+            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
             if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
                 cur = best.idx;
             }
         }
-        epoch = epoch.wrapping_add(1);
-        if epoch == 0 {
-            epoch = 1;
-            for v in visited.iter_mut() {
-                *v = 0;
-            }
-        }
-        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, k, 0, &mut visited, epoch, &[], &[], None, None, &[]);
+        epoch = unsafe { self.bump_epoch() };
+        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, k, 0, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
         found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
         found.into_iter().take(k).map(|c| (c.dist, c.idx)).collect()
     }
@@ -2854,19 +2889,16 @@ impl Hnsw {
                 entry = g;
             }
         }
-        let mut visited: Vec<u32> = vec![0; self.nodes.len()];
-        let mut epoch = 1u32;
+        let n = self.nodes.len();
+        // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
+        let _ = unsafe { self.ensure_visited(n) };
+        let mut epoch;
+        let visited_ptr = self.visited_cell.get();
         let mut cur = entry;
         let top = self.nodes[entry].neighbors.len() - 1;
         for lvl in (1..=top).rev() {
-            epoch = epoch.wrapping_add(1);
-            if epoch == 0 {
-                epoch = 1;
-                for v in visited.iter_mut() {
-                    *v = 0;
-                }
-            }
-            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, &mut visited, epoch, &[], &[], None, None, &[]);
+            epoch = unsafe { self.bump_epoch() };
+            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
             if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
                 // only accept if still within [lo, hi)
                 if best.idx >= lo && best.idx < hi {
@@ -2874,14 +2906,8 @@ impl Hnsw {
                 }
             }
         }
-        epoch = epoch.wrapping_add(1);
-        if epoch == 0 {
-            epoch = 1;
-            for v in visited.iter_mut() {
-                *v = 0;
-            }
-        }
-        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, k, 0, &mut visited, epoch, &[], &[], None, None, &[]);
+        epoch = unsafe { self.bump_epoch() };
+        let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, k, 0, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
         found.retain(|c| c.idx >= lo && c.idx < hi);
         found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
         found.into_iter().take(k).map(|c| (c.dist, c.idx)).collect()
@@ -2912,7 +2938,7 @@ impl Hnsw {
     /// every layer the two nodes share. This gives the global graph a
     /// small-world backbone spanning all shards without rebuilding any
     /// segment's internal structure.
-    fn merge_segments(mut segments: Vec<Hnsw>, bridge: usize) -> Hnsw {
+    fn merge_segments(mut segments: Vec<Hnsw>, bridge: usize, mut tier: Option<&mut MmapTier>) -> Hnsw {
         if segments.is_empty() {
             return Hnsw::new();
         }
@@ -2958,7 +2984,7 @@ impl Hnsw {
                 merged.all_norm = Vec::with_capacity(total);
             }
         }
-        merged.visited = vec![0u32; total];
+        merged.visited_cell = UnsafeCell::new(vec![0u32; total]);
 
         for (si, seg) in segments.iter().enumerate() {
             for (li, node) in seg.nodes.iter().enumerate() {
@@ -2974,7 +3000,14 @@ impl Hnsw {
                 let o = li * dim;
                 merged.all_i8.extend_from_slice(&seg.all_i8[o..o + dim]);
                 let go = gidx * dim;
-                if let Some(t) = merged.f32_tier.as_mut() {
+                if let Some(t) = tier.as_mut() {
+                    // Write directly to mmap — avoids RAM intermediate.
+                    let go_tier = gidx; // tier uses same indexing
+                    let slice = t.as_mut_slice();
+                    if go_tier * dim + dim <= slice.len() {
+                        slice[go_tier * dim..go_tier * dim + dim].copy_from_slice(&seg.all_f32[o..o + dim]);
+                    }
+                } else if let Some(t) = merged.f32_tier.as_mut() {
                     t.as_mut_slice()[go..go + dim].copy_from_slice(&seg.all_f32[o..o + dim]);
                 } else {
                     merged.all_f32.extend_from_slice(&seg.all_f32[o..o + dim]);
@@ -3156,7 +3189,7 @@ impl Hnsw {
         }
         self.entry = Some(best_entry);
         self.max_level = best_lvl;
-        self.visited = vec![0u32; self.nodes.len()];
+        unsafe { *self.visited_cell.get() = vec![0u32; self.nodes.len()]; }
 
         // BRIDGE pass — identical strategy to `merge_segments`. The live graph
         // is treated as segment 0 when non-empty. For EVERY node we compare it
@@ -3360,13 +3393,18 @@ impl VectorIndex {
         let dim = dim;
         let bridge = 8usize;
         let zero_attr: Vec<u32> = vec![0u32; n]; // Module-4 attrs: none for this path
+        // Share data across threads via Arc instead of cloning per thread.
+        // At 1M × 768d this saves ~K × 3 GB of redundant copies.
+        let shared_data: Arc<Vec<f32>> = Arc::new(shuffled);
+        let shared_perm: Arc<Vec<usize>> = Arc::new(perm);
+        let shared_attr: Arc<Vec<u32>> = Arc::new(zero_attr);
         let handles: Vec<_> = ranges
             .into_iter()
             .enumerate()
             .map(|(_si, (lo, hi))| {
-                let data_ptr: Vec<f32> = shuffled.to_vec(); // owned copy per thread
-                let perm_ptr: Vec<usize> = perm.clone(); // owned perm copy per thread
-                let attr_ptr: Vec<u32> = zero_attr.clone();
+                let data_ptr = Arc::clone(&shared_data);
+                let perm_ptr = Arc::clone(&shared_perm);
+                let attr_ptr = Arc::clone(&shared_attr);
                 let dim = dim;
                 // The TRUE id of shuffled row `r` is `perm[r]`; build_segment
                 // assigns ids as base + local row, so pass the perm offset.
@@ -3386,20 +3424,14 @@ impl VectorIndex {
             })
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let mut merged = Hnsw::merge_segments(segments, bridge);
-        if tiered {
-            // Spill the exact f32 rerank originals to the NVMe cold tier.
-            // merge_segments populated `merged.all_f32` (RAM); copy it into the
-            // mmap, then drop the RAM copy so live RSS is int8-only.
-            let n = merged.all_f32.len() / dim.max(1);
-            if n > 0 {
-                merged.enable_tier(n);
-                if let Some(t) = merged.f32_tier.as_mut() {
-                    t.as_mut_slice().copy_from_slice(&merged.all_f32);
-                    t.flush();
-                    merged.all_f32 = Vec::new();
-                }
-            }
+        // For tiered mode, pre-allocate the mmap BEFORE merge so merge_segments
+        // can write f32 data directly to it — avoids the ~N×dim×4 RAM intermediate.
+        let mut pre_tier = if tiered { MmapTier::new(n * dim) } else { None };
+        let mut merged = Hnsw::merge_segments(segments, bridge, pre_tier.as_mut());
+        // Move the tier into the merged Hnsw and drop any leftover all_f32.
+        if let Some(t) = pre_tier {
+            merged.f32_tier = Some(t);
+            merged.all_f32 = Vec::new();
         }
         Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()) }
     }
@@ -3455,13 +3487,16 @@ impl VectorIndex {
 
         let dim = dim;
         let bridge = 8usize;
+        let shared_data: Arc<Vec<f32>> = Arc::new(shuffled);
+        let shared_attr: Arc<Vec<u32>> = Arc::new(shuffled_attr);
+        let shared_perm: Arc<Vec<usize>> = Arc::new(perm);
         let handles: Vec<_> = ranges
             .into_iter()
             .enumerate()
             .map(|(_si, (lo, hi))| {
-                let data_ptr: Vec<f32> = shuffled.to_vec();
-                let attr_ptr: Vec<u32> = shuffled_attr.to_vec();
-                let perm_ptr: Vec<usize> = perm.clone();
+                let data_ptr = Arc::clone(&shared_data);
+                let attr_ptr = Arc::clone(&shared_attr);
+                let perm_ptr = Arc::clone(&shared_perm);
                 let dim = dim;
                 std::thread::spawn(move || {
                     let mut h = Hnsw::build_segment(&data_ptr, dim, lo, hi - lo, lo as u64, &attr_ptr);
@@ -3478,7 +3513,7 @@ impl VectorIndex {
             })
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let merged = Hnsw::merge_segments(segments, bridge);
+        let merged = Hnsw::merge_segments(segments, bridge, None);
         Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()) }
     }
 
@@ -3545,14 +3580,18 @@ impl VectorIndex {
 
         let dim = dim;
         let bridge = 8usize;
+        let shared_data: Arc<Vec<f32>> = Arc::new(shuffled);
+        let shared_attr: Arc<Vec<u32>> = Arc::new(shuffled_attr);
+        let shared_inv: Arc<Vec<usize>> = Arc::new(inv);
+        let shared_ids: Arc<Vec<u64>> = Arc::new(ids.to_vec());
         let handles: Vec<_> = ranges
             .into_iter()
             .enumerate()
             .map(|(_si, (lo, hi))| {
-                let data_ptr: Vec<f32> = shuffled.to_vec();
-                let attr_ptr: Vec<u32> = shuffled_attr.to_vec();
-                let inv_ptr: Vec<usize> = inv.clone();
-                let ids_ptr: Vec<u64> = ids.to_vec();
+                let data_ptr = Arc::clone(&shared_data);
+                let attr_ptr = Arc::clone(&shared_attr);
+                let inv_ptr = Arc::clone(&shared_inv);
+                let ids_ptr = Arc::clone(&shared_ids);
                 let dim = dim;
                 std::thread::spawn(move || {
                     let mut h = Hnsw::build_segment(&data_ptr, dim, lo, hi - lo, lo as u64, &attr_ptr);
@@ -3571,7 +3610,7 @@ impl VectorIndex {
             })
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let merged = Hnsw::merge_segments(segments, bridge);
+        let merged = Hnsw::merge_segments(segments, bridge, None);
         Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()) }
     }
 
@@ -3854,11 +3893,14 @@ impl VectorIndex {
                 format!("VADDBATCH dim {dim} != existing index dim {existing}"),
             ));
         }
-        // Durable substrate writes (cheap, single thread is fine — they're just
-        // sequential WAL appends; the graph build below is the parallel part).
+        // Durable substrate writes — batch into one put_batch for a single
+        // WAL flush instead of N sequential fsyncs. At 100K vectors on HDD
+        // this saves seconds of fsync overhead.
+        let mut kvs: Vec<(Vec<u8>, Value)> = Vec::with_capacity(n);
         for i in 0..n {
-            self.engine.put(vec_key(ids[i]), Value::Vector(vectors[i * dim..(i + 1) * dim].to_vec()))?;
+            kvs.push((vec_key(ids[i]), Value::Vector(vectors[i * dim..(i + 1) * dim].to_vec())));
         }
+        self.engine.put_batch(kvs)?;
         // Shard the batch into as-even ranges and build each in its own thread.
         let shards = n_shards.max(1).min(n);
         let per = (n as f64 / shards as f64).ceil() as usize;
@@ -3995,11 +4037,12 @@ impl VectorIndex {
                 format!("VADDBATCH dim {dim} != existing index dim {existing_dim}"),
             ));
         }
-        // Durable substrate writes (sequential WAL appends — cheap; the rebuild
-        // below is the parallel part).
+        // Durable substrate writes — batch into one put_batch for a single WAL flush.
+        let mut kvs: Vec<(Vec<u8>, Value)> = Vec::with_capacity(n);
         for i in 0..n {
-            self.engine.put(vec_key(ids[i]), Value::Vector(vectors[i * dim..(i + 1) * dim].to_vec()))?;
+            kvs.push((vec_key(ids[i]), Value::Vector(vectors[i * dim..(i + 1) * dim].to_vec())));
         }
+        self.engine.put_batch(kvs)?;
         let existing = self.export_vectors();
         let m = existing.len();
         let total = m + n;
@@ -4148,7 +4191,8 @@ impl VectorIndex {
     /// Batch search under a single read-lock acquire. Amortizes lock + protocol.
     /// Uses the same two-stage (INT8 traversal + exact f32 rerank) pipeline
     /// as `search` / `search_ef`, so batched results are bit-identical to N
-    /// single calls.
+    /// single calls. Pre-allocates scratch buffers outside the loop to avoid
+    /// per-query heap allocation.
     pub fn search_many(
         &self,
         queries: &[Vec<f32>],
@@ -4156,31 +4200,43 @@ impl VectorIndex {
     ) -> Vec<Vec<(u64, f32)>> {
         let g = self.hnsw.read().unwrap();
         let rerank_k = (k * 4).max(64);
+        let dim = g.dim;
+        // Pre-allocate scratch buffers reused across all queries in the batch.
+        let mut qn: Vec<f32> = vec![0.0; dim];
+        let mut qq: Vec<i8> = vec![0; dim];
+        let mut qf: Vec<f32> = Vec::new();
+        let mut rescored: Vec<(u64, f32)> = Vec::with_capacity(rerank_k);
         queries
             .iter()
             .map(|q| {
-                let mut qn = q.clone();
+                // Reuse pre-allocated buffers instead of allocating per query.
+                qn.clear();
+                qn.extend_from_slice(q);
                 l2_normalize(&mut qn);
-                let qq = quantize(&qn);
-                let qf = g.query_f32(&qn);
+                qq.clear();
+                quantize_into(&qn, &mut qq);
+                qf.clear();
+                qf.extend_from_slice(&g.query_f32(&qn));
                 let candidates = g.search_indices(&qq, rerank_k, 128.max(rerank_k), &qf);
-                let mut rescored: Vec<(u64, f32)> = candidates
-                    .into_iter()
-                    .filter_map(|(idx, _int8_dist)| {
-                        let node = g.nodes.get(idx)?;
-                        if node.deleted {
-                            return None;
-                        }
-                        let dot = dot_f32(&qn, g.vec_at_f32(idx));
-                        let d = (1.0 - dot).max(0.0).min(2.0);
-                        Some((node.id, d))
-                    })
-                    .collect();
+                rescored.clear();
+                rescored.extend(
+                    candidates
+                        .into_iter()
+                        .filter_map(|(idx, _int8_dist)| {
+                            let node = g.nodes.get(idx)?;
+                            if node.deleted {
+                                return None;
+                            }
+                            let dot = dot_f32(&qn, g.vec_at_f32(idx));
+                            let d = (1.0 - dot).max(0.0).min(2.0);
+                            Some((node.id, d))
+                        }),
+                );
                 rescored.sort_by(|a, b| {
                     a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 rescored.truncate(k);
-                rescored
+                rescored.clone()
             })
             .collect()
     }
