@@ -3442,11 +3442,18 @@ impl VectorIndex {
         }
 
         let dim = dim;
-        let bridge = 16usize; // 16 cross-shard edges per node (target recall 1.000)
-        let zero_attr: Vec<u32> = vec![0u32; n]; // Module-4 attrs: none for this path
-        // INDEX INDIRECTION: each shard reads data[perm[i]] — no shuffled copy.
+        let bridge = 16usize;
+        let zero_attr: Vec<u32> = vec![0u32; n];
         let perm_arc: Arc<Vec<usize>> = Arc::new(perm);
         let attr_arc: Arc<Vec<u32>> = Arc::new(zero_attr);
+
+        // GPU graph construction (Turbo/Hybrid): batch kNN on GPU per shard.
+        // CPU graph construction (CpuOnly): sequential HNSW insert.
+        let use_gpu_build = gpu::gpu_available() && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly;
+        if use_gpu_build {
+            eprintln!("[GPU] GPU graph construction enabled — building kNN on GPU");
+        }
+
         let segments: Vec<Hnsw> = std::thread::scope(|s| {
             let handles: Vec<_> = ranges
                 .into_iter()
@@ -3455,16 +3462,53 @@ impl VectorIndex {
                     let perm_clone = Arc::clone(&perm_arc);
                     let attr_clone = Arc::clone(&attr_arc);
                     s.spawn(move || {
-                        let mut h = Hnsw::build_segment_indexed(data, dim, &perm_clone, lo, hi - lo, lo as u64, &attr_clone);
-                        for (local, node) in h.nodes.iter_mut().enumerate() {
-                            let true_row = perm_clone[lo + local];
-                            node.id = true_row as u64;
+                        let base_id = lo as u64;
+                        if use_gpu_build {
+                            // GPU path: compute kNN graph on GPU, then build HNSW from edges
+                            let count = hi - lo;
+                            // Collect INT8 vectors for this shard
+                            let mut shard_i8: Vec<i8> = Vec::with_capacity(count * dim);
+                            for row in 0..count {
+                                let true_row = perm_clone[lo + row];
+                                let base = true_row * dim;
+                                for d in 0..dim {
+                                    shard_i8.push((data[base + d] * 127.0) as i8);
+                                }
+                            }
+                            // GPU: compute kNN graph (batch distance on GPU)
+                            let k_init = 32; // neighbors per node
+                            match gpu::gpu_build_knn_graph(&shard_i8, count, dim, k_init) {
+                                Some(knn_graph) => {
+                                    // Convert kNN graph to HNSW
+                                    let mut h = Hnsw::new();
+                                    h.dim = dim;
+                                    // Insert all vectors first
+                                    for row in 0..count {
+                                        let true_row = perm_clone[lo + row];
+                                        let v: Vec<f32> = data[true_row * dim..(true_row + 1) * dim].to_vec();
+                                        h.insert_attr(base_id + row as u64, v, attr_clone[lo + row]);
+                                    }
+                                    // Wire edges from GPU kNN graph
+                                    for (i, neighbors) in knn_graph.iter().enumerate() {
+                                        if i < h.nodes.len() {
+                                            h.nodes[i].neighbors[0] = neighbors.clone();
+                                        }
+                                    }
+                                    h.id_to_idx.clear();
+                                    for (local, node) in h.nodes.iter().enumerate() {
+                                        h.id_to_idx.insert(node.id, local);
+                                    }
+                                    h
+                                }
+                                None => {
+                                    eprintln!("[GPU] GPU kNN failed, falling back to CPU for shard");
+                                    Hnsw::build_segment_indexed(data, dim, &perm_clone, lo, count, base_id, &attr_clone)
+                                }
+                            }
+                        } else {
+                            // CPU path: sequential HNSW insert
+                            Hnsw::build_segment_indexed(data, dim, &perm_clone, lo, hi - lo, lo as u64, &attr_clone)
                         }
-                        h.id_to_idx.clear();
-                        for (local, node) in h.nodes.iter().enumerate() {
-                            h.id_to_idx.insert(node.id, local);
-                        }
-                        h
                     })
                 })
                 .collect();
@@ -4356,6 +4400,53 @@ impl VectorIndex {
         queries: &[Vec<f32>],
         k: usize,
     ) -> Vec<Vec<(u64, f32)>> {
+        let mode = gpu::gpu_get_mode();
+        let num_queries = queries.len();
+
+        // ── TURBO: Batch ALL queries into ONE GPU kernel call ──
+        // This is the CAGRA way: Q blocks × 256 threads, one kernel launch.
+        // GPU stays busy the entire time — no per-query overhead.
+        if mode == gpu::ComputeMode::Turbo && gpu::gpu_available() {
+            let guard = self.gpu_idx.read().unwrap();
+            if let Some(ref idx) = *guard {
+                // Quantize all queries
+                let mut all_qq: Vec<i8> = Vec::with_capacity(num_queries * idx.dim);
+                for q in queries {
+                    let mut qn = q.clone();
+                    l2_normalize(&mut qn);
+                    all_qq.extend_from_slice(&quantize(&qn));
+                }
+                let itopk = 128.max(k * 4);
+                let max_iters = 20;
+                if let Some((all_indices, _all_dists)) = gpu::gpu_search(
+                    idx, &all_qq, num_queries, k, itopk, max_iters, 0,
+                ) {
+                    // f32 rerank from CPU (read f32 vectors from RAM)
+                    let g = self.hnsw.read().unwrap();
+                    let mut results = Vec::with_capacity(num_queries);
+                    for qi in 0..num_queries {
+                        let mut hits: Vec<(u64, f32)> = (0..k).filter_map(|ki| {
+                            let global_i = all_indices[qi * k + ki];
+                            if global_i < 0 { return None; }
+                            let idx = global_i as usize;
+                            let node = g.nodes.get(idx)?;
+                            if node.deleted { return None; }
+                            let mut qn = queries[qi].clone();
+                            l2_normalize(&mut qn);
+                            let dot = dot_f32(&qn, g.vec_at_f32(idx));
+                            let d = (1.0 - dot).max(0.0).min(2.0);
+                            Some((node.id, d))
+                        }).collect();
+                        hits.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                        hits.truncate(k);
+                        results.push(hits);
+                    }
+                    return results;
+                }
+            }
+        }
+
+        // ── CPU fallback: sequential per-query ──
         let g = self.hnsw.read().unwrap();
         let rerank_k = (k * 4).max(64);
         let dim = g.dim;
