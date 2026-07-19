@@ -3510,8 +3510,17 @@ impl VectorIndex {
                                 }
                             }
                         } else {
-                            // CPU path: sequential HNSW insert
-                            Hnsw::build_segment_indexed(data, dim, &perm_clone, lo, hi - lo, lo as u64, &attr_clone)
+                            // CPU path: sequential HNSW insert + ID remapping
+                            let mut h = Hnsw::build_segment_indexed(data, dim, &perm_clone, lo, hi - lo, lo as u64, &attr_clone);
+                            for (local, node) in h.nodes.iter_mut().enumerate() {
+                                let true_row = perm_clone[lo + local];
+                                node.id = true_row as u64;
+                            }
+                            h.id_to_idx.clear();
+                            for (local, node) in h.nodes.iter().enumerate() {
+                                h.id_to_idx.insert(node.id, local);
+                            }
+                            h
                         }
                     })
                 })
