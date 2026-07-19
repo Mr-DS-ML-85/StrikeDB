@@ -3496,7 +3496,7 @@ impl VectorIndex {
         }
 
         let dim = dim;
-        let bridge = 8usize;
+        let bridge = 16usize;
         let shared_data: Arc<Vec<f32>> = Arc::new(shuffled);
         let shared_attr: Arc<Vec<u32>> = Arc::new(shuffled_attr);
         let shared_perm: Arc<Vec<usize>> = Arc::new(perm);
@@ -3589,7 +3589,7 @@ impl VectorIndex {
         }
 
         let dim = dim;
-        let bridge = 8usize;
+        let bridge = 16usize;
         let shared_data: Arc<Vec<f32>> = Arc::new(shuffled);
         let shared_attr: Arc<Vec<u32>> = Arc::new(shuffled_attr);
         let shared_inv: Arc<Vec<usize>> = Arc::new(inv);
