@@ -3438,7 +3438,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert(i as u64, v);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()) };
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -3479,7 +3479,7 @@ impl VectorIndex {
             merged.f32_tier = Some(t);
             merged.all_f32 = Vec::new();
         }
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()) }
+        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// MODULE 4 constructor: build the graph in parallel like
@@ -3528,7 +3528,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert_attr(i as u64, v, attrs[i]);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()) };
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -3560,7 +3560,7 @@ impl VectorIndex {
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let merged = Hnsw::merge_segments(segments, bridge, None);
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()) }
+        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// Like `build_parallel_attr`, but maps each row to an ARBITRARY client
@@ -3621,7 +3621,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert_attr(ids[i], v, attrs[i]);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()) };
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -3657,7 +3657,7 @@ impl VectorIndex {
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let merged = Hnsw::merge_segments(segments, bridge, None);
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()) }
+        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// MODULE 5 constructor: build the dense HNSW in parallel (like
@@ -3833,9 +3833,41 @@ pub struct VectorIndex {
     /// MODULE 5: sparse / lexical index over the SAME doc ids as `hnsw`. None
     /// for pure-dense indexes. Hybrid queries fuse the two in-engine.
     sparse: RwLock<SparseIndex>,
+    /// GPU-resident index for CAGRA-style GPU search. None if no GPU or not built.
+    gpu_idx: RwLock<Option<gpu::GpuIndex>>,
 }
 
 impl VectorIndex {
+    /// Upload vectors + flat CSR graph to GPU for CAGRA-style GPU search.
+    /// Called once after build. Subsequent searches use the cached GPU data.
+    pub fn upload_to_gpu(&self) {
+        if !gpu::gpu_init() { return; }
+        let g = self.hnsw.read().unwrap();
+        let n = g.nodes.len();
+        let dim = g.dim;
+        let degree = g.nodes.first().map(|n| n.neighbors.first().map_or(0, |l| l.len())).unwrap_or(0);
+        if degree == 0 || n == 0 { return; }
+        // Build flat CSR graph: n × degree × i32
+        let mut graph_flat: Vec<i32> = vec![-1i32; n * degree];
+        for (i, node) in g.nodes.iter().enumerate() {
+            if let Some(level0) = node.neighbors.first() {
+                for (j, &neighbor) in level0.iter().enumerate().take(degree) {
+                    graph_flat[i * degree + j] = neighbor as i32;
+                }
+            }
+        }
+        // Build flat INT8 vectors: n × dim
+        let vectors_i8: Vec<i8> = g.all_i8.clone();
+        drop(g);
+        match gpu::gpu_build_index(&vectors_i8, &graph_flat, n, dim, degree) {
+            Some(idx) => {
+                eprintln!("[GPU] VectorIndex uploaded: {n} vectors, degree={degree}");
+                *self.gpu_idx.write().unwrap() = Some(idx);
+            }
+            None => eprintln!("[GPU] VectorIndex upload failed"),
+        }
+    }
+
     /// Open the index and rebuild the graph from any persisted raw f32 vectors.
     /// Quantization is done here so the substrate stays f32-exact.
     pub fn open(engine: Arc<Engine>) -> Self {
@@ -3846,7 +3878,7 @@ impl VectorIndex {
                 hnsw.insert(id, v);
             }
         }
-        Self { engine, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()) }
+        Self { engine, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// Insert/replace a vector: durable f32 write + graph update with a
@@ -4169,6 +4201,42 @@ impl VectorIndex {
     pub fn search_ef(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         let mut q = query.to_vec();
         l2_normalize(&mut q);
+
+        // ── GPU search path (CAGRA) ──
+        if gpu::gpu_available() && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly {
+            let guard = self.gpu_idx.read().unwrap();
+            if let Some(ref idx) = *guard {
+                // Quantize query to INT8 for GPU kernel
+                let qq = quantize(&q);
+                let itopk = ef.max(k * 4).max(64);
+                let max_iters = (itopk as f32).sqrt() as usize + 5;
+                if let Some((indices, _distances)) = gpu::gpu_search(
+                    idx, &qq, 1, k, itopk, max_iters, 0,
+                ) {
+                    // GPU search returned results — convert to (id, dist) pairs
+                    // and do f32 rerank for precision
+                    let g = self.hnsw.read().unwrap();
+                    let mut results: Vec<(u64, f32)> = indices
+                        .iter()
+                        .filter(|&&idx| idx >= 0)
+                        .filter_map(|&idx| {
+                            let idx = idx as usize;
+                            let node = g.nodes.get(idx)?;
+                            if node.deleted { return None; }
+                            let dot = dot_f32(&q, g.vec_at_f32(idx));
+                            let d = (1.0 - dot).max(0.0).min(2.0);
+                            Some((node.id, d))
+                        })
+                        .collect();
+                    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    results.truncate(k);
+                    return results;
+                }
+                // GPU search failed — fall through to CPU
+            }
+        }
+
+        // ── CPU search path (HNSW) ──
         let qq = quantize(&q);
         let g = self.hnsw.read().unwrap();
         let qf = g.query_f32(&q);

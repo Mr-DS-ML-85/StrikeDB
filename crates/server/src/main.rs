@@ -335,7 +335,12 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
                 continue;
             }
 
+            let t_start = std::time::Instant::now();
             let resp = dispatch(&db, &name, args);
+            let elapsed_ms = t_start.elapsed().as_micros() as f64 / 1000.0;
+            // Log command with password redaction.
+            let redacted = redact_cmd(&name, args);
+            eprintln!("[CMD] {:>6.1}ms {}", elapsed_ms, redacted);
             write_resp_buf(&mut out, &resp)?;
             if name == "QUIT" {
                 quit = true;
@@ -672,6 +677,43 @@ fn dispatch_acl(db: &Db, args: &[Vec<u8>], current_user: &str) -> Resp {
             Resp::Simple("OK".into())
         }
         _ => err("ACL subcommand not supported (USE WHOAMI LIST SETUSER GETUSER DELUSER SAVE LOAD)"),
+    }
+}
+
+/// Redact sensitive data from command args for logging.
+/// Passwords in AUTH and ACL SETUSER >password are replaced with `***`.
+fn redact_cmd(name: &str, args: &[Vec<u8>]) -> String {
+    let upper = name.to_uppercase();
+    match upper.as_str() {
+        "AUTH" => format!("AUTH ***"),
+        "ACL" => {
+            // ACL SETUSER username >password ...
+            if args.len() >= 2 {
+                let sub = String::from_utf8_lossy(&args[0]).to_uppercase();
+                if sub == "SETUSER" {
+                    let user = String::from_utf8_lossy(&args[1]);
+                    let mut out = format!("ACL SETUSER {}", user);
+                    for tok in &args[2..] {
+                        let s = String::from_utf8_lossy(tok);
+                        if s.starts_with('>') {
+                            out.push_str(" >***");
+                        } else {
+                            out.push(' ');
+                            out.push_str(&s);
+                        }
+                    }
+                    return out;
+                }
+            }
+            format!("ACL {}", args.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>().join(" "))
+        }
+        _ => {
+            let mut parts = vec![upper];
+            for a in args {
+                parts.push(String::from_utf8_lossy(a).to_string());
+            }
+            parts.join(" ")
+        }
     }
 }
 
