@@ -103,6 +103,6 @@ DB-Strike beats Redis on every op at every pipeline depth, with durable fsync.
 | KV throughput | **3.5×** vs Redis |
 | Recall@10 | **1.000** (perfect) |
 | Crash recovery | **Automatic** vs manual |
-| Cold-start | **<1 sec** vs 35 min |
+| Cold-start | **0.5 sec (4,200× faster)** vs 35 min |
 | Dependencies | **0** vs 50+ |
 | Unified engine | **KV+vector+TS+pubsub+memory** vs vector-only |
