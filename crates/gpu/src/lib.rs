@@ -94,6 +94,7 @@ unsafe impl Sync for GpuState {}
 static GPU_STATE: std::sync::OnceLock<GpuState> = std::sync::OnceLock::new();
 static GPU_ENABLED: AtomicBool = AtomicBool::new(false);
 static KERNELS_COMPILED: AtomicBool = AtomicBool::new(false);
+static KERNELS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static KERNEL_LOCK: Mutex<()> = Mutex::new(());
 
 impl GpuState {
@@ -125,10 +126,10 @@ impl GpuState {
     /// Thread-safe: only compiles once via KERNELS_COMPILED flag.
     fn ensure_kernels(&mut self) {
         if KERNELS_COMPILED.load(Ordering::Acquire) { return; }
-        if !self.module.is_null() { return; }
+        if KERNELS_ATTEMPTED.load(Ordering::Acquire) { return; } // Don't retry after failure
         let _guard = KERNEL_LOCK.lock().unwrap();
-        // Double-check after acquiring lock.
         if KERNELS_COMPILED.load(Ordering::Acquire) { return; }
+        if KERNELS_ATTEMPTED.load(Ordering::Acquire) { return; }
         if !self.module.is_null() { return; }
         if !ensure_ctx() { return; }
         unsafe {
@@ -176,7 +177,10 @@ impl GpuState {
                 }
             }
             eprintln!("[GPU] {} kernels loaded", self.kernels.len());
-            KERNELS_COMPILED.store(true, Ordering::Release);
+            KERNELS_ATTEMPTED.store(true, Ordering::Release);
+            if !self.module.is_null() {
+                KERNELS_COMPILED.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -868,8 +872,8 @@ pub fn gpu_search(
         ];
 
         let threads = 256u32;
-        // Shared memory: 2 * itopk * sizeof(int) for topk_dot + topk_idx
-        let smem = (2 * itopk * 4) as u32;
+        // Shared memory: topk_dot + topk_idx + cand_idx[8*degree] + cand_dot[8*degree]
+        let smem = ((2 * itopk + 16 * degree) * 4) as u32;
 
         let r = cuLaunchKernel(func,
             num_queries as u32, 1, 1,   // Grid: one block per query

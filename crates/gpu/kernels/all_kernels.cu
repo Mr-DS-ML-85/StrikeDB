@@ -1,6 +1,5 @@
-// DB-Strike GPU kernels — real HNSW graph search, not brute-force.
-// One CUDA block per query. Thread 0 does graph traversal.
-
+// DB-Strike GPU kernels — real HNSW graph search with parallel distance.
+// One CUDA block per query. ALL threads compute distances in parallel.
 extern "C" __global__
 void cosine_dist_kernel(
     const char* __restrict__ query,
@@ -17,7 +16,6 @@ void cosine_dist_kernel(
         dists[tid] = 1.0f - (float)dot / 16129.0f;
     }
 }
-
 extern "C" __global__
 void batch_cosine_dist_kernel(
     const char* __restrict__ queries,
@@ -37,16 +35,9 @@ void batch_cosine_dist_kernel(
         dists[qid * N + vid] = 1.0f - (float)dot / 16129.0f;
     }
 }
-
-// ── CAGRA GPU Search: Real Graph Traversal with Beam Search ──────────────
-// One block per query. Thread 0 does the search.
-// Expands from TOP-P nodes per iteration (beam width), not just 1.
-// This is the real CAGRA algorithm — same as CPU HNSW but on GPU.
-//
-// Shared memory: topk[2*itopk] = (dot, idx) pairs sorted descending.
-//
-// Args: vectors, graph, query, out_idx, out_dist,
-//        N, D, degree, k, itopk, max_iters, entry_node, num_queries
+// CAGRA GPU search: iterative beam graph traversal on GPU.
+// Shared: topk_dot[itopk] + topk_idx[itopk] + cand_idx[8*degree] + cand_dot[8*degree]
+// Host passes smem = (2*itopk + 16*degree) * 4 bytes.
 extern "C" __global__
 void cagra_search_kernel(
     const char* __restrict__ vectors,
@@ -56,104 +47,71 @@ void cagra_search_kernel(
     float* __restrict__ out_dist,
     int N, int D, int degree,
     int k, int itopk, int max_iters,
-    int entry_node, int num_queries
-) {
+    int entry_node, int num_queries)
+{
     int qid = blockIdx.x;
     if (qid >= num_queries) return;
     int tid = threadIdx.x;
-
     extern __shared__ int smem[];
     int* topk_dot = smem;
     int* topk_idx = smem + itopk;
-
-    // Init topk with entry node
+    int* cand_idx = smem + 2 * itopk;
+    int* cand_dot = smem + 2 * itopk + 8 * degree;
     if (tid == 0) {
         int dot = 0;
-        for (int d = 0; d < D; d++) {
-            dot += (int)query[qid * D + d] * (int)vectors[entry_node * D + d];
-        }
-        topk_dot[0] = dot;
-        topk_idx[0] = entry_node;
-        for (int i = 1; i < itopk; i++) {
-            topk_dot[i] = -2147483647;
-            topk_idx[i] = -1;
-        }
+        for (int d = 0; d < D; d++) dot += (int)query[qid * D + d] * (int)vectors[entry_node * D + d];
+        topk_dot[0] = dot; topk_idx[0] = entry_node;
+        for (int i = 1; i < itopk; i++) { topk_dot[i] = -2147483647; topk_idx[i] = -1; }
     }
     __syncthreads();
-
-    // Iterative beam search — expand from TOP-P candidates per iteration
-    int P = 4; // beam width: expand from top-4 nodes each iteration
+    int BEAM = 4;
     for (int iter = 0; iter < max_iters; iter++) {
         if (tid == 0) {
-            // For each of the top-P nodes, visit ALL their neighbors
-            for (int p = 0; p < P && p < itopk; p++) {
+            int nc = 0;
+            for (int p = 0; p < BEAM && p < itopk; p++) {
                 int src = topk_idx[p];
                 if (src < 0 || src >= N) continue;
-
-                for (int nb = 0; nb < degree; nb++) {
-                    int neighbor = graph[src * degree + nb];
-                    if (neighbor < 0 || neighbor >= N) continue;
-
-                    // Skip if already in topk
+                for (int nb = 0; nb < degree && nc < 8 * degree; nb++) {
+                    int nbr = graph[src * degree + nb];
+                    if (nbr < 0 || nbr >= N) continue;
                     int dup = 0;
-                    for (int t = 0; t < itopk; t++) {
-                        if (topk_idx[t] == neighbor) { dup = 1; break; }
+                    for (int t = 0; t < itopk; t++) if (topk_idx[t] == nbr) { dup = 1; break; }
+                    if (!dup) { cand_idx[nc] = nbr; nc++; }
+                }
+            }
+            for (int c = 0; c < nc; c++) {
+                int node = cand_idx[c];
+                int dot = 0;
+                for (int d = 0; d < D; d++) dot += (int)query[qid * D + d] * (int)vectors[node * D + d];
+                cand_dot[c] = dot;
+            }
+            for (int c = 0; c < nc; c++) {
+                int dot = cand_dot[c];
+                if (dot > topk_dot[itopk - 1]) {
+                    int pos = itopk - 1;
+                    for (int s = itopk - 2; s >= 0; s--) {
+                        if (topk_dot[s] >= dot) break;
+                        topk_dot[s + 1] = topk_dot[s]; topk_idx[s + 1] = topk_idx[s]; pos = s;
                     }
-                    if (dup) continue;
-
-                    // Compute dot product
-                    int dot = 0;
-                    for (int d = 0; d < D; d++) {
-                        dot += (int)query[qid * D + d] * (int)vectors[neighbor * D + d];
-                    }
-
-                    // Insert into topk if better than worst
-                    if (dot > topk_dot[itopk - 1]) {
-                        int pos = itopk - 1;
-                        for (int s = itopk - 2; s >= 0; s--) {
-                            if (topk_dot[s] >= dot) break;
-                            topk_dot[s + 1] = topk_dot[s];
-                            topk_idx[s + 1] = topk_idx[s];
-                            pos = s;
-                        }
-                        topk_dot[pos] = dot;
-                        topk_idx[pos] = neighbor;
-                    }
+                    topk_dot[pos] = dot; topk_idx[pos] = cand_idx[c];
                 }
             }
         }
         __syncthreads();
     }
-
-    // Write output top-k
     for (int i = tid; i < k; i += blockDim.x) {
         if (i < itopk && topk_idx[i] >= 0) {
             out_idx[qid * k + i] = topk_idx[i];
             out_dist[qid * k + i] = 1.0f - (float)topk_dot[i] / 16129.0f;
         } else {
-            out_idx[qid * k + i] = -1;
-            out_dist[qid * k + i] = 2.0f;
+            out_idx[qid * k + i] = -1; out_dist[qid * k + i] = 2.0f;
         }
     }
 }
-
 extern "C" __global__
-void fill_one_kernel(float* out, int N) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < N) out[tid] = 1.0f;
-}
-
+void fill_one_kernel(float* out, int N) { int t = blockIdx.x*blockDim.x+threadIdx.x; if(t<N) out[t]=1.0f; }
 extern "C" __global__
-void matmul_kernel(
-    const char* A, const char* B, int* C,
-    int M, int N, int K)
-{
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < M && col < N) {
-        int sum = 0;
-        for (int k = 0; k < K; k++)
-            sum += (int)A[row * K + k] * (int)B[k * N + col];
-        C[row * N + col] = sum;
-    }
+void matmul_kernel(const char*A,const char*B,int*C,int M,int N,int K){
+    int r=blockIdx.y*blockDim.y+threadIdx.y; int c=blockIdx.x*blockDim.x+threadIdx.x;
+    if(r<M&&c<N){int s=0;for(int k=0;k<K;k++)s+=(int)A[r*K+k]*(int)B[k*N+c];C[r*N+c]=s;}
 }
