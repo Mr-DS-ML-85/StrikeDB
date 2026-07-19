@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 storage = { path = "../storage" }
+gpu = { path = "../gpu" }
