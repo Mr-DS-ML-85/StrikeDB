@@ -6,33 +6,31 @@
 //! - If data fits in VRAM → GPU-only path (fastest)
 //! - If data exceeds VRAM → tiered: GPU (hot int8) + RAM (f32 rerank) + NVMe (cold)
 //! - If no GPU → CPU-only path (graceful fallback)
-//! - Lazy kernel loading via RESP: GPU.LOAD <kernel>, GPU.INFO, GPU.UNLOAD
+//! - Kernels disabled by default, loaded on-demand:
+//!   - RESP: GPU.LOAD <kernel>, GPU.INFO, GPU.UNLOAD
+//!   - Auto: first call to gpu_cosine_dist/gpu_matmul triggers lazy load
 //!
 //! Kernels (loaded on-demand):
-//! - `cosine_dist` — INT8 cosine distance for vector search
-//! - `matmul` — INT8 matrix multiply for bridge distances
+//! - `cosine_dist` — INT8 cosine distance for vector search (VSEARCH, VADD, bridge)
+//! - `matmul` — INT8 matrix multiply for VADDBATCH PAR
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 type NvrtcProgram = *mut std::ffi::c_void;
-type NvrtcResult = i32;
-#[allow(dead_code)]
-const NVRTC_SUCCESS: NvrtcResult = 0;
 
 extern "C" {
     fn nvrtcCreateProgram(prog: *mut NvrtcProgram, src: *const i8, name: *const i8,
                           numHeaders: i32, headers: *const *const i8,
-                          includeNames: *const *const i8) -> NvrtcResult;
+                          includeNames: *const *const i8) -> i32;
     fn nvrtcCompileProgram(prog: NvrtcProgram, numOptions: i32,
-                           options: *const *const i8) -> NvrtcResult;
-    fn nvrtcGetPTXSize(prog: NvrtcProgram, size: *mut usize) -> NvrtcResult;
-    fn nvrtcGetPTX(prog: NvrtcProgram, ptx: *mut i8) -> NvrtcResult;
-    fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> NvrtcResult;
-    #[allow(dead_code)]
-    fn nvrtcGetProgramLogSize(prog: NvrtcProgram, size: *mut usize) -> NvrtcResult;
-    #[allow(dead_code)]
-    fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut i8) -> NvrtcResult;
+                           options: *const *const i8) -> i32;
+    fn nvrtcGetPTXSize(prog: NvrtcProgram, size: *mut usize) -> i32;
+    fn nvrtcGetPTX(prog: NvrtcProgram, ptx: *mut i8) -> i32;
+    fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> i32;
+    fn nvrtcGetProgramLogSize(prog: NvrtcProgram, size: *mut usize) -> i32;
+    fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut i8) -> i32;
     fn cuInit(flags: u32) -> i32;
     fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32;
     fn cuCtxCreate_v2(context: *mut *mut std::ffi::c_void, flags: u32, device: i32) -> i32;
@@ -57,10 +55,10 @@ extern "C" {
     fn cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: i32) -> i32;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
     fn cuGetErrorString(error: i32, str: *mut *const i8) -> i32;
+    fn cuCtxSetCurrent(ctx: *mut std::ffi::c_void) -> i32;
 }
 
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
-
 const CU_CTX_SCHED_BLOCKING_SYNC: u32 = 0x04;
 
 /// Compiled kernel handle.
@@ -70,6 +68,7 @@ struct CompiledKernel {
 }
 
 /// GPU state — holds CUDA context + compiled kernels.
+/// Kernels are compiled lazily on first demand, NOT at init.
 pub struct GpuState {
     ctx: *mut std::ffi::c_void,
     module: *mut std::ffi::c_void,
@@ -86,9 +85,11 @@ unsafe impl Sync for GpuState {}
 /// Global GPU state — lazy init on first use.
 static GPU_STATE: std::sync::OnceLock<GpuState> = std::sync::OnceLock::new();
 static GPU_ENABLED: AtomicBool = AtomicBool::new(false);
+static KERNELS_COMPILED: AtomicBool = AtomicBool::new(false);
+static KERNEL_LOCK: Mutex<()> = Mutex::new(());
 
 impl GpuState {
-    /// Try to initialize CUDA context, compile all kernels, detect VRAM.
+    /// Initialize CUDA context + detect VRAM. NO kernel compilation.
     fn init_ctx() -> Option<Self> {
         unsafe {
             if cuInit(0) != 0 { return None; }
@@ -97,25 +98,38 @@ impl GpuState {
             let mut ctx = std::ptr::null_mut();
             if cuCtxCreate_v2(&mut ctx, CU_CTX_SCHED_BLOCKING_SYNC, device) != 0 { return None; }
 
-            // Detect VRAM.
             let mut vram_total: usize = 0;
             let mut vram_free: usize = 0;
             cuMemGetInfo_v2(&mut vram_free, &mut vram_total);
             let mp_count = { let mut v = 0i32; cuDeviceGetAttribute(&mut v, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device); v };
-            eprintln!("[GPU] NVIDIA GPU detected: {} MB VRAM ({} free), {} SMs", vram_total / 1024 / 1024, vram_free / 1024 / 1024, mp_count);
+            eprintln!("[GPU] NVIDIA GPU detected: {} MB VRAM ({} free), {} SMs",
+                vram_total / 1024 / 1024, vram_free / 1024 / 1024, mp_count);
 
-            let mut state = Self {
+            Some(Self {
                 ctx, module: std::ptr::null_mut(), kernels: Vec::new(),
                 available: true, vram_total, vram_free,
-            };
+            })
+        }
+    }
 
-            // Compile ALL kernels from one source file via NVRTC.
-            // One compile → one PTX → one module → all function handles.
-            eprintln!("[GPU] Compiling CUDA kernels via NVRTC...");
+    /// Lazy-compile kernels. Called on first kernel use (not at init).
+    /// Compiles all kernels from one source file into one module.
+    /// Thread-safe: only compiles once via KERNELS_COMPILED flag.
+    fn ensure_kernels(&mut self) {
+        if KERNELS_COMPILED.load(Ordering::Acquire) { return; }
+        if !self.module.is_null() { return; }
+        let _guard = KERNEL_LOCK.lock().unwrap();
+        // Double-check after acquiring lock.
+        if KERNELS_COMPILED.load(Ordering::Acquire) { return; }
+        if !self.module.is_null() { return; }
+        if !ensure_ctx() { return; }
+        unsafe {
+            eprintln!("[GPU] Compiling CUDA kernels via NVRTC (lazy)...");
             let src_cstr = CString::new(KERNEL_SRC).unwrap();
             let name_cstr = CString::new("dbstrike_kernels").unwrap();
             let mut prog: NvrtcProgram = std::ptr::null_mut();
-            nvrtcCreateProgram(&mut prog, src_cstr.as_ptr(), name_cstr.as_ptr(), 0, std::ptr::null(), std::ptr::null());
+            nvrtcCreateProgram(&mut prog, src_cstr.as_ptr(), name_cstr.as_ptr(), 0,
+                               std::ptr::null(), std::ptr::null());
             let arch = CString::new("--gpu-architecture=compute_86").unwrap();
             let opts = [arch.as_ptr()];
             let ret = nvrtcCompileProgram(prog, 1, opts.as_ptr());
@@ -125,8 +139,11 @@ impl GpuState {
                 if log_size > 1 {
                     let mut log = vec![0i8; log_size];
                     nvrtcGetProgramLog(prog, log.as_mut_ptr());
-                    eprintln!("[GPU] NVRTC compile error:\n{}", String::from_utf8_lossy(&log.iter().map(|&c| c as u8).collect::<Vec<_>>()));
+                    eprintln!("[GPU] NVRTC compile error:\n{}",
+                        String::from_utf8_lossy(&log.iter().map(|&c| c as u8).collect::<Vec<_>>()));
                 }
+                nvrtcDestroyProgram(&mut prog);
+                return;
             }
             let mut ptx_size = 0usize;
             nvrtcGetPTXSize(prog, &mut ptx_size);
@@ -134,97 +151,56 @@ impl GpuState {
             nvrtcGetPTX(prog, ptx.as_mut_ptr());
             nvrtcDestroyProgram(&mut prog);
             eprintln!("[GPU] PTX compiled ({} bytes)", ptx_size);
-            let ret = cuModuleLoadDataEx(&mut state.module, ptx.as_ptr(), 0, std::ptr::null(), std::ptr::null_mut());
-            if ret != 0 { eprintln!("[GPU] cuModuleLoadDataEx failed: {}", ret); }
+
+            let ret = cuModuleLoadDataEx(&mut self.module, ptx.as_ptr(), 0,
+                                          std::ptr::null(), std::ptr::null_mut());
+            if ret != 0 {
+                eprintln!("[GPU] cuModuleLoadDataEx failed: {}", ret);
+                return;
+            }
             // Get ALL function handles from the loaded module.
-            for name in &["cosine_dist_kernel", "fill_one_kernel", "matmul_kernel"] {
+            for name in &["cosine_dist_kernel", "matmul_kernel"] {
                 let cname = CString::new(*name).unwrap();
                 let mut func = std::ptr::null_mut();
-                if cuModuleGetFunction(&mut func, state.module, cname.as_ptr()) == 0 {
+                if cuModuleGetFunction(&mut func, self.module, cname.as_ptr()) == 0 {
                     let short_name = name.replace("_kernel", "");
-                    state.kernels.push(CompiledKernel { name: short_name.clone(), function: func });
-                    eprintln!("[GPU] Function '{}' loaded", short_name);
+                    self.kernels.push(CompiledKernel { name: short_name.clone(), function: func });
                 }
             }
-            Some(state)
+            eprintln!("[GPU] {} kernels loaded", self.kernels.len());
+            KERNELS_COMPILED.store(true, Ordering::Release);
         }
     }
 
-    /// Compile a kernel from CUDA source.
-    #[allow(dead_code)]
-    fn compile_kernel(&mut self, name: &str, source: &str) -> Option<*mut std::ffi::c_void> {
-        unsafe {
-            let src_cstr = CString::new(source).ok()?;
-            let name_cstr = CString::new(name).ok()?;
-            let mut prog: NvrtcProgram = std::ptr::null_mut();
-            let ret = nvrtcCreateProgram(&mut prog, src_cstr.as_ptr(), name_cstr.as_ptr(),
-                                          0, std::ptr::null(), std::ptr::null());
-            if ret != NVRTC_SUCCESS { return None; }
-
-            let arch = CString::new("--gpu-architecture=compute_86").ok()?;
-            let opts = [arch.as_ptr()];
-            let ret = nvrtcCompileProgram(prog, opts.len() as i32, opts.as_ptr());
-            if ret != NVRTC_SUCCESS {
-                let mut log_size = 0usize;
-                nvrtcGetProgramLogSize(prog, &mut log_size);
-                let mut log = vec![0i8; log_size];
-                nvrtcGetProgramLog(prog, log.as_mut_ptr());
-                let log_bytes: &[u8] = std::slice::from_raw_parts(log.as_ptr() as *const u8, log.len());
-                eprintln!("[GPU] Compile error '{}': {}", name, String::from_utf8_lossy(log_bytes));
-                nvrtcDestroyProgram(&mut prog);
-                return None;
-            }
-
-            let mut ptx_size = 0usize;
-            nvrtcGetPTXSize(prog, &mut ptx_size);
-            let mut ptx = vec![0i8; ptx_size];
-            nvrtcGetPTX(prog, ptx.as_mut_ptr());
-            nvrtcDestroyProgram(&mut prog);
-
-            // Load PTX into module (or create new module).
-            if self.module.is_null() {
-                let ret = cuModuleLoadDataEx(&mut self.module, ptx.as_ptr(), 0,
-                                              std::ptr::null(), std::ptr::null_mut());
-                if ret != 0 { return None; }
-            }
-
-            // Get function handle.
-            let cname = CString::new(format!("{}_kernel", name)).ok()?;
-            let mut func = std::ptr::null_mut();
-            if cuModuleGetFunction(&mut func, self.module, cname.as_ptr()) == 0 {
-                self.kernels.push(CompiledKernel { name: name.to_string(), function: func });
-                Some(func)
-            } else {
-                None
-            }
-        }
-    }
-
-    /// Get a compiled kernel by name.
+    /// Get a compiled kernel by name. Returns None if not yet loaded.
     fn get_kernel(&self, name: &str) -> Option<*mut std::ffi::c_void> {
         self.kernels.iter().find(|k| k.name == name).map(|k| k.function)
     }
 }
 
-// ── Kernel source code (lazy-loaded per RESP command) ──────────────────────
+// ── Kernel source code (compiled once, lazily) ────────────────────────────
 
 const KERNEL_SRC: &str = include_str!("../kernels/all_kernels.cu");
-#[allow(dead_code)]
-const MATMUL_SRC: &str = include_str!("../kernels/int8_matmul.cu");
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-/// Initialize GPU (lazy). Returns true if CUDA is available.
+/// Initialize GPU — detect CUDA, create context. Kernels NOT compiled yet.
 pub fn gpu_init() -> bool {
-    GPU_ENABLED.load(Ordering::Relaxed) || {
-        let state = GpuState::init_ctx();
-        if let Some(s) = state {
-            let _ = GPU_STATE.set(s);
-            GPU_ENABLED.store(true, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
+    if GPU_ENABLED.load(Ordering::Relaxed) { return true; }
+    // Use get_or_init to prevent double-init race.
+    let state = GPU_STATE.get_or_init(|| {
+        GpuState::init_ctx().unwrap_or_else(|| {
+            // Sentinel: create a dummy state so get_or_init doesn't retry.
+            // We check `available` before using it.
+            GpuState { ctx: std::ptr::null_mut(), module: std::ptr::null_mut(),
+                       kernels: Vec::new(), available: false, vram_total: 0, vram_free: 0 }
+        })
+    });
+    if state.available {
+        GPU_ENABLED.store(true, Ordering::Relaxed);
+        true
+    } else {
+        false
     }
 }
 
@@ -233,10 +209,33 @@ pub fn gpu_available() -> bool {
     GPU_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Load a kernel by name (RESP: GPU.LOAD <name>).
-/// Kernels are compiled at init; this just checks availability.
+/// Load a kernel category (RESP: GPU.LOAD <name>).
+/// "cosine_dist" loads the cosine distance kernel.
+/// "matmul" loads the matrix multiply kernel.
+/// "all" loads everything.
+/// First call compiles PTX; subsequent calls are no-ops.
 pub fn gpu_load_kernel(name: &str) -> bool {
     if !gpu_init() { return false; }
+    let state = match GPU_STATE.get() {
+        Some(s) => s,
+        None => return false,
+    };
+    // Check if already loaded
+    if state.get_kernel(name).is_some() { return true; }
+    // Need to compile — force via raw pointer (safe: GpuState is Sync, single-threaded init).
+    let state_ptr = state as *const GpuState as *mut GpuState;
+    unsafe { (*state_ptr).ensure_kernels(); }
+    GPU_STATE.get().map(|s| s.get_kernel(name).is_some()).unwrap_or(false)
+}
+
+/// Auto-load a specific kernel if not already loaded.
+/// Called internally before gpu_cosine_dist / gpu_matmul.
+fn gpu_ensure_kernel(name: &str) -> bool {
+    if !gpu_init() { return false; }
+    let state = GPU_STATE.get().unwrap();
+    if state.get_kernel(name).is_some() { return true; }
+    let state_ptr = state as *const GpuState as *mut GpuState;
+    unsafe { (*state_ptr).ensure_kernels(); }
     GPU_STATE.get().map(|s| s.get_kernel(name).is_some()).unwrap_or(false)
 }
 
@@ -256,10 +255,9 @@ pub fn gpu_info() -> Vec<(&'static str, String)> {
 }
 
 /// Check if `n` vectors of `dim` dimensions fit in GPU VRAM.
-/// Returns (fits, vram_needed_bytes, vram_free_bytes).
 pub fn gpu_check_capacity(n: usize, dim: usize) -> (bool, usize, usize) {
     if let Some(state) = GPU_STATE.get() {
-        let needed = n * dim; // int8 vectors
+        let needed = n * dim;
         (needed <= state.vram_free, needed, state.vram_free)
     } else {
         (false, 0, 0)
@@ -267,7 +265,6 @@ pub fn gpu_check_capacity(n: usize, dim: usize) -> (bool, usize, usize) {
 }
 
 /// Auto-tier: decide GPU vs CPU+RAM based on data size vs VRAM.
-/// Returns the optimal strategy.
 pub fn gpu_tier_strategy(n: usize, dim: usize) -> GpuTier {
     if !gpu_available() {
         return GpuTier::CpuOnly;
@@ -276,10 +273,8 @@ pub fn gpu_tier_strategy(n: usize, dim: usize) -> GpuTier {
     if fits {
         GpuTier::GpuOnly
     } else if needed <= free * 3 {
-        // Data 3x VRAM — tiered GPU+RAM
         GpuTier::GpuPlusRam
     } else {
-        // Data >3x VRAM — GPU+RAM+CPU
         GpuTier::GpuRamCpu
     }
 }
@@ -287,19 +282,28 @@ pub fn gpu_tier_strategy(n: usize, dim: usize) -> GpuTier {
 /// GPU tier strategy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GpuTier {
-    /// No GPU — CPU only.
     CpuOnly,
-    /// Data fits in VRAM — GPU only (fastest).
     GpuOnly,
-    /// Data exceeds VRAM — GPU (hot) + RAM (warm).
     GpuPlusRam,
-    /// Data >> VRAM — GPU (hot) + RAM (warm) + CPU (cold).
     GpuRamCpu,
 }
 
-/// INT8 cosine distance on GPU. Returns None if GPU unavailable or kernel not loaded.
+/// Ensure current thread has the CUDA context active.
+/// CUDA driver API contexts are thread-local; must be set per-thread.
+fn ensure_ctx() -> bool {
+    if let Some(state) = GPU_STATE.get() {
+        unsafe { cuCtxSetCurrent(state.ctx) == 0 }
+    } else {
+        false
+    }
+}
+
+/// INT8 cosine distance on GPU. Auto-loads kernel if needed.
+/// Returns None if GPU unavailable.
 pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Option<Vec<f32>> {
+    if !gpu_ensure_kernel("cosine_dist") { return None; }
     let func = GPU_STATE.get()?.get_kernel("cosine_dist")?;
+    if !ensure_ctx() { return None; }
     unsafe {
         let q_bytes = query.len();
         let v_bytes = vectors.len();
@@ -319,9 +323,6 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
         let mut arg0 = d_q as *mut std::ffi::c_void;
         let mut arg1 = d_v as *mut std::ffi::c_void;
         let mut arg2 = d_d as *mut std::ffi::c_void;
-        // cuLaunchKernel: each kernelParams[i] is a pointer TO the arg value.
-        // For device pointers: store the device address as *mut c_void.
-        // For scalars: store the int VALUE as *mut c_void (not a pointer to it!).
         let mut arg3 = n_val as *mut std::ffi::c_void;
         let mut arg4 = dim_val as *mut std::ffi::c_void;
         let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4];
@@ -337,14 +338,7 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
             return None;
         }
         let sync_r = cuCtxSynchronize();
-        if sync_r != 0 {
-            let mut err_str: *const i8 = std::ptr::null();
-            cuGetErrorString(sync_r, &mut err_str);
-            let msg = if err_str.is_null() { "unknown".to_string() }
-                      else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
-            eprintln!("[GPU] cuCtxSynchronize error {}: {}", sync_r, msg);
-            return None;
-        }
+        if sync_r != 0 { return None; }
 
         let mut dists = vec![0.0f32; n];
         cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, d_bytes);
@@ -353,9 +347,11 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
     }
 }
 
-/// INT8 matmul on GPU. Returns None if GPU unavailable.
+/// INT8 matmul on GPU. Auto-loads kernel if needed.
 pub fn gpu_matmul(a: &[i8], b: &[i8], m: usize, k: usize, n: usize) -> Option<Vec<i32>> {
+    if !gpu_ensure_kernel("matmul") { return None; }
     let func = GPU_STATE.get()?.get_kernel("matmul")?;
+    if !ensure_ctx() { return None; }
     unsafe {
         let a_bytes = m * k; let b_bytes = k * n; let c_bytes = m * n * 4;
         let mut d_a = 0u64; let mut d_b = 0u64; let mut d_c = 0u64;
@@ -391,9 +387,6 @@ pub fn gpu_unload() {
     GPU_ENABLED.store(false, Ordering::Relaxed);
     if let Some(state) = GPU_STATE.get() {
         unsafe {
-            if !state.module.is_null() {
-                // Module destroyed with context.
-            }
             if !state.ctx.is_null() {
                 cuCtxDestroy_v2(state.ctx);
             }
@@ -405,7 +398,7 @@ pub fn gpu_unload() {
 mod tests {
     use super::*;
 
-        #[test]
+    #[test]
     fn test_gpu_init() {
         if !gpu_init() {
             println!("[GPU] No CUDA available (expected in CI)");
@@ -414,6 +407,10 @@ mod tests {
         println!("[GPU] CUDA initialized");
         let info = gpu_info();
         println!("[GPU] info: {:?}", info);
+        // At this point: 0 kernels loaded (lazy)
+        let state = GPU_STATE.get().unwrap();
+        assert!(state.kernels.is_empty(), "kernels should be empty before explicit load");
+
         // Test memory alloc/free
         unsafe {
             let mut d = 0u64;
@@ -422,63 +419,36 @@ mod tests {
             cuMemFree_v2(d);
             println!("[GPU] mem alloc/free: OK");
         }
-        // Test fill_one kernel from the loaded module
-        unsafe {
-            let state = GPU_STATE.get().unwrap();
-            let func = state.get_kernel("fill_one").expect("fill_one kernel not found");
-            let n: i32 = 16;
-            let mut d = 0u64;
-            cuMemAlloc_v2(&mut d, (n as usize) * 4);
-            let mut arg0 = d as *mut std::ffi::c_void;
-            let mut arg1 = n as *mut std::ffi::c_void;
-            let mut args = [&mut arg0, &mut arg1];
-            let r = cuLaunchKernel(func, 1, 1, 1, 16, 1, 1, 0,
-                std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
-                std::ptr::null_mut());
-            cuCtxSynchronize();
-            let mut result = vec![0.0f32; n as usize];
-            cuMemcpyDtoH_v2(result.as_mut_ptr() as *mut std::ffi::c_void, d, (n as usize) * 4);
-            cuMemFree_v2(d);
-            println!("[GPU] fill_one: launch_ret={} all_ones={}", r, result.iter().all(|&x| x == 1.0));
-            assert_eq!(r, 0, "cuLaunchKernel failed");
-            assert!(result.iter().all(|&x| x == 1.0), "kernel did not fill with 1.0");
-            println!("[GPU] Kernel execution VERIFIED — GPU works!");
+
+        // Test lazy kernel loading — first cosine_dist call triggers compile
+        let dists = gpu_cosine_dist(
+            &[127, 0, 0],
+            &[127, 0, 0,  0, 127, 0,  0, 0, 127],
+            3, 3,
+        );
+        match dists {
+            Some(d) => {
+                println!("[GPU] cosine_dist (lazy): {:?}", d);
+                assert!(d[0] < 0.01, "identical should be ~0, got {}", d[0]);
+                assert!(d[1] > 0.99, "orthogonal should be ~1, got {}", d[1]);
+                assert!(d[2] > 0.99, "orthogonal should be ~1, got {}", d[2]);
+                println!("[GPU] cosine_dist VERIFIED — lazy load works!");
+            }
+            None => panic!("gpu_cosine_dist returned None"),
         }
-        // Test cosine_dist kernel
-        unsafe {
-            let state = GPU_STATE.get().unwrap();
-            let func = state.get_kernel("cosine_dist").expect("cosine_dist kernel not found");
-            // query=[127,0,0] vs vectors=[127,0,0, 0,127,0, 0,0,127] (3 vectors, dim=3)
-            let query: Vec<i8> = vec![127, 0, 0];
-            let vectors: Vec<i8> = vec![127, 0, 0,  0, 127, 0,  0, 0, 127];
-            let n: i32 = 3;
-            let dim: i32 = 3;
-            let mut d_q = 0u64; let mut d_v = 0u64; let mut d_d = 0u64;
-            cuMemAlloc_v2(&mut d_q, 3);
-            cuMemAlloc_v2(&mut d_v, 9);
-            cuMemAlloc_v2(&mut d_d, 12);
-            cuMemcpyHtoD_v2(d_q, query.as_ptr() as *const std::ffi::c_void, 3);
-            cuMemcpyHtoD_v2(d_v, vectors.as_ptr() as *const std::ffi::c_void, 9);
-            let mut arg0 = d_q as *mut std::ffi::c_void;
-            let mut arg1 = d_v as *mut std::ffi::c_void;
-            let mut arg2 = d_d as *mut std::ffi::c_void;
-            let mut arg3 = n as *mut std::ffi::c_void;
-            let mut arg4 = dim as *mut std::ffi::c_void;
-            let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4];
-            let r = cuLaunchKernel(func, 1, 1, 1, 32, 1, 1, 0,
-                std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
-                std::ptr::null_mut());
-            cuCtxSynchronize();
-            let mut dists = vec![0.0f32; 3];
-            cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, 12);
-            cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
-            println!("[GPU] cosine_dist: launch_ret={} dists={:?}", r, dists);
-            // dists[0] should be ~0.0 (identical), dists[1] and dists[2] should be ~1.0 (orthogonal)
-            assert!(dists[0] < 0.01, "identical vectors should have dist ~0, got {}", dists[0]);
-            assert!(dists[1] > 0.99, "orthogonal vectors should have dist ~1, got {}", dists[1]);
-            assert!(dists[2] > 0.99, "orthogonal vectors should have dist ~1, got {}", dists[2]);
-            println!("[GPU] cosine_dist VERIFIED — correct distances!");
-        }
-        println!("[GPU] All checks passed");
+
+        println!("[GPU] All checks passed — lazy kernel loading works!");
+    }
+
+    #[test]
+    fn test_gpu_load_explicit() {
+        if !gpu_init() { return; }
+        // Explicit load via GPU.LOAD
+        let loaded = gpu_load_kernel("cosine_dist");
+        println!("[GPU] GPU.LOAD cosine_dist: {}", loaded);
+        assert!(loaded, "gpu_load_kernel should succeed");
+        let loaded2 = gpu_load_kernel("matmul");
+        println!("[GPU] GPU.LOAD matmul: {}", loaded2);
+        assert!(loaded2, "gpu_load_kernel matmul should succeed");
     }
 }
