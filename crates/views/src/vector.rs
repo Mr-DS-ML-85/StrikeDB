@@ -3075,7 +3075,7 @@ impl Hnsw {
             let mut all_dists: Vec<f32> = vec![f32::MAX; total * k_seg];
             for b in 0..k_seg {
                 if let Some(dists) = gpu::gpu_cosine_dist(
-                    &merged.all_i8, &entry_flat[b * dim..(b + 1) * dim], total, dim)
+                    &entry_flat[b * dim..(b + 1) * dim], &merged.all_i8, total, dim)
                 {
                     for (i, &d) in dists.iter().enumerate() {
                         all_dists[i * k_seg + b] = d;

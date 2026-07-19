@@ -319,8 +319,11 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
         let mut arg0 = d_q as *mut std::ffi::c_void;
         let mut arg1 = d_v as *mut std::ffi::c_void;
         let mut arg2 = d_d as *mut std::ffi::c_void;
-        let mut arg3 = &n_val as *const i32 as *mut std::ffi::c_void;
-        let mut arg4 = &dim_val as *const i32 as *mut std::ffi::c_void;
+        // cuLaunchKernel: each kernelParams[i] is a pointer TO the arg value.
+        // For device pointers: store the device address as *mut c_void.
+        // For scalars: store the int VALUE as *mut c_void (not a pointer to it!).
+        let mut arg3 = n_val as *mut std::ffi::c_void;
+        let mut arg4 = dim_val as *mut std::ffi::c_void;
         let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4];
         let r = cuLaunchKernel(func, blocks, 1, 1, threads, 1, 1, 0,
                       std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
@@ -362,11 +365,19 @@ pub fn gpu_matmul(a: &[i8], b: &[i8], m: usize, k: usize, n: usize) -> Option<Ve
         let threads = 16u32;
         let bx = (n as u32 + threads - 1) / threads;
         let by = (m as u32 + threads - 1) / threads;
-        let mut args = [d_a as *mut std::ffi::c_void, d_b as *mut std::ffi::c_void,
-                       d_c as *mut std::ffi::c_void, m as *mut std::ffi::c_void,
-                       n as *mut std::ffi::c_void, k as *mut std::ffi::c_void];
+        let m_val = m as i32;
+        let n_val = n as i32;
+        let k_val = k as i32;
+        let mut arg0 = d_a as *mut std::ffi::c_void;
+        let mut arg1 = d_b as *mut std::ffi::c_void;
+        let mut arg2 = d_c as *mut std::ffi::c_void;
+        let mut arg3 = m_val as *mut std::ffi::c_void;
+        let mut arg4 = n_val as *mut std::ffi::c_void;
+        let mut arg5 = k_val as *mut std::ffi::c_void;
+        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
         cuLaunchKernel(func, bx, by, 1, threads, threads, 1, 0,
-                      std::ptr::null_mut(), args.as_mut_ptr(), std::ptr::null_mut());
+                      std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+                      std::ptr::null_mut());
         cuCtxSynchronize();
         let mut c = vec![0i32; m * n];
         cuMemcpyDtoH_v2(c.as_mut_ptr() as *mut std::ffi::c_void, d_c, c_bytes);
@@ -432,6 +443,41 @@ mod tests {
             assert_eq!(r, 0, "cuLaunchKernel failed");
             assert!(result.iter().all(|&x| x == 1.0), "kernel did not fill with 1.0");
             println!("[GPU] Kernel execution VERIFIED — GPU works!");
+        }
+        // Test cosine_dist kernel
+        unsafe {
+            let state = GPU_STATE.get().unwrap();
+            let func = state.get_kernel("cosine_dist").expect("cosine_dist kernel not found");
+            // query=[127,0,0] vs vectors=[127,0,0, 0,127,0, 0,0,127] (3 vectors, dim=3)
+            let query: Vec<i8> = vec![127, 0, 0];
+            let vectors: Vec<i8> = vec![127, 0, 0,  0, 127, 0,  0, 0, 127];
+            let n: i32 = 3;
+            let dim: i32 = 3;
+            let mut d_q = 0u64; let mut d_v = 0u64; let mut d_d = 0u64;
+            cuMemAlloc_v2(&mut d_q, 3);
+            cuMemAlloc_v2(&mut d_v, 9);
+            cuMemAlloc_v2(&mut d_d, 12);
+            cuMemcpyHtoD_v2(d_q, query.as_ptr() as *const std::ffi::c_void, 3);
+            cuMemcpyHtoD_v2(d_v, vectors.as_ptr() as *const std::ffi::c_void, 9);
+            let mut arg0 = d_q as *mut std::ffi::c_void;
+            let mut arg1 = d_v as *mut std::ffi::c_void;
+            let mut arg2 = d_d as *mut std::ffi::c_void;
+            let mut arg3 = n as *mut std::ffi::c_void;
+            let mut arg4 = dim as *mut std::ffi::c_void;
+            let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4];
+            let r = cuLaunchKernel(func, 1, 1, 1, 32, 1, 1, 0,
+                std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+                std::ptr::null_mut());
+            cuCtxSynchronize();
+            let mut dists = vec![0.0f32; 3];
+            cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, 12);
+            cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
+            println!("[GPU] cosine_dist: launch_ret={} dists={:?}", r, dists);
+            // dists[0] should be ~0.0 (identical), dists[1] and dists[2] should be ~1.0 (orthogonal)
+            assert!(dists[0] < 0.01, "identical vectors should have dist ~0, got {}", dists[0]);
+            assert!(dists[1] > 0.99, "orthogonal vectors should have dist ~1, got {}", dists[1]);
+            assert!(dists[2] > 0.99, "orthogonal vectors should have dist ~1, got {}", dists[2]);
+            println!("[GPU] cosine_dist VERIFIED — correct distances!");
         }
         println!("[GPU] All checks passed");
     }
