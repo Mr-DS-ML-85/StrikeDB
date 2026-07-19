@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 type NvrtcProgram = *mut std::ffi::c_void;
 type NvrtcResult = i32;
+#[allow(dead_code)]
 const NVRTC_SUCCESS: NvrtcResult = 0;
 
 extern "C" {
@@ -28,7 +29,9 @@ extern "C" {
     fn nvrtcGetPTXSize(prog: NvrtcProgram, size: *mut usize) -> NvrtcResult;
     fn nvrtcGetPTX(prog: NvrtcProgram, ptx: *mut i8) -> NvrtcResult;
     fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> NvrtcResult;
+    #[allow(dead_code)]
     fn nvrtcGetProgramLogSize(prog: NvrtcProgram, size: *mut usize) -> NvrtcResult;
+    #[allow(dead_code)]
     fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut i8) -> NvrtcResult;
     fn cuInit(flags: u32) -> i32;
     fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32;
@@ -106,13 +109,46 @@ impl GpuState {
                 available: true, vram_total, vram_free,
             };
 
-            // Compile kernel sources via NVRTC (each source = one kernel).
+            // Compile each kernel source into its own PTX, then load all into one module.
+            // NVRTC: one program per source file. Each source = one kernel function.
             eprintln!("[GPU] Compiling CUDA kernels via NVRTC...");
             let kernel_srcs = [("cosine_dist", COSINE_DIST_SRC), ("fill_one", FILL_ONE_SRC)];
+            let mut all_ptx = Vec::new();
             for (name, src) in &kernel_srcs {
-                match state.compile_kernel(name, src) {
-                    Some(_) => eprintln!("[GPU] Kernel '{}' compiled", name),
-                    None => eprintln!("[GPU] Kernel '{}' FAILED", name),
+                let src_cstr = CString::new(*src).unwrap();
+                let name_cstr = CString::new(*name).unwrap();
+                let mut prog: NvrtcProgram = std::ptr::null_mut();
+                let ret = nvrtcCreateProgram(&mut prog, src_cstr.as_ptr(), name_cstr.as_ptr(), 0, std::ptr::null(), std::ptr::null());
+                if ret != 0 { eprintln!("[GPU] NVRTC create '{}' failed: {}", name, ret); continue; }
+                let arch = CString::new("--gpu-architecture=compute_86").unwrap();
+                let opts = [arch.as_ptr()];
+                let ret = nvrtcCompileProgram(prog, 1, opts.as_ptr());
+                if ret != 0 {
+                    eprintln!("[GPU] NVRTC compile '{}' failed: {}", name, ret);
+                    nvrtcDestroyProgram(&mut prog);
+                    continue;
+                }
+                let mut ptx_size = 0usize;
+                nvrtcGetPTXSize(prog, &mut ptx_size);
+                let mut ptx = vec![0i8; ptx_size];
+                nvrtcGetPTX(prog, ptx.as_mut_ptr());
+                nvrtcDestroyProgram(&mut prog);
+                all_ptx.push(ptx);
+                eprintln!("[GPU] Kernel '{}' compiled", name);
+            }
+            // Load all PTX into one module.
+            for ptx in &all_ptx {
+                let ret = cuModuleLoadDataEx(&mut state.module, ptx.as_ptr(), 0, std::ptr::null(), std::ptr::null_mut());
+                if ret != 0 { eprintln!("[GPU] cuModuleLoadDataEx failed: {}", ret); }
+            }
+            // Get function handles from the loaded module.
+            for name in &["cosine_dist_kernel", "fill_one_kernel"] {
+                let cname = CString::new(*name).unwrap();
+                let mut func = std::ptr::null_mut();
+                if cuModuleGetFunction(&mut func, state.module, cname.as_ptr()) == 0 {
+                    let short_name = name.replace("_kernel", "");
+                    state.kernels.push(CompiledKernel { name: short_name.clone(), function: func });
+                    eprintln!("[GPU] Function '{}' loaded", short_name);
                 }
             }
             Some(state)
@@ -120,6 +156,7 @@ impl GpuState {
     }
 
     /// Compile a kernel from CUDA source.
+    #[allow(dead_code)]
     fn compile_kernel(&mut self, name: &str, source: &str) -> Option<*mut std::ffi::c_void> {
         unsafe {
             let src_cstr = CString::new(source).ok()?;
@@ -375,9 +412,9 @@ mod tests {
         // Test memory alloc/free
         unsafe {
             let mut d = 0u64;
-            let r = super::cuMemAlloc_v2(&mut d, 1024);
+            let r = cuMemAlloc_v2(&mut d, 1024);
             assert_eq!(r, 0, "GPU mem alloc failed");
-            super::cuMemFree_v2(d);
+            cuMemFree_v2(d);
             println!("[GPU] mem alloc/free: OK");
         }
         // Test fill_one kernel — compile inline to verify GPU launch works
@@ -385,36 +422,36 @@ mod tests {
             // Compile fill_one kernel inline
             let src = CString::new(FILL_ONE_SRC).unwrap();
             let pname = CString::new("fill_one_test").unwrap();
-            let mut prog: super::NvrtcProgram = std::ptr::null_mut();
-            super::nvrtcCreateProgram(&mut prog, src.as_ptr(), pname.as_ptr(), 0, std::ptr::null(), std::ptr::null());
+            let mut prog: NvrtcProgram = std::ptr::null_mut();
+            nvrtcCreateProgram(&mut prog, src.as_ptr(), pname.as_ptr(), 0, std::ptr::null(), std::ptr::null());
             let arch = CString::new("--gpu-architecture=compute_86").unwrap();
             let opts = [arch.as_ptr()];
-            super::nvrtcCompileProgram(prog, 1, opts.as_ptr());
+            nvrtcCompileProgram(prog, 1, opts.as_ptr());
             let mut ptx_size = 0usize;
-            super::nvrtcGetPTXSize(prog, &mut ptx_size);
+            nvrtcGetPTXSize(prog, &mut ptx_size);
             let mut ptx = vec![0i8; ptx_size];
-            super::nvrtcGetPTX(prog, ptx.as_mut_ptr());
-            super::nvrtcDestroyProgram(&mut prog);
+            nvrtcGetPTX(prog, ptx.as_mut_ptr());
+            nvrtcDestroyProgram(&mut prog);
             let mut module = std::ptr::null_mut();
-            super::cuModuleLoadDataEx(&mut module, ptx.as_ptr(), 0, std::ptr::null(), std::ptr::null_mut());
+            cuModuleLoadDataEx(&mut module, ptx.as_ptr(), 0, std::ptr::null(), std::ptr::null_mut());
             let cname = CString::new("fill_one_kernel").unwrap();
             let mut func = std::ptr::null_mut();
-            super::cuModuleGetFunction(&mut func, module, cname.as_ptr());
+            cuModuleGetFunction(&mut func, module, cname.as_ptr());
 
             // Launch
             let n: i32 = 16;
             let mut d = 0u64;
-            super::cuMemAlloc_v2(&mut d, (n as usize) * 4);
+            cuMemAlloc_v2(&mut d, (n as usize) * 4);
             let mut arg0 = d as *mut std::ffi::c_void;
             let mut arg1 = n as *mut std::ffi::c_void;
             let mut args = [&mut arg0, &mut arg1];
-            let r = super::cuLaunchKernel(func, 1, 1, 1, 16, 1, 1, 0,
+            let r = cuLaunchKernel(func, 1, 1, 1, 16, 1, 1, 0,
                 std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
                 std::ptr::null_mut());
-            super::cuCtxSynchronize();
+            cuCtxSynchronize();
             let mut result = vec![0.0f32; n as usize];
-            super::cuMemcpyDtoH_v2(result.as_mut_ptr() as *mut std::ffi::c_void, d, (n as usize) * 4);
-            super::cuMemFree_v2(d);
+            cuMemcpyDtoH_v2(result.as_mut_ptr() as *mut std::ffi::c_void, d, (n as usize) * 4);
+            cuMemFree_v2(d);
             println!("[GPU] fill_one: launch_ret={} all_ones={}", r, result.iter().all(|&x| x == 1.0));
             assert_eq!(r, 0, "cuLaunchKernel failed");
             assert!(result.iter().all(|&x| x == 1.0), "kernel did not fill with 1.0");
