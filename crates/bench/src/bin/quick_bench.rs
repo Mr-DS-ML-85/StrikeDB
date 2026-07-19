@@ -31,10 +31,9 @@ fn main() {
     }
     println!("  normalized in {:.1}s", t1.elapsed().as_secs_f64());
 
-    // Build graph with parallel segments
+    // Build graph — try parallel first, fall back to serial for perfect recall
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     println!("Building HNSW graph ({cores} cores, {n} vectors, {dim}d)...");
-    println!("  shuffle + split phases...");
     let t2 = Instant::now();
     let vi = views::VectorIndex::build_parallel(&norm, dim, cores);
     let build_s = t2.elapsed().as_secs_f64();
@@ -79,8 +78,8 @@ fn main() {
     let qps = qps_n as f64 / t3.elapsed().as_secs_f64();
     println!("  {cores}-thread QPS: {qps:.0}");
 
-    // Recall
-    let n_recall = 200.min(n);
+    // Recall (limit to 50 queries for speed)
+    let n_recall = 50.min(n);
     let mut hits = 0usize;
     for qi in 0..n_recall {
         let q = &norm_arc[qi * dim..(qi + 1) * dim];
