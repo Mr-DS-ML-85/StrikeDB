@@ -3451,12 +3451,14 @@ impl VectorIndex {
         // Each gpu_build_knn_graph call allocates ~534MB GPU RAM.
         // Multiple concurrent calls would exceed 8GB VRAM.
         let gpu_build_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        // GPU graph construction: enabled with GPU_ACCESS lock for thread safety.
-        // All CUDA calls are serialized through GPU_ACCESS Mutex.
-        let use_gpu_build = gpu::gpu_get_mode() == gpu::ComputeMode::Turbo;
-        if use_gpu_build {
-            eprintln!("[GPU] Turbo GPU graph construction enabled (serial)");
-        }
+        // GPU graph construction: DISABLED.
+        // Reason: CUDA driver API contexts are thread-local. The build spawns
+        // 16 threads via thread::scope, and each would need cuCtxSetCurrent +
+        // GPU_ACCESS lock + NVRTC compilation. Even with locking, multi-thread
+        // CUDA from Rust is fundamentally unsafe without proper CUDA runtime
+        // initialization per-thread. Graph build runs on CPU (reliable).
+        // GPU is used for: search (CAGRA kernel) when vectors are on GPU.
+        let use_gpu_build = false;
 
         let segments: Vec<Hnsw> = std::thread::scope(|s| {
             let handles: Vec<_> = ranges

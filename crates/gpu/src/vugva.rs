@@ -29,7 +29,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Where a chunk currently lives in the memory hierarchy.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -116,13 +116,13 @@ impl LookAheadTracker {
 /// Calculates the physical distance between a compute unit and a memory chunk.
 /// In single-GPU, distance is 0 (local) or 1 (host RAM).
 /// In multi-GPU, distance is the hop count through the PCIe/PEX switch.
+#[allow(dead_code)]
 struct NumaRouter {
-    /// Number of GPUs.
     num_gpus: usize,
-    /// GPU VRAM capacities (bytes).
     gpu_vram: Vec<usize>,
 }
 
+#[allow(dead_code)]
 impl NumaRouter {
     fn new(num_gpus: usize, gpu_vram: Vec<usize>) -> Self {
         Self { num_gpus, gpu_vram }
@@ -152,27 +152,17 @@ impl NumaRouter {
     }
 }
 
-/// The VUGVA Virtual Memory Table — Rust-level memory routing engine.
+#[allow(dead_code)]
 pub struct VugvaVmt {
-    /// All chunks (source of truth in chunk.ram_data).
     chunks: Vec<Mutex<VugvaChunk>>,
-    /// Vectors per chunk.
     chunk_size: usize,
-    /// Vector dimension.
     dim: usize,
-    /// Total vectors.
     n: usize,
-    /// GPU VRAM budget for hot data (bytes).
     vram_budget: usize,
-    /// How many chunks fit in VRAM.
     vram_slots: usize,
-    /// Access counter for LRU.
     access_counter: AtomicUsize,
-    /// Look-ahead tracker: predicts next chunks to prefetch.
     lookahead: Mutex<LookAheadTracker>,
-    /// NUMA router: handles multi-GPU topology.
     numa: NumaRouter,
-    /// Background prefetch thread running?
     prefetch_active: AtomicBool,
 }
 

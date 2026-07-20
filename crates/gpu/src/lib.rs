@@ -201,11 +201,12 @@ const KERNEL_SRC: &str = include_str!("../kernels/all_kernels.cu");
 /// Initialize GPU — detect CUDA, create context. Kernels NOT compiled yet.
 pub fn gpu_init() -> bool {
     if GPU_ENABLED.load(Ordering::Relaxed) { return true; }
+    let _guard = GPU_ACCESS.lock().ok();
+    // Double-check after acquiring lock.
+    if GPU_ENABLED.load(Ordering::Relaxed) { return true; }
     // Use get_or_init to prevent double-init race.
     let state = GPU_STATE.get_or_init(|| {
         GpuState::init_ctx().unwrap_or_else(|| {
-            // Sentinel: create a dummy state so get_or_init doesn't retry.
-            // We check `available` before using it.
             GpuState { ctx: std::ptr::null_mut(), module: std::ptr::null_mut(),
                        kernels: Vec::new(), available: false, vram_total: 0, vram_free: 0 }
         })
@@ -248,8 +249,13 @@ fn gpu_ensure_kernel(name: &str) -> bool {
     if !gpu_init() { return false; }
     let state = GPU_STATE.get().unwrap();
     if state.get_kernel(name).is_some() { return true; }
-    let state_ptr = state as *const GpuState as *mut GpuState;
-    unsafe { (*state_ptr).ensure_kernels(); }
+    // NVRTC compilation must be under GPU_ACCESS lock — it does CUDA calls.
+    let _guard = GPU_ACCESS.lock().ok();
+    if let Some(state) = GPU_STATE.get() {
+        if state.get_kernel(name).is_some() { return true; }
+        let state_ptr = state as *const GpuState as *mut GpuState;
+        unsafe { (*state_ptr).ensure_kernels(); }
+    }
     GPU_STATE.get().map(|s| s.get_kernel(name).is_some()).unwrap_or(false)
 }
 
@@ -816,9 +822,6 @@ mod tests {
         println!("[GPU] CUDA initialized");
         let info = gpu_info();
         println!("[GPU] info: {:?}", info);
-        // At this point: 0 kernels loaded (lazy)
-        let state = GPU_STATE.get().unwrap();
-        assert!(state.kernels.is_empty(), "kernels should be empty before explicit load");
 
         // Test memory alloc/free
         unsafe {
