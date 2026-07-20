@@ -359,10 +359,10 @@ pub fn gpu_auto_mode(n: usize, dim: usize) -> ComputeMode {
         return ComputeMode::CpuOnly;
     }
     let (_, _, vram_free) = gpu_check_capacity(n, dim);
-    // Peak VRAM: vectors + kNN build distance matrix + graph + 500MB overhead
+    // Peak VRAM: vectors + kNN build distance matrix (batch_q=64) + graph + overhead
     let shards = 16usize;
     let shard_n = (n + shards - 1) / shards;
-    let build_peak = shard_n * dim + 1024 * shard_n * 4 + shard_n * 80 * 4 + 500 * 1024 * 1024;
+    let build_peak = shard_n * dim + 64 * shard_n * 4 + shard_n * 80 * 4 + 100 * 1024 * 1024;
     let data_only = n * dim + n * 80 * 4;
 
     if build_peak <= vram_free {

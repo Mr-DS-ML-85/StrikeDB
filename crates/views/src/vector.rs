@@ -3451,10 +3451,13 @@ impl VectorIndex {
         // Each gpu_build_knn_graph call allocates ~534MB GPU RAM.
         // Multiple concurrent calls would exceed 8GB VRAM.
         let gpu_build_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        // GPU graph build: disabled — allocates 500MB+ GPU RAM per shard + 671MB index.
-        // Combined with CPU HNSW graph (2GB+ RAM), exceeds system limits.
-        // Graph build runs on CPU (reliable, ~170s).
-        let use_gpu_build = false;
+        // GPU-accelerated HNSW: GPU computes kNN distances, CPU builds graph edges.
+        // CAGRA approach: GPU handles distance computation (batch), CPU wires HNSW edges.
+        // Serialized via GPU_ACCESS lock to prevent multi-thread CUDA crash.
+        let use_gpu_build = gpu::gpu_get_mode() == gpu::ComputeMode::Turbo;
+        if use_gpu_build {
+            eprintln!("[GPU] Turbo: GPU-accelerated HNSW build — GPU computes kNN distances");
+        }
 
         let segments: Vec<Hnsw> = std::thread::scope(|s| {
             let handles: Vec<_> = ranges
