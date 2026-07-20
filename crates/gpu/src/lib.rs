@@ -530,10 +530,10 @@ unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_i
     cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
 
     // Use batch_cosine_dist: Q queries × N vectors per kernel launch.
-    // Q=256 → output = 256×N×4 = 1GB for N=1M. Fits in 7GB VRAM.
-    // Reduces kernel launches from N=1M to ceil(N/256)=3906.
+    // batch_cosine_dist: Q queries × N vectors, output = Q×N×4 bytes.
+    // Q=32 → output = 128MB. Safe VRAM, fast readback.
     let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
-    let batch_q = 256.min(n);
+    let batch_q = 32.min(n);
     let mut knn_flat: Vec<usize> = vec![0usize; n * k_init];
     let mut d_d = 0u64;
     if cuMemAlloc_v2(&mut d_d, batch_q * n * 4) != 0 {
