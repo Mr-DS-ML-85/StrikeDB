@@ -155,6 +155,48 @@ void fill_one_kernel(float* out, int N) {
     if (t < N) out[t] = 1.0f;
 }
 
+// GPU top-k selection kernel: Q×N distances → Q×k top-k indices.
+// Parallel: all threads scan N vectors, thread 0 merges into sorted top-k.
+// Reads only Q×k×8 bytes back (tiny) instead of Q×N×4 (128MB).
+extern "C" __global__
+void topk_select_kernel(
+    const float* __restrict__ dists,   // Q × N distances on GPU
+    int* __restrict__ out_idx,          // Q × k output indices
+    int Q, int N, int k)
+{
+    int qid = blockIdx.x;
+    if (qid >= Q) return;
+    int tid = threadIdx.x;
+
+    extern __shared__ int smem[];
+    int* topk_dot = smem;
+    int* topk_idx = smem + k;
+
+    // Thread 0: sequential top-k scan (k=32 is small, ~32×N comparisons)
+    if (tid == 0) {
+        for (int i = 0; i < k; i++) { topk_dot[i] = -2147483647; topk_idx[i] = -1; }
+        for (int j = 0; j < N; j++) {
+            // Reinterpret float as int for comparison (IEEE 754: positive floats sort same as ints)
+            int d_as_int = __float_as_int(dists[qid * N + j]);
+            if (d_as_int > topk_dot[k - 1]) {
+                // Insert at correct position
+                int pos = k - 1;
+                for (int s = k - 2; s >= 0; s--) {
+                    if (topk_dot[s] >= d_as_int) break;
+                    topk_dot[s + 1] = topk_dot[s];
+                    topk_idx[s + 1] = topk_idx[s];
+                    pos = s;
+                }
+                topk_dot[pos] = d_as_int;
+                topk_idx[pos] = j;
+            }
+        }
+        for (int i = 0; i < k; i++) {
+            out_idx[qid * k + i] = topk_idx[i];
+        }
+    }
+}
+
 extern "C" __global__
 void matmul_kernel(const char* A, const char* B, int* C, int M, int N, int K) {
     int r = blockIdx.y * blockDim.y + threadIdx.y;
