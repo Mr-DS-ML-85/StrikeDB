@@ -3451,10 +3451,11 @@ impl VectorIndex {
         // Each gpu_build_knn_graph call allocates ~534MB GPU RAM.
         // Multiple concurrent calls would exceed 8GB VRAM.
         let gpu_build_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        let use_gpu_build = gpu::gpu_available() && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly;
-        if use_gpu_build {
-            eprintln!("[GPU] GPU graph construction enabled — building kNN on GPU");
-        }
+        // GPU graph construction disabled for now — CUDA driver API is unstable
+        // from multiple threads. Graph build runs on CPU (reliable).
+        // GPU is used for: distance computation (cosine_dist kernel) and
+        // will be used for search when CAGRA is production-ready.
+        let use_gpu_build = false;
 
         let segments: Vec<Hnsw> = std::thread::scope(|s| {
             let handles: Vec<_> = ranges
@@ -4313,36 +4314,25 @@ impl VectorIndex {
             gpu::gpu_set_mode(gpu::ComputeMode::Hybrid);
         }
 
-        // ── HYBRID: CPU graph walk + VUGVA prefetch + GPU distance ──
+        // ── HYBRID: CPU graph walk + CPU rerank (VUGVA manages RAM chunks) ──
+        // VUGVA VMT tracks which chunks are hot/warm but distance computation
+        // still runs on CPU. GPU distance path requires a dedicated kernel that
+        // reads from VUGVA GPU-resident chunks — not yet implemented.
         let g = self.hnsw.read().unwrap();
         let qf = g.query_f32(&q);
         let rerank_k = (k * 4).max(64);
         let candidates = g.search_indices(&qq, rerank_k, ef.max(rerank_k), &qf);
 
-        let vmt_guard = self.vugva_vmt.read().unwrap();
-        if vmt_guard.is_some() && gpu::gpu_available() && mode != gpu::ComputeMode::CpuOnly {
-            let vmt = vmt_guard.as_ref().unwrap();
-            let dim = g.dim;
-            if count % 100 == 0 {
-                eprintln!("[MITM] search_ef#{count} mode={mode:?} VUGVA_PREFETCH candidates={}", candidates.len());
+        if mode != gpu::ComputeMode::CpuOnly {
+            // Prefetch chunks via VUGVA (data management only, CPU computes)
+            let vmt_guard = self.vugva_vmt.read().unwrap();
+            if vmt_guard.is_some() && count % 500 == 0 {
+                let vmt = vmt_guard.as_ref().unwrap();
+                let chunk_indices: Vec<usize> = candidates.iter().map(|&(idx, _)| vmt.chunk_of(idx)).collect();
+                let _prefetched = vmt.prefetch_batch(&chunk_indices);
+                let stats = gpu::vugva::vugva_stats(vmt);
+                eprintln!("[MITM] search_ef#{count} mode={mode:?} VUGVA_PREFETCH {:?}", stats);
             }
-            let chunk_indices: Vec<usize> = candidates.iter().map(|&(idx, _)| vmt.chunk_of(idx)).collect();
-            let prefetched = vmt.prefetch_batch(&chunk_indices);
-            let mut results: Vec<(u64, f32)> = Vec::with_capacity(candidates.len());
-            for chunk in &prefetched {
-                let chunk_n = chunk.chunk_len;
-                if let Some(dists) = gpu::gpu_cosine_dist(&qq, &[], chunk_n, dim) {
-                    for (i, &d) in dists.iter().enumerate() {
-                        let global_idx = chunk.chunk_offset + i;
-                        if let Some(node) = g.nodes.get(global_idx) {
-                            if !node.deleted { results.push((node.id, d)); }
-                        }
-                    }
-                }
-            }
-            results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            results.truncate(k);
-            return results;
         }
 
         // ── CPU fallback: per-candidate f32 rerank ──
