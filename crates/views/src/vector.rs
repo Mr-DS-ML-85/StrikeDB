@@ -3470,7 +3470,7 @@ impl VectorIndex {
                 gpu::gpu_build_knn_graph(&i8_data, n, dim, k_init)
                     .unwrap_or_else(|| {
                         eprintln!("[GPU] GPU kNN failed, CPU fallback");
-                        let mut graph = vec![vec![0usize; k_init]; n];
+                        let mut flat = vec![0usize; n * k_init];
                         for i in 0..n {
                             let mut dists: Vec<(i32, usize)> = (0..n).filter(|&j| j != i).map(|j| {
                                 let mut dot = 0i32;
@@ -3479,9 +3479,12 @@ impl VectorIndex {
                             }).collect();
                             dists.select_nth_unstable_by(k_init, |a, b| b.0.cmp(&a.0));
                             dists.truncate(k_init);
-                            graph[i] = dists.into_iter().map(|(_, j)| j).collect();
+                            let base = i * k_init;
+                            for (j, (_, idx)) in dists.into_iter().enumerate().take(k_init) {
+                                flat[base + j] = idx;
+                            }
                         }
-                        graph
+                        flat
                     })
             };
             // Build ONE HNSW from the GPU kNN edges
@@ -3504,9 +3507,14 @@ impl VectorIndex {
                 });
                 h.id_to_idx.insert(true_row as u64, i);
             }
-            // Wire edges from GPU kNN graph
-            for (i, neighbors) in knn_graph.iter().enumerate() {
-                h.nodes[i].neighbors[0] = neighbors.clone();
+            // Wire edges from flat kNN graph (N × k_init contiguous)
+            for i in 0..n {
+                let base = i * k_init;
+                for j in 0..k_init {
+                    if base + j < knn_graph.len() {
+                        h.nodes[i].neighbors[0].push(knn_graph[base + j]);
+                    }
+                }
             }
             eprintln!("[GPU] HNSW built from GPU kNN: {n} nodes, {k_init} edges/node");
             drop(perm_arc);

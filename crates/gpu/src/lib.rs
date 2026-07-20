@@ -517,53 +517,50 @@ pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize,
 /// stay within VRAM. Returns a flat kNN graph: n × k_init indices.
 ///
 /// This is the CAGRA Phase 1 build — 2.2-27x faster than CPU HNSW.
-pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usize) -> Option<Vec<Vec<usize>>> {
+pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usize) -> Option<Vec<usize>> {
     let _guard = gpu_lock_and_ensure()?;
     unsafe { _gpu_build_knn_graph_impl(vectors_i8, n, dim, k_init) }
 }
 
-unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_init: usize) -> Option<Vec<Vec<usize>>> {
+unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_init: usize) -> Option<Vec<usize>> {
     // Upload all vectors to GPU once
     let v_bytes = n * dim;
     let mut d_v = 0u64;
     if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
     cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
 
+    // Use batch_cosine_dist: Q queries × N vectors per kernel launch.
+    // Q=256 → output = 256×N×4 = 1GB for N=1M. Fits in 7GB VRAM.
+    // Reduces kernel launches from N=1M to ceil(N/256)=3906.
     let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
-
-    // Small batch: 64 queries × N × 4 bytes output. For N=62K shard: 64*62K*4 = 15MB.
-    // batch_q * n * 4 must fit in VRAM. For 1M vectors with 7GB VRAM:
-    // 512 * 1M * 4 = 2GB output buffer. Safe.
-    let batch_q = 512.min(n);
-    let mut knn_graph: Vec<Vec<usize>> = vec![vec![0usize; k_init]; n];
-    let mut q_buf: Vec<i8> = vec![0i8; batch_q * dim];
+    let batch_q = 256.min(n);
+    let mut knn_flat: Vec<usize> = vec![0usize; n * k_init];
     let mut d_d = 0u64;
     if cuMemAlloc_v2(&mut d_d, batch_q * n * 4) != 0 {
-        cuMemFree_v2(d_v);
-        return None;
+        cuMemFree_v2(d_v); return None;
+    }
+    let mut d_q = 0u64;
+    if cuMemAlloc_v2(&mut d_q, batch_q * dim) != 0 {
+        cuMemFree_v2(d_v); cuMemFree_v2(d_d); return None;
     }
     let threads = 256u32;
 
-    eprintln!("[GPU] Building kNN graph: {n} vectors, dim={dim}, k_init={k_init}, batch={batch_q}");
+    eprintln!("[GPU] Building kNN graph: {n} vecs, dim={dim}, k={k_init}, batch={batch_q}");
+    let t_total = std::time::Instant::now();
+    let mut t_kernel = std::time::Duration::ZERO;
+    let mut t_cpu = std::time::Duration::ZERO;
 
     for batch_start in (0..n).step_by(batch_q) {
         let batch_end = (batch_start + batch_q).min(n);
         let q_count = batch_end - batch_start;
 
-        // Copy query batch to host buffer
-        for i in 0..q_count {
-            let src = (batch_start + i) * dim;
-            let dst = i * dim;
-            q_buf[dst..dst + dim].copy_from_slice(&vectors_i8[src..src + dim]);
-        }
+        // CPU: upload query batch (continuous slice, no per-query copy)
+        let t0 = std::time::Instant::now();
+        cuMemcpyHtoD_v2(d_q, vectors_i8[batch_start * dim..batch_end * dim].as_ptr() as *const std::ffi::c_void, q_count * dim);
+        t_cpu += t0.elapsed();
 
-        // Upload queries
-        let q_bytes = q_count * dim;
-        let mut d_q = 0u64;
-        if cuMemAlloc_v2(&mut d_q, q_bytes) != 0 { continue; }
-        cuMemcpyHtoD_v2(d_q, q_buf.as_ptr() as *const std::ffi::c_void, q_bytes);
-
-        // Launch batch_cosine_dist: Q queries × N vectors
+        // GPU: batch_cosine_dist kernel
+        let t1 = std::time::Instant::now();
         let mut arg0 = d_q as *mut std::ffi::c_void;
         let mut arg1 = d_v as *mut std::ffi::c_void;
         let mut arg2 = d_d as *mut std::ffi::c_void;
@@ -571,38 +568,38 @@ unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_i
         let mut arg4 = n as *mut std::ffi::c_void;
         let mut arg5 = dim as *mut std::ffi::c_void;
         let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
-
         let r = cuLaunchKernel(func, q_count as u32, 1, 1, threads, 1, 1, 0,
             std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
             std::ptr::null_mut());
-        if r != 0 { cuMemFree_v2(d_q); continue; }
+        if r != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_d); return None; }
         cuCtxSynchronize();
+        t_kernel += t1.elapsed();
 
-        // Read back distances and find top-k per query
+        // CPU: read Q×N distances, find top-k per query
         let mut dists = vec![0.0f32; q_count * n];
         cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, q_count * n * 4);
-        cuMemFree_v2(d_q);
-
-        // For each query in batch, find k_init nearest (excluding self)
         for qi in 0..q_count {
             let global_q = batch_start + qi;
             let row = &dists[qi * n..(qi + 1) * n];
-            // Find k_init smallest distances (simple selection)
             let mut candidates: Vec<(f32, usize)> = row.iter().enumerate()
                 .filter(|&(i, _)| i != global_q)
-                .map(|(i, &d)| (d, i))
-                .collect();
-            // Partial sort — just find top-k smallest
+                .map(|(i, &d)| (d, i)).collect();
             candidates.select_nth_unstable_by(k_init, |a, b| a.0.partial_cmp(&b.0).unwrap());
             candidates.truncate(k_init);
-            knn_graph[global_q] = candidates.into_iter().map(|(_, i)| i).collect();
+            let base = global_q * k_init;
+            for (j, (_, idx)) in candidates.into_iter().enumerate().take(k_init) {
+                knn_flat[base + j] = idx;
+            }
         }
     }
 
+    let total = t_total.elapsed();
+    eprintln!("[GPU] kNN done: {n}×{dim}, k={k_init} in {:.1}s (kernel={:.1}s cpu={:.1}s)",
+        total.as_secs_f64(), t_kernel.as_secs_f64(), t_cpu.as_secs_f64());
     cuMemFree_v2(d_v);
+    cuMemFree_v2(d_q);
     cuMemFree_v2(d_d);
-    eprintln!("[GPU] kNN graph built: {n} × {k_init}");
-    Some(knn_graph)
+    Some(knn_flat)
 }
 
 /// INT8 matmul on GPU. Auto-loads kernel if needed.
