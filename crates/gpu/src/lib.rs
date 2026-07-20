@@ -96,6 +96,8 @@ static GPU_ENABLED: AtomicBool = AtomicBool::new(false);
 static KERNELS_COMPILED: AtomicBool = AtomicBool::new(false);
 static KERNELS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static KERNEL_LOCK: Mutex<()> = Mutex::new(());
+// CUDA driver API is NOT thread-safe. All CUDA calls MUST go through this lock.
+static GPU_ACCESS: Mutex<()> = Mutex::new(());
 
 impl GpuState {
     /// Initialize CUDA context + detect VRAM. NO kernel compilation.
@@ -379,8 +381,24 @@ impl ComputeMode {
     pub const GpuRamCpu: Self = ComputeMode::Hybrid;
 }
 
-/// Ensure current thread has the CUDA context active.
+/// Ensure current thread has the CUDA context active AND holds the GPU lock.
 /// CUDA driver API contexts are thread-local; must be set per-thread.
+/// The GPU_ACCESS lock serializes all CUDA operations to prevent crashes.
+fn ensure_ctx_locked() -> Option<std::sync::MutexGuard<'static, ()>> {
+    let guard = GPU_ACCESS.lock().ok()?;
+    if let Some(state) = GPU_STATE.get() {
+        unsafe {
+            if cuCtxSetCurrent(state.ctx) != 0 {
+                return None;
+            }
+        }
+        Some(guard)
+    } else {
+        None
+    }
+}
+
+/// Ensure current thread has the CUDA context active (no lock).
 fn ensure_ctx() -> bool {
     if let Some(state) = GPU_STATE.get() {
         unsafe { cuCtxSetCurrent(state.ctx) == 0 }
@@ -389,80 +407,12 @@ fn ensure_ctx() -> bool {
     }
 }
 
-// ── VUGVA Unified Memory: GPU reads RAM directly ─────────────────────────
-// The VUGVA paper's core insight: eliminate CPU-mediated data shuttling.
-// cuMemAllocManaged allocates unified memory that both GPU and CPU can access.
-// The GPU kernel dereferences a host pointer; if the page isn't in VRAM,
-// CUDA's page-migrator pulls it via DMA — no CPU involvement.
-// This is "software RDMA at the virtual level" (VUGVA Section 3.2).
-
-/// Allocate unified memory — GPU can read directly from host RAM.
-/// No cuMemcpyHtoD needed. GPU kernels receive the same pointer;
-/// CUDA handles page migration transparently.
-pub fn gpu_alloc_managed(size: usize) -> Option<u64> {
-    if !ensure_ctx() { return None; }
-    unsafe {
-        let mut d = 0u64;
-        let ret = cuMemAllocManaged(&mut d, size, CU_MEM_ATTACH_GLOBAL);
-        if ret == 0 { Some(d) } else { None }
-    }
-}
-
-/// Free unified memory.
-pub fn gpu_free_managed(ptr: u64) {
-    unsafe { cuMemFree_v2(ptr); }
-}
-
-/// VUGVA-style batch search: GPU reads vectors directly from RAM.
-/// Queries are on CPU, vectors live in unified memory.
-/// The GPU kernel reads query from CPU, vectors from RAM — no copies.
-pub fn gpu_vugva_batch_dist(
-    query_i8: &[i8],
-    vectors_unified: u64,
-    n: usize,
-    dim: usize,
-) -> Option<Vec<f32>> {
-    if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
-    let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
-    if !ensure_ctx() { return None; }
-    unsafe {
-        // Only upload the query (tiny: dim bytes). Vectors stay in RAM.
-        let mut d_q = 0u64;
-        if cuMemAlloc_v2(&mut d_q, query_i8.len()) != 0 { return None; }
-        cuMemcpyHtoD_v2(d_q, query_i8.as_ptr() as *const std::ffi::c_void, query_i8.len());
-        // Output buffer
-        let mut d_d = 0u64;
-        if cuMemAlloc_v2(&mut d_d, n * 4) != 0 { cuMemFree_v2(d_q); return None; }
-        // Launch: Q=1, vectors in unified memory (GPU reads from RAM directly)
-        let mut arg0 = d_q as *mut std::ffi::c_void;
-        let mut arg1 = vectors_unified as *mut std::ffi::c_void; // RAM pointer!
-        let mut arg2 = d_d as *mut std::ffi::c_void;
-        let mut arg3 = 1usize as *mut std::ffi::c_void;
-        let mut arg4 = n as *mut std::ffi::c_void;
-        let mut arg5 = dim as *mut std::ffi::c_void;
-        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
-        let threads = 256u32;
-        let r = cuLaunchKernel(func, 1, 1, 1, threads, 1, 1, 0,
-            std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
-            std::ptr::null_mut());
-        if r != 0 {
-            cuMemFree_v2(d_q); cuMemFree_v2(d_d);
-            return None;
-        }
-        cuCtxSynchronize();
-        let mut dists = vec![0.0f32; n];
-        cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, n * 4);
-        cuMemFree_v2(d_q); cuMemFree_v2(d_d);
-        Some(dists)
-    }
-}
-
 /// INT8 cosine distance on GPU. Auto-loads kernel if needed.
 /// Returns None if GPU unavailable.
 pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Option<Vec<f32>> {
     if !gpu_ensure_kernel("cosine_dist") { return None; }
     let func = GPU_STATE.get()?.get_kernel("cosine_dist")?;
-    if !ensure_ctx() { return None; }
+    let _guard = ensure_ctx_locked()?;
     unsafe {
         let q_bytes = query.len();
         let v_bytes = vectors.len();
@@ -512,7 +462,7 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
 pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize, dim: usize) -> Option<Vec<f32>> {
     if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
     let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
-    if !ensure_ctx() { return None; }
+    let _guard = ensure_ctx_locked()?;
     unsafe {
         let q_bytes = q * dim;
         let v_bytes = n * dim;
@@ -564,7 +514,7 @@ pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize,
 /// This is the CAGRA Phase 1 build — 2.2-27x faster than CPU HNSW.
 pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usize) -> Option<Vec<Vec<usize>>> {
     if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
-    if !ensure_ctx() { return None; }
+    let _guard = ensure_ctx_locked()?;
     unsafe { _gpu_build_knn_graph_impl(vectors_i8, n, dim, k_init) }
 }
 
@@ -728,7 +678,7 @@ impl GpuIndex {
 /// - Hybrid: vectors in unified memory (GPU reads from RAM via page faults)
 pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], n: usize, dim: usize, degree: usize) -> Option<GpuIndex> {
     if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
-    if !ensure_ctx() { return None; }
+    let _guard = ensure_ctx_locked()?;
     let mode = gpu_get_mode();
     unsafe {
         let v_bytes = n * dim;
@@ -765,62 +715,6 @@ pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], n: usize, dim: usi
     }
 }
 
-/// GPU brute-force search using GPU-resident vectors from GpuIndex.
-/// Only uploads the query (dim bytes). Vectors stay on GPU.
-/// This is the TURBO path — full GPU, zero CPU work.
-pub fn gpu_brute_force_search(
-    index: &GpuIndex,
-    query_i8: &[i8],
-    k: usize,
-) -> Option<Vec<(usize, f32)>> {
-    if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
-    let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
-    if !ensure_ctx() { return None; }
-    unsafe {
-        let dim = index.dim;
-        let n = index.n;
-        // Upload ONLY the query (dim bytes, not N*dim)
-        let mut d_q = 0u64;
-        if cuMemAlloc_v2(&mut d_q, dim) != 0 { return None; }
-        cuMemcpyHtoD_v2(d_q, query_i8.as_ptr() as *const std::ffi::c_void, dim);
-        // Output buffer: N floats
-        let mut d_d = 0u64;
-        if cuMemAlloc_v2(&mut d_d, n * 4) != 0 { cuMemFree_v2(d_q); return None; }
-        // Launch: 1 block (one query), 256 threads, vectors already on GPU
-        let mut arg0 = d_q as *mut std::ffi::c_void;
-        let mut arg1 = index.d_vectors as *mut std::ffi::c_void;  // GPU-resident!
-        let mut arg2 = d_d as *mut std::ffi::c_void;
-        let mut arg3 = 1usize as *mut std::ffi::c_void;  // Q=1
-        let mut arg4 = n as *mut std::ffi::c_void;
-        let mut arg5 = dim as *mut std::ffi::c_void;
-        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
-        let threads = 256u32;
-        let r = cuLaunchKernel(func, 1, 1, 1, threads, 1, 1, 0,
-            std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
-            std::ptr::null_mut());
-        if r != 0 {
-            let mut err_str: *const i8 = std::ptr::null();
-            cuGetErrorString(r, &mut err_str);
-            let msg = if err_str.is_null() { "unknown".to_string() }
-                      else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
-            eprintln!("[GPU] brute_force_search error {}: {}", r, msg);
-            cuMemFree_v2(d_q); cuMemFree_v2(d_d);
-            return None;
-        }
-        cuCtxSynchronize();
-        // Read N distances back
-        let mut dists = vec![0.0f32; n];
-        cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, n * 4);
-        cuMemFree_v2(d_q);
-        cuMemFree_v2(d_d);
-        // Find top-k
-        let mut results: Vec<(f32, usize)> = dists.into_iter().enumerate().map(|(i, d)| (d, i)).collect();
-        results.select_nth_unstable_by(k, |a, b| a.0.partial_cmp(&b.0).unwrap());
-        results.truncate(k);
-        Some(results.into_iter().map(|(d, i)| (i, d)).collect())
-    }
-}
-
 /// CAGRA-style GPU search: batch of INT8 queries → top-k results.
 /// The entire graph traversal runs on GPU — no CPU graph walks.
 /// `entry_node` is the starting point for graph traversal (0 = default random).
@@ -834,7 +728,7 @@ pub fn gpu_search(
     entry_node: usize,
 ) -> Option<(Vec<i32>, Vec<f32>)> {
     let func = GPU_STATE.get()?.get_kernel("cagra_search")?;
-    if !ensure_ctx() { return None; }
+    let _guard = ensure_ctx_locked()?;
     let dim = index.dim;
     let n = index.n;
     let degree = index.degree;

@@ -3451,11 +3451,12 @@ impl VectorIndex {
         // Each gpu_build_knn_graph call allocates ~534MB GPU RAM.
         // Multiple concurrent calls would exceed 8GB VRAM.
         let gpu_build_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        // GPU graph construction disabled for now — CUDA driver API is unstable
-        // from multiple threads. Graph build runs on CPU (reliable).
-        // GPU is used for: distance computation (cosine_dist kernel) and
-        // will be used for search when CAGRA is production-ready.
-        let use_gpu_build = false;
+        // GPU graph construction: enabled with GPU_ACCESS lock for thread safety.
+        // All CUDA calls are serialized through GPU_ACCESS Mutex.
+        let use_gpu_build = gpu::gpu_get_mode() == gpu::ComputeMode::Turbo;
+        if use_gpu_build {
+            eprintln!("[GPU] Turbo GPU graph construction enabled (serial)");
+        }
 
         let segments: Vec<Hnsw> = std::thread::scope(|s| {
             let handles: Vec<_> = ranges
