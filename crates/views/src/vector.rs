@@ -3451,11 +3451,10 @@ impl VectorIndex {
         // Each gpu_build_knn_graph call allocates ~534MB GPU RAM.
         // Multiple concurrent calls would exceed 8GB VRAM.
         let gpu_build_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        // GPU graph construction: Turbo mode only, serialized via GPU_ACCESS lock.
-        let use_gpu_build = gpu::gpu_get_mode() == gpu::ComputeMode::Turbo;
-        if use_gpu_build {
-            eprintln!("[GPU] Turbo mode: GPU graph construction enabled");
-        }
+        // GPU graph build: disabled — allocates 500MB+ GPU RAM per shard + 671MB index.
+        // Combined with CPU HNSW graph (2GB+ RAM), exceeds system limits.
+        // Graph build runs on CPU (reliable, ~170s).
+        let use_gpu_build = false;
 
         let segments: Vec<Hnsw> = std::thread::scope(|s| {
             let handles: Vec<_> = ranges
@@ -3910,11 +3909,20 @@ impl VectorIndex {
         let degree = g.nodes.first().map(|n| n.neighbors.first().map_or(0, |l| l.len())).unwrap_or(0);
         if degree == 0 || n == 0 { return; }
         // Build flat CSR graph: n × degree × i32
+        // Pad missing neighbors with self-loops (node→self) so the GPU kernel
+        // always has valid neighbors to explore. -1 holes break graph traversal.
         let mut graph_flat: Vec<i32> = vec![-1i32; n * degree];
         for (i, node) in g.nodes.iter().enumerate() {
+            let i32_i = i as i32;
             if let Some(level0) = node.neighbors.first() {
                 for (j, &neighbor) in level0.iter().enumerate().take(degree) {
                     graph_flat[i * degree + j] = neighbor as i32;
+                }
+            }
+            // Pad remaining slots with self-loop
+            for j in 0..degree {
+                if graph_flat[i * degree + j] == -1 {
+                    graph_flat[i * degree + j] = i32_i;
                 }
             }
         }

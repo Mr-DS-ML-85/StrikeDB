@@ -531,10 +531,8 @@ unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_i
 
     let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
 
-    // Adaptive batch size: fit output in available VRAM.
-    // Output = batch_q * n * 4 bytes. Cap at 500MB to leave headroom.
-    let max_output_bytes = 500 * 1024 * 1024; // 500MB
-    let batch_q = (max_output_bytes / (n * 4).max(1)).max(1).min(n).min(512);
+    // Small batch: 64 queries × N × 4 bytes output. For N=62K shard: 64*62K*4 = 15MB.
+    let batch_q = 64.min(n);
     let mut knn_graph: Vec<Vec<usize>> = vec![vec![0usize; k_init]; n];
     let mut q_buf: Vec<i8> = vec![0i8; batch_q * dim];
     let mut d_d = 0u64;
@@ -722,15 +720,14 @@ pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], n: usize, dim: usi
         cuMemcpyHtoD_v2(d_g, graph_flat.as_ptr() as *const std::ffi::c_void, g_bytes);
 
         // VUGVA: Pre-allocate persistent search buffers (reused per query).
-        // Max 256 queries × dim query + 256 × 128 × 4 results = tiny.
-        let max_q = 256;
-        let max_k = 128;
+        let max_q = 16;  // max batch size for multi-query search
+        let max_k = 64;  // max topk
         let mut d_qb = 0u64;
         let mut d_ib = 0u64;
         let mut d_db = 0u64;
-        let _ = cuMemAlloc_v2(&mut d_qb, max_q * dim); // query buffer
-        let _ = cuMemAlloc_v2(&mut d_ib, max_q * max_k * 4); // idx buffer
-        let _ = cuMemAlloc_v2(&mut d_db, max_q * max_k * 4); // dist buffer
+        let _ = cuMemAlloc_v2(&mut d_qb, max_q * dim);
+        let _ = cuMemAlloc_v2(&mut d_ib, max_q * max_k * 4);
+        let _ = cuMemAlloc_v2(&mut d_db, max_q * max_k * 4);
         eprintln!("[GPU] Index: {} vecs × {}d, degree={}, persistent search buffers allocated", n, dim, degree);
         Some(GpuIndex { d_vectors: d_v, d_graph: d_g, n, dim, degree,
                         d_query_buf: d_qb, d_idx_buf: d_ib, d_dist_buf: d_db })
