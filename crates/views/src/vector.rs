@@ -3451,14 +3451,11 @@ impl VectorIndex {
         // Each gpu_build_knn_graph call allocates ~534MB GPU RAM.
         // Multiple concurrent calls would exceed 8GB VRAM.
         let gpu_build_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        // GPU graph construction: DISABLED.
-        // Reason: CUDA driver API contexts are thread-local. The build spawns
-        // 16 threads via thread::scope, and each would need cuCtxSetCurrent +
-        // GPU_ACCESS lock + NVRTC compilation. Even with locking, multi-thread
-        // CUDA from Rust is fundamentally unsafe without proper CUDA runtime
-        // initialization per-thread. Graph build runs on CPU (reliable).
-        // GPU is used for: search (CAGRA kernel) when vectors are on GPU.
-        let use_gpu_build = false;
+        // GPU graph construction: Turbo mode only, serialized via GPU_ACCESS lock.
+        let use_gpu_build = gpu::gpu_get_mode() == gpu::ComputeMode::Turbo;
+        if use_gpu_build {
+            eprintln!("[GPU] Turbo mode: GPU graph construction enabled");
+        }
 
         let segments: Vec<Hnsw> = std::thread::scope(|s| {
             let handles: Vec<_> = ranges
@@ -4296,11 +4293,16 @@ impl VectorIndex {
                 if let Some((indices, _distances)) = gpu::gpu_search(
                     idx, &qq, 1, k, itopk, max_iters, 0,
                 ) {
+                    if count < 3 {
+                        let valid: Vec<_> = indices.iter().filter(|&&i| i >= 0).collect();
+                        eprintln!("[DEBUG] GPU search query#{}: {} valid results out of {} total, first 5: {:?}",
+                            count, valid.len(), k, &indices[..k.min(indices.len())]);
+                    }
                     if count % 100 == 0 {
                         eprintln!("[MITM] search_ef#{count} mode=Turbo GPU_CAGRA n={}", idx.n);
                     }
                     let g = self.hnsw.read().unwrap();
-                    return indices.iter().filter(|&&i| i >= 0).filter_map(|&i| {
+                    let results: Vec<(u64, f32)> = indices.iter().filter(|&&i| i >= 0).filter_map(|&i| {
                         let idx = i as usize;
                         let node = g.nodes.get(idx)?;
                         if node.deleted { return None; }
@@ -4308,6 +4310,10 @@ impl VectorIndex {
                         let d = (1.0 - dot).max(0.0).min(2.0);
                         Some((node.id, d))
                     }).collect();
+                    if count < 3 {
+                        eprintln!("[DEBUG] GPU results: {:?}", &results[..results.len().min(5)]);
+                    }
+                    return results;
                 }
             }
             if count % 100 == 0 {

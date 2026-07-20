@@ -247,16 +247,33 @@ pub fn gpu_load_kernel(name: &str) -> bool {
 /// Called internally before gpu_cosine_dist / gpu_matmul.
 fn gpu_ensure_kernel(name: &str) -> bool {
     if !gpu_init() { return false; }
-    let state = GPU_STATE.get().unwrap();
-    if state.get_kernel(name).is_some() { return true; }
-    // NVRTC compilation must be under GPU_ACCESS lock — it does CUDA calls.
-    let _guard = GPU_ACCESS.lock().ok();
+    if KERNELS_ATTEMPTED.load(Ordering::Acquire) {
+        return GPU_STATE.get().map(|s| s.get_kernel(name).is_some()).unwrap_or(false);
+    }
+    // First-time compilation: acquire GPU_ACCESS lock (does CUDA calls).
+    if let Some(_guard) = GPU_ACCESS.lock().ok() {
+        if let Some(state) = GPU_STATE.get() {
+            if state.get_kernel(name).is_some() { return true; }
+            let state_ptr = state as *const GpuState as *mut GpuState;
+            unsafe { (*state_ptr).ensure_kernels(); }
+        }
+    }
+    GPU_STATE.get().map(|s| s.get_kernel(name).is_some()).unwrap_or(false)
+}
+
+/// Acquire GPU_ACCESS lock and ensure kernels are compiled.
+/// Callers that need both lock and kernels should call this instead of
+/// gpu_ensure_kernel + GPU_ACCESS.lock() separately (avoids deadlock).
+fn gpu_lock_and_ensure() -> Option<std::sync::MutexGuard<'static, ()>> {
+    let guard = GPU_ACCESS.lock().ok()?;
+    // Kernels already compiled? Just return the lock.
+    if KERNELS_COMPILED.load(Ordering::Acquire) { return Some(guard); }
+    // First time: compile kernels while holding the lock.
     if let Some(state) = GPU_STATE.get() {
-        if state.get_kernel(name).is_some() { return true; }
         let state_ptr = state as *const GpuState as *mut GpuState;
         unsafe { (*state_ptr).ensure_kernels(); }
     }
-    GPU_STATE.get().map(|s| s.get_kernel(name).is_some()).unwrap_or(false)
+    Some(guard)
 }
 
 /// Get GPU info (RESP: GPU.INFO).
@@ -388,22 +405,6 @@ impl ComputeMode {
 }
 
 /// Ensure current thread has the CUDA context active AND holds the GPU lock.
-/// CUDA driver API contexts are thread-local; must be set per-thread.
-/// The GPU_ACCESS lock serializes all CUDA operations to prevent crashes.
-fn ensure_ctx_locked() -> Option<std::sync::MutexGuard<'static, ()>> {
-    let guard = GPU_ACCESS.lock().ok()?;
-    if let Some(state) = GPU_STATE.get() {
-        unsafe {
-            if cuCtxSetCurrent(state.ctx) != 0 {
-                return None;
-            }
-        }
-        Some(guard)
-    } else {
-        None
-    }
-}
-
 /// Ensure current thread has the CUDA context active (no lock).
 fn ensure_ctx() -> bool {
     if let Some(state) = GPU_STATE.get() {
@@ -416,9 +417,8 @@ fn ensure_ctx() -> bool {
 /// INT8 cosine distance on GPU. Auto-loads kernel if needed.
 /// Returns None if GPU unavailable.
 pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Option<Vec<f32>> {
-    if !gpu_ensure_kernel("cosine_dist") { return None; }
+    let _guard = gpu_lock_and_ensure()?;
     let func = GPU_STATE.get()?.get_kernel("cosine_dist")?;
-    let _guard = ensure_ctx_locked()?;
     unsafe {
         let q_bytes = query.len();
         let v_bytes = vectors.len();
@@ -466,9 +466,8 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
 /// This is the CAGRA distance kernel — Q blocks, one per query.
 /// Returns None if GPU unavailable.
 pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize, dim: usize) -> Option<Vec<f32>> {
-    if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
+    let _guard = gpu_lock_and_ensure()?;
     let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
-    let _guard = ensure_ctx_locked()?;
     unsafe {
         let q_bytes = q * dim;
         let v_bytes = n * dim;
@@ -519,8 +518,7 @@ pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize,
 ///
 /// This is the CAGRA Phase 1 build — 2.2-27x faster than CPU HNSW.
 pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usize) -> Option<Vec<Vec<usize>>> {
-    if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
-    let _guard = ensure_ctx_locked()?;
+    let _guard = gpu_lock_and_ensure()?;
     unsafe { _gpu_build_knn_graph_impl(vectors_i8, n, dim, k_init) }
 }
 
@@ -690,8 +688,7 @@ impl GpuIndex {
 /// - Turbo: vectors in VRAM (fast access, cuMemAlloc + copy)
 /// - Hybrid: vectors in unified memory (GPU reads from RAM via page faults)
 pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], n: usize, dim: usize, degree: usize) -> Option<GpuIndex> {
-    if !gpu_ensure_kernel("batch_cosine_dist") { return None; }
-    let _guard = ensure_ctx_locked()?;
+    let _guard = gpu_lock_and_ensure()?;
     let mode = gpu_get_mode();
     unsafe {
         let v_bytes = n * dim;
@@ -753,7 +750,7 @@ pub fn gpu_search(
     entry_node: usize,
 ) -> Option<(Vec<i32>, Vec<f32>)> {
     let func = GPU_STATE.get()?.get_kernel("cagra_search")?;
-    let _guard = ensure_ctx_locked()?;
+    let _guard = gpu_lock_and_ensure()?;
     let dim = index.dim;
     let n = index.n;
     let degree = index.degree;

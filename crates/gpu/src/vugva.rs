@@ -6,7 +6,7 @@
 //!
 //! This eliminates the 25ms overhead that makes GPU slower than CPU for search.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Pre-allocated GPU buffers for zero-allocation search.
 /// Created once, reused for ALL search queries.
@@ -165,7 +165,7 @@ impl VugvaVmt {
     }
 
     /// Get pre-allocated search buffers.
-    pub fn get_search_buffers(&self) -> std::sync::MutexGuard<Option<VugvaSearchBuffers>> {
+    pub fn get_search_buffers(&self) -> std::sync::MutexGuard<'_, Option<VugvaSearchBuffers>> {
         self.search_buffers.lock().unwrap()
     }
 
