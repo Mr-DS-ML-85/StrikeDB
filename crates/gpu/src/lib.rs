@@ -362,7 +362,7 @@ pub fn gpu_auto_mode(n: usize, dim: usize) -> ComputeMode {
     // Peak VRAM: vectors + kNN build distance matrix (batch_q=64) + graph + overhead
     let shards = 16usize;
     let shard_n = (n + shards - 1) / shards;
-    let build_peak = shard_n * dim + 64 * shard_n * 4 + shard_n * 80 * 4 + 100 * 1024 * 1024;
+    let build_peak = shard_n * dim + 512 * shard_n * 4 + 20 * 1024 * 1024;
     let data_only = n * dim + n * 80 * 4;
 
     if build_peak <= vram_free {
@@ -532,7 +532,9 @@ unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_i
     let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
 
     // Small batch: 64 queries × N × 4 bytes output. For N=62K shard: 64*62K*4 = 15MB.
-    let batch_q = 64.min(n);
+    // batch_q * n * 4 must fit in VRAM. For 1M vectors with 7GB VRAM:
+    // 512 * 1M * 4 = 2GB output buffer. Safe.
+    let batch_q = 512.min(n);
     let mut knn_graph: Vec<Vec<usize>> = vec![vec![0usize; k_init]; n];
     let mut q_buf: Vec<i8> = vec![0i8; batch_q * dim];
     let mut d_d = 0u64;

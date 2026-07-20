@@ -1,16 +1,23 @@
 //! Quick in-process ingest + search benchmark on real datasets.
 use std::time::Instant;
 
-fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: &[f32], cores: usize) {
+fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: Vec<f32>, cores: usize) -> Vec<f32> {
+    // norm is OWNED — we can drop it after extracting what's needed.
+    // This saves 1.5-3GB RAM during build.
     let nq = 200.min(n);
-    // Extract queries (tiny: 200 × 384 × 4 = 300KB)
     let queries: Vec<f32> = (0..nq).flat_map(|qi| norm[qi * dim..(qi + 1) * dim].iter().copied()).collect();
 
-    // Set compute mode
     match mode {
-        "turbo" => { gpu::gpu_set_mode(gpu::ComputeMode::Turbo); }
-        "hybrid" => { gpu::gpu_set_mode(gpu::ComputeMode::Hybrid); }
-        "cpu" => { gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly); }
+        "turbo" => {
+            let detected = gpu::gpu_auto_mode(n, dim);
+            if detected != gpu::ComputeMode::Turbo {
+                eprintln!("[GPU] WARNING: data may exceed VRAM. Using {:?}", detected);
+            } else {
+                gpu::gpu_set_mode(gpu::ComputeMode::Turbo);
+            }
+        }
+        "hybrid" => gpu::gpu_set_mode(gpu::ComputeMode::Hybrid),
+        "cpu" => gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly),
         _ => { gpu::gpu_auto_mode(n, dim); }
     }
     let actual_mode = gpu::gpu_get_mode();
@@ -18,7 +25,7 @@ fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: &[f32], cores:
     println!("  MODE: {:?} | {n} × {dim}d | {cores} cores", actual_mode);
     println!("{}", "=".repeat(56));
 
-    // Ground truth FIRST (before build, while norm is fresh)
+    // Ground truth FIRST (while norm is fresh)
     let n_recall = 50.min(nq);
     println!("Computing recall ground truth ({n_recall} queries)...");
     let t_bf = Instant::now();
@@ -33,17 +40,16 @@ fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: &[f32], cores:
         truth.iter().take(10).map(|(_, id)| *id).collect()
     }).collect();
     println!("  ground truth: {:.1}s", t_bf.elapsed().as_secs_f64());
-    // NOTE: norm is still alive (borrowed from caller) but no longer needed after this point.
-    // The graph build will keep it alive during construction.
 
-    // Build graph with tiered mmap (all_f32 on mmap, saves 1.5-3GB)
-    println!("Building HNSW graph (tiered mmap)...");
+    // Build graph — GPU path stores only all_i8 (no f32 copies)
+    println!("Building HNSW graph...");
     let t2 = Instant::now();
-    let vi = views::VectorIndex::build_parallel_tiered(norm, dim, cores, true);
+    let vi = views::VectorIndex::build_parallel_tiered(&norm, dim, cores, true);
+    // norm is no longer needed after build — drop it to free RAM
+    drop(norm);
     let build_s = t2.elapsed().as_secs_f64();
     println!("  build: {build_s:.1}s ({:.0} vec/s)", n as f64 / build_s);
 
-    // Upload to GPU for turbo/hybrid
     if matches!(actual_mode, gpu::ComputeMode::Turbo | gpu::ComputeMode::Hybrid) {
         println!("  Uploading graph to GPU...");
         vi.upload_to_gpu();
@@ -94,6 +100,9 @@ fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: &[f32], cores:
     let recall = hits as f64 / (n_recall * 10) as f64;
     println!("  Recall@10: {recall:.3}");
     println!("  Mode: {actual_mode:?} | Build: {build_s:.1}s | QPS: {qps:.0} | p50: {p50}µs | Recall: {recall:.3}");
+
+    // Return queries for recall (norm is dropped)
+    std::sync::Arc::try_unwrap(queries_arc).unwrap_or_else(|arc| (*arc).clone())
 }
 
 fn main() {
@@ -113,8 +122,9 @@ fn main() {
     let dim = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let mut data: Vec<f32> = unsafe { std::slice::from_raw_parts(bytes[8..].as_ptr() as *const f32, n * dim).to_vec() };
     println!("  loaded {n} × {dim}d in {:.1}s", t0.elapsed().as_secs_f64());
+    drop(bytes);
 
-    // L2 normalize IN PLACE on data (saves 1.5GB clone)
+    // L2 normalize in-place
     println!("Normalizing...");
     let t1 = Instant::now();
     for i in 0..n {
@@ -125,16 +135,15 @@ fn main() {
         for j in 0..dim { data[base + j] *= inv; }
     }
     println!("  normalized in {:.1}s", t1.elapsed().as_secs_f64());
-    drop(bytes); // Free raw file bytes
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
 
     if mode == "all" {
         for m in &["cpu", "hybrid", "turbo"] {
-            run_bench(path, m, n, dim, &data, cores);
+            data = run_bench(path, m, n, dim, data, cores);
         }
     } else {
-        run_bench(path, mode, n, dim, &data, cores);
+        run_bench(path, mode, n, dim, data, cores);
     }
 
     println!("\n{}", "=".repeat(56));
