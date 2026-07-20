@@ -3451,14 +3451,77 @@ impl VectorIndex {
         // Each gpu_build_knn_graph call allocates ~534MB GPU RAM.
         // Multiple concurrent calls would exceed 8GB VRAM.
         let gpu_build_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        // GPU-accelerated HNSW: GPU computes kNN distances, CPU builds graph edges.
-        // CAGRA approach: GPU handles distance computation (batch), CPU wires HNSW edges.
-        // Serialized via GPU_ACCESS lock to prevent multi-thread CUDA crash.
+        // ═══ GPU-accelerated HNSW (CAGRA approach) ═══
+        // GPU computes kNN graph for the ENTIRE dataset in one pass.
+        // Then build ONE HNSW from those edges — no segments, no copies.
+        // CPU only wires edges (fast). GPU does all distance computation.
         let use_gpu_build = gpu::gpu_get_mode() == gpu::ComputeMode::Turbo;
         if use_gpu_build {
-            eprintln!("[GPU] Turbo: GPU-accelerated HNSW build — GPU computes kNN distances");
+            eprintln!("[GPU] Turbo: CAGRA-style — GPU builds kNN, HNSW wires edges");
         }
 
+        if use_gpu_build {
+            // GPU PATH: single kNN graph → single HNSW. No segments, no copies.
+            let k_init = 32;
+            let knn_graph = {
+                let i8_data: Vec<i8> = perm_arc.iter().flat_map(|&r| {
+                    (0..dim).map(move |d| (data[r * dim + d] * 127.0) as i8)
+                }).collect();
+                gpu::gpu_build_knn_graph(&i8_data, n, dim, k_init)
+                    .unwrap_or_else(|| {
+                        eprintln!("[GPU] GPU kNN failed, CPU fallback");
+                        let mut graph = vec![vec![0usize; k_init]; n];
+                        for i in 0..n {
+                            let mut dists: Vec<(i32, usize)> = (0..n).filter(|&j| j != i).map(|j| {
+                                let mut dot = 0i32;
+                                for d in 0..dim { dot += i8_data[i*dim+d] as i32 * i8_data[j*dim+d] as i32; }
+                                (dot, j)
+                            }).collect();
+                            dists.select_nth_unstable_by(k_init, |a, b| b.0.cmp(&a.0));
+                            dists.truncate(k_init);
+                            graph[i] = dists.into_iter().map(|(_, j)| j).collect();
+                        }
+                        graph
+                    })
+            };
+            // Build ONE HNSW from the GPU kNN edges
+            let mut h = Hnsw::new();
+            h.dim = dim;
+            // Insert vectors via index indirection (no all_f32 copy for GPU path)
+            // Store INT8 only — f32 rerank reads from mmap tier.
+            h.all_i8.reserve(n * dim);
+            for i in 0..n {
+                let true_row = perm_arc[i];
+                let base = true_row * dim;
+                for d in 0..dim {
+                    h.all_i8.push((data[base + d] * 127.0) as i8);
+                }
+                h.nodes.push(Node {
+                    id: true_row as u64,
+                    neighbors: vec![Vec::new(); h.max_level + 1],
+                    deleted: false,
+                    attr: 0,
+                });
+                h.id_to_idx.insert(true_row as u64, i);
+            }
+            // Wire edges from GPU kNN graph
+            for (i, neighbors) in knn_graph.iter().enumerate() {
+                h.nodes[i].neighbors[0] = neighbors.clone();
+            }
+            eprintln!("[GPU] HNSW built from GPU kNN: {n} nodes, {k_init} edges/node");
+            drop(perm_arc);
+            drop(attr_arc);
+
+            let mut pre_tier = if tiered { MmapTier::new(n * dim) } else { None };
+            let mut merged = h;
+            if let Some(t) = pre_tier {
+                merged.f32_tier = Some(t);
+                merged.all_f32 = Vec::new();
+            }
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) };
+        }
+
+        // ═══ CPU PATH: standard HNSW segments with shared index indirection ═══
         let segments: Vec<Hnsw> = std::thread::scope(|s| {
             let handles: Vec<_> = ranges
                 .into_iter()
@@ -3466,65 +3529,16 @@ impl VectorIndex {
                 .map(|(_si, (lo, hi))| {
                     let perm_clone = Arc::clone(&perm_arc);
                     let attr_clone = Arc::clone(&attr_arc);
-                    let lock_clone = Arc::clone(&gpu_build_lock);
                     s.spawn(move || {
-                        let base_id = lo as u64;
-                        if use_gpu_build {
-                            // Serialize GPU access: only one shard builds at a time
-                            let _gpu_guard = lock_clone.lock().unwrap();
-                            let count = hi - lo;
-                            // Collect INT8 vectors for this shard
-                            let mut shard_i8: Vec<i8> = Vec::with_capacity(count * dim);
-                            for row in 0..count {
-                                let true_row = perm_clone[lo + row];
-                                let base = true_row * dim;
-                                for d in 0..dim {
-                                    shard_i8.push((data[base + d] * 127.0) as i8);
-                                }
-                            }
-                            // GPU: compute kNN graph (batch distance on GPU)
-                            let k_init = 32; // neighbors per node
-                            match gpu::gpu_build_knn_graph(&shard_i8, count, dim, k_init) {
-                                Some(knn_graph) => {
-                                    // Convert kNN graph to HNSW
-                                    let mut h = Hnsw::new();
-                                    h.dim = dim;
-                                    // Insert all vectors first
-                                    for row in 0..count {
-                                        let true_row = perm_clone[lo + row];
-                                        let v: Vec<f32> = data[true_row * dim..(true_row + 1) * dim].to_vec();
-                                        h.insert_attr(base_id + row as u64, v, attr_clone[lo + row]);
-                                    }
-                                    // Wire edges from GPU kNN graph
-                                    for (i, neighbors) in knn_graph.iter().enumerate() {
-                                        if i < h.nodes.len() {
-                                            h.nodes[i].neighbors[0] = neighbors.clone();
-                                        }
-                                    }
-                                    h.id_to_idx.clear();
-                                    for (local, node) in h.nodes.iter().enumerate() {
-                                        h.id_to_idx.insert(node.id, local);
-                                    }
-                                    h
-                                }
-                                None => {
-                                    eprintln!("[GPU] GPU kNN failed, falling back to CPU for shard");
-                                    Hnsw::build_segment_indexed(data, dim, &perm_clone, lo, count, base_id, &attr_clone)
-                                }
-                            }
-                        } else {
-                            // CPU path: sequential HNSW insert + ID remapping
-                            let mut h = Hnsw::build_segment_indexed(data, dim, &perm_clone, lo, hi - lo, lo as u64, &attr_clone);
-                            for (local, node) in h.nodes.iter_mut().enumerate() {
-                                let true_row = perm_clone[lo + local];
-                                node.id = true_row as u64;
-                            }
-                            h.id_to_idx.clear();
-                            for (local, node) in h.nodes.iter().enumerate() {
-                                h.id_to_idx.insert(node.id, local);
-                            }
-                            h
+                        let mut h = Hnsw::build_segment_indexed(data, dim, &perm_clone, lo, hi - lo, lo as u64, &attr_clone);
+                        for (local, node) in h.nodes.iter_mut().enumerate() {
+                            node.id = perm_clone[lo + local] as u64;
                         }
+                        h.id_to_idx.clear();
+                        for (local, node) in h.nodes.iter().enumerate() {
+                            h.id_to_idx.insert(node.id, local);
+                        }
+                        h
                     })
                 })
                 .collect();

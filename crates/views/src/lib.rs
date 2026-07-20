@@ -6,7 +6,6 @@ pub mod kv;
 pub mod table;
 pub mod timeseries;
 pub mod vector;
-pub mod gpu_graph;
 
 pub use kv::Kv;
 pub use table::{Row, Tables};
