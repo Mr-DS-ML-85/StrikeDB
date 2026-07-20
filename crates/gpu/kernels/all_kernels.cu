@@ -71,6 +71,7 @@ void cagra_search_kernel(
     int* topk_idx = smem + itopk;
     int* cand_idx = smem + 2 * itopk;
     int* cand_dot = smem + 2 * itopk + 8 * degree;
+    int* smem_nc = smem + 2 * itopk + 16 * degree; // dedicated slot for nc count
 
     // Init topk with entry node
     if (tid == 0) {
@@ -85,9 +86,9 @@ void cagra_search_kernel(
     int BEAM = 4;
 
     for (int iter = 0; iter < max_iters; iter++) {
-        // Phase 1: Thread 0 reads neighbors from graph
-        int nc = 0;
+        // Phase 1: Thread 0 reads neighbors, stores count at shared smem[0]
         if (tid == 0) {
+            int nc = 0;
             for (int p = 0; p < BEAM && p < itopk; p++) {
                 int src = topk_idx[p];
                 if (src < 0 || src >= N) continue;
@@ -98,8 +99,10 @@ void cagra_search_kernel(
                     }
                 }
             }
+            smem_nc[0] = nc;
         }
         __syncthreads();
+        int nc = smem_nc[0];
         if (nc == 0) break;
 
         // Phase 2: ALL threads compute distances in PARALLEL

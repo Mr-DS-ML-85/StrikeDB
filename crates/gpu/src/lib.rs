@@ -81,10 +81,10 @@ pub struct GpuState {
     ctx: *mut std::ffi::c_void,
     module: *mut std::ffi::c_void,
     kernels: Vec<CompiledKernel>,
-    #[allow(dead_code)]
     available: bool,
     vram_total: usize,
     vram_free: usize,
+    device: i32,
 }
 
 unsafe impl Send for GpuState {}
@@ -118,7 +118,7 @@ impl GpuState {
 
             Some(Self {
                 ctx, module: std::ptr::null_mut(), kernels: Vec::new(),
-                available: true, vram_total, vram_free,
+                available: true, vram_total, vram_free, device,
             })
         }
     }
@@ -141,7 +141,14 @@ impl GpuState {
             let mut prog: NvrtcProgram = std::ptr::null_mut();
             nvrtcCreateProgram(&mut prog, src_cstr.as_ptr(), name_cstr.as_ptr(), 0,
                                std::ptr::null(), std::ptr::null());
-            let arch = CString::new("--gpu-architecture=compute_86").unwrap();
+            // Detect GPU compute capability for PTX arch
+            let mut compute_major = 0i32;
+            let mut compute_minor = 0i32;
+            cuDeviceGetAttribute(&mut compute_major, 75, self.device);
+            cuDeviceGetAttribute(&mut compute_minor, 76, self.device);
+            let arch_str = format!("--gpu-architecture=compute_{}{}", compute_major, compute_minor);
+            eprintln!("[GPU] PTX arch: compute_{}{}", compute_major, compute_minor);
+            let arch = CString::new(arch_str).unwrap();
             let opts = [arch.as_ptr()];
             let ret = nvrtcCompileProgram(prog, 1, opts.as_ptr());
             if ret != 0 {
@@ -208,7 +215,7 @@ pub fn gpu_init() -> bool {
     let state = GPU_STATE.get_or_init(|| {
         GpuState::init_ctx().unwrap_or_else(|| {
             GpuState { ctx: std::ptr::null_mut(), module: std::ptr::null_mut(),
-                       kernels: Vec::new(), available: false, vram_total: 0, vram_free: 0 }
+                       kernels: Vec::new(), available: false, vram_total: 0, vram_free: 0, device: 0 }
         })
     });
     if state.available {
@@ -425,9 +432,9 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
         let d_bytes = n * 4;
 
         let mut d_q = 0u64; let mut d_v = 0u64; let mut d_d = 0u64;
-        let r = cuMemAlloc_v2(&mut d_q, q_bytes); if r != 0 { return None; }
-        let r = cuMemAlloc_v2(&mut d_v, v_bytes); if r != 0 { return None; }
-        let r = cuMemAlloc_v2(&mut d_d, d_bytes); if r != 0 { return None; }
+        if cuMemAlloc_v2(&mut d_q, q_bytes) != 0 { return None; }
+        if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { cuMemFree_v2(d_q); return None; }
+        if cuMemAlloc_v2(&mut d_d, d_bytes) != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); return None; }
         cuMemcpyHtoD_v2(d_q, query.as_ptr() as *const std::ffi::c_void, q_bytes);
         cuMemcpyHtoD_v2(d_v, vectors.as_ptr() as *const std::ffi::c_void, v_bytes);
 
@@ -450,6 +457,7 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
             let msg = if err_str.is_null() { "unknown".to_string() }
                       else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
             eprintln!("[GPU] cuLaunchKernel error {}: {}", r, msg);
+            cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
             return None;
         }
         let sync_r = cuCtxSynchronize();
@@ -571,7 +579,7 @@ unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_i
         let r = cuLaunchKernel(func, q_count as u32, 1, 1, threads, 1, 1, 0,
             std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
             std::ptr::null_mut());
-        if r != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_d); return None; }
+        if r != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d); return None; }
         cuCtxSynchronize();
         t_kernel += t1.elapsed();
 
@@ -604,9 +612,8 @@ unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_i
 
 /// INT8 matmul on GPU. Auto-loads kernel if needed.
 pub fn gpu_matmul(a: &[i8], b: &[i8], m: usize, k: usize, n: usize) -> Option<Vec<i32>> {
-    if !gpu_ensure_kernel("matmul") { return None; }
+    let _guard = gpu_lock_and_ensure()?;
     let func = GPU_STATE.get()?.get_kernel("matmul")?;
-    if !ensure_ctx() { return None; }
     unsafe {
         let a_bytes = m * k; let b_bytes = k * n; let c_bytes = m * n * 4;
         let mut d_a = 0u64; let mut d_b = 0u64; let mut d_c = 0u64;
@@ -782,7 +789,8 @@ pub fn gpu_search(
 
         let threads = 256u32;
         // Shared memory: topk_dot + topk_idx + cand_idx[8*degree] + cand_dot[8*degree]
-        let smem = ((2 * itopk + 16 * degree) * 4) as u32;
+        // Shared memory: topk[2*itopk] + cand[16*degree] + nc_slot
+        let smem = ((2 * itopk + 16 * degree + 1) * 4) as u32;
 
         let r = cuLaunchKernel(func,
             num_queries as u32, 1, 1,   // Grid: one block per query
