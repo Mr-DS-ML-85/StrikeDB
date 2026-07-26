@@ -32,7 +32,7 @@
 use std::cell::UnsafeCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use storage::{Engine, Value};
 
 /// MODULE 4 — a predicate over a node's `attr` (its category id). Qdrant forces
@@ -204,6 +204,7 @@ extern "C" {
     fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
     fn msync(addr: *mut std::ffi::c_void, len: usize, flags: i32) -> i32;
     fn close(fd: i32) -> i32;
+    fn unlink(path: *const i8) -> i32;
 }
 
 const MMAP_PROT_READ: i32 = 0x1;
@@ -216,8 +217,9 @@ const MMAP_MS_SYNC: i32 = 0x4;
 
 /// NVMe-backed array of `f32`, memory-mapped from a temp file. Exposes a
 /// `&[f32]` view for reads (the rerank path) and `&mut [f32]` for writes
-/// (graph build). On drop the mapping is unmapped; the file persists until
-/// explicitly removed (we leave it for OS temp cleanup).
+/// (graph build). The backing file is unlinked immediately after mmap, so it
+/// has no name on disk and the kernel reclaims it when the process exits —
+/// however it exits. Nothing is left for OS temp cleanup to collect.
 ///
 /// `MmapTier` is `Send`: each instance owns a distinct mapping + fd; the
 /// underlying region is never shared across threads, so moving it between
@@ -275,6 +277,20 @@ impl MmapTier {
             unsafe { close(fd) };
             return None;
         }
+        // Unlink NOW, while we still hold the fd and the mapping.
+        //
+        // POSIX keeps the inode alive until the last fd AND the last mapping
+        // go away, so the tier stays fully usable — it just no longer has a
+        // name. The kernel then reclaims it on process exit unconditionally,
+        // including SIGKILL, panic, and OOM-kill.
+        //
+        // Doing this in `Drop` instead would be wrong: Drop does not run on
+        // abort or SIGKILL, which is exactly how these leaked. A 1M x 768d
+        // run leaves a 3 GB file behind, one per process, and nothing ever
+        // collects them — 26 GB accumulated here and filled the root
+        // filesystem to 100%. `std::env::temp_dir()` honours TMPDIR, so these
+        // do not necessarily land on a tmpfs that a reboot would clear.
+        unsafe { unlink(cpath.as_ptr()) };
         Some(Self { ptr: ptr as *mut f32, len: count, fd, _path: path })
     }
 
@@ -353,6 +369,41 @@ fn mitm() -> Mitm {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(-1);
         Mitm { on, no_break, noprune, trace_query }
+    })
+}
+
+/// Degree budget for `merge_into`'s bridge pass, as a multiple of `m_max0`.
+///
+/// Default 2, and the reason is not arbitrary. A merged node's neighbour list
+/// holds two kinds of edge: the intra-segment ones its own segment build chose,
+/// and the cross-segment bridges `merge_into` adds. The bridges are *by
+/// construction* farther away than the intra-segment picks — a segment already
+/// kept its nearest — so pruning the combined list to `m_max0` purely by
+/// distance throws the bridges out first. That deletes exactly the edges that
+/// make the fused graph navigable, and search degenerates to whichever segment
+/// it entered.
+///
+/// Measured on 100k × 384d over the wire, everything else identical:
+///
+///   mult=1  Recall@10 0.907   p99 741 µs
+///   mult=2  Recall@10 0.975   p99 674 µs
+///   mult=4  Recall@10 0.968   p99 592 µs
+///
+/// So one extra `m_max0` of headroom is enough to keep the bridges, and a
+/// second buys nothing. The budget stays bounded either way — 100k nodes at
+/// degree 128 is ~100 MB of adjacency, not the multi-GB blowup the *uncapped*
+/// version reached, because uncapped growth was unbounded in the number of
+/// merges rather than in the degree.
+///
+/// Override with `DBSTRIKE_MERGE_CAP_MULT` to re-run the sweep above.
+fn merge_cap_mult() -> usize {
+    static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("DBSTRIKE_MERGE_CAP_MULT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(2)
     })
 }
 
@@ -1600,10 +1651,44 @@ struct Node {
     attr: u32,
 }
 
-// SAFETY: Hnsw is always behind RwLock in VectorIndex. UnsafeCell fields are
-// accessed only through &self methods that use raw pointers; no concurrent
-// mutation occurs because RwLock serializes access.
+// SAFETY: `Hnsw` owns no interior-mutable state. Search methods take `&self`
+// and need a scratch visited-buffer, but that buffer lives in thread-local
+// storage (`VISIT`), not in the struct — so two threads holding the same
+// `&Hnsw` under an `RwLock` *read* guard touch two different buffers.
+//
+// It used to live in an `UnsafeCell` field, justified by "RwLock serializes
+// access". That is not true of a read lock: `VSEARCH` takes `read()`, so N
+// concurrent queries shared one `Vec<u32>` and all mutated it through `&self`.
+// `ensure_visited`'s `resize` could then tear the Vec's (ptr, len, cap) triple
+// and a later resize would allocate against a garbage length — which is how a
+// 1.6 GB server reached 3.4 GB and got OOM-killed at 8 concurrent clients while
+// 1 client, and even 200 clients replaying one identical query, stayed flat.
 unsafe impl Sync for Hnsw {}
+
+/// Per-thread search scratch: the generation-stamped visited buffer and its
+/// epoch counter.
+///
+/// Thread-local rather than per-index because it is pure scratch — nothing is
+/// read back across calls, every search begins by bumping the epoch, which
+/// invalidates every stamp already in the buffer. So one thread searching
+/// several different indexes can reuse one buffer safely; it simply grows to
+/// the largest node count that thread has seen.
+struct VisitScratch {
+    visited: Vec<u32>,
+    epoch: u32,
+}
+
+thread_local! {
+    static VISIT: UnsafeCell<VisitScratch> =
+        UnsafeCell::new(VisitScratch { visited: Vec::new(), epoch: 0 });
+}
+
+/// Raw pointer to this thread's scratch. Valid for the rest of the thread's
+/// life; callers use it within a single search call.
+#[inline]
+fn visit_scratch() -> *mut VisitScratch {
+    VISIT.with(|c| c.get())
+}
 
 struct Hnsw {
     nodes: Vec<Node>,
@@ -1637,13 +1722,6 @@ struct Hnsw {
     m_max0: usize,
     ef_construction: usize,
     rng: Rng,
-    /// Generation-stamped visited buffer (see `search_layer`). Grown only as
-    /// the graph grows; stamped with an incrementing epoch per search instead
-    /// of memset — keeps ingest O(N), not O(N²).
-    /// Wrapped in UnsafeCell so &self search methods can use it (each thread
-    /// accesses only its own Hnsw; no concurrent mutation).
-    visited_cell: UnsafeCell<Vec<u32>>,
-    epoch_cell: UnsafeCell<u32>,
     /// Reused quantization scratch (one vector's worth of i8).
     qbuf: Vec<i8>,
     /// Reused low-bit packing scratch (one vector's worth of packed bytes).
@@ -1693,8 +1771,6 @@ impl Hnsw {
             m_max0: 64,
             ef_construction: 200,
             rng: Rng(0x9E3779B97F4A7C15),
-            visited_cell: UnsafeCell::new(Vec::new()),
-            epoch_cell: UnsafeCell::new(0),
             qbuf: Vec::new(),
             bin_scratch: Vec::new(),
             turbo_rot: Vec::new(),
@@ -1709,25 +1785,38 @@ impl Hnsw {
         }
     }
 
-    /// Bump the epoch and return the new value.
+    /// Bump this thread's epoch and return the new value.
+    ///
+    /// On wraparound the buffer is zeroed, because stamp `0` is the "never
+    /// visited" sentinel and a stale `u32::MAX`-era stamp would otherwise be
+    /// mistaken for a fresh one.
     unsafe fn bump_epoch(&self) -> u32 {
-        let e = &mut *self.epoch_cell.get();
-        *e = e.wrapping_add(1);
-        if *e == 0 {
-            *e = 1;
-            let v = &mut *self.visited_cell.get();
-            v.iter_mut().for_each(|x| *x = 0);
+        let s = &mut *visit_scratch();
+        s.epoch = s.epoch.wrapping_add(1);
+        if s.epoch == 0 {
+            s.epoch = 1;
+            s.visited.iter_mut().for_each(|x| *x = 0);
         }
-        *e
+        s.epoch
     }
 
-    /// Ensure visited is large enough for `n` nodes and bump the epoch.
+    /// Ensure this thread's visited buffer covers `n` nodes, and bump the epoch.
     unsafe fn ensure_visited(&self, n: usize) -> u32 {
-        let v = &mut *self.visited_cell.get();
-        if v.len() < n {
-            v.resize(n, 0);
+        let s = &mut *visit_scratch();
+        if s.visited.len() < n {
+            s.visited.resize(n, 0);
         }
         self.bump_epoch()
+    }
+
+    /// Raw pointer to this thread's visited buffer.
+    ///
+    /// Returned as a pointer, not a reference, so it does not borrow `self` —
+    /// the search loops need `self.nodes` and `self.all_i8` borrowed at the
+    /// same time.
+    #[inline]
+    fn visited_ptr(&self) -> *mut Vec<u32> {
+        unsafe { &raw mut (*visit_scratch()).visited }
     }
 
     /// Module 2: select the quantization mode. MUST be called before any insert
@@ -1771,6 +1860,16 @@ impl Hnsw {
         match &self.f32_tier {
             Some(t) => &t.as_slice()[o..o + self.dim],
             None => &self.all_f32[o..o + self.dim],
+        }
+    }
+
+    /// The whole exact corpus as one contiguous `n · dim` slice, whichever
+    /// tier is holding it. Used to hand the GPU a single upload for the
+    /// kernel's fused rerank phase.
+    fn f32_corpus(&self) -> &[f32] {
+        match &self.f32_tier {
+            Some(t) => t.as_slice(),
+            None => &self.all_f32,
         }
     }
 
@@ -1900,7 +1999,7 @@ impl Hnsw {
         let epoch = unsafe { self.ensure_visited(need) };
         // Use raw pointer to break the borrow chain: visited_ptr borrows the
         // UnsafeCell but NOT &self, so self.nodes/all_i8 remain borrowable.
-        let visited_ptr = self.visited_cell.get();
+        let visited_ptr = self.visited_ptr();
 
         let mut cur = entry;
         let top = self.max_level;
@@ -2284,7 +2383,7 @@ impl Hnsw {
         // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
         let _ = unsafe { self.ensure_visited(n) };
         let mut epoch;
-        let visited_ptr = self.visited_cell.get();
+        let visited_ptr = self.visited_ptr();
         let mut cur = entry;
         // TurboQuant deployment trick: navigate the HNSW graph with the CHEAP
         // int8 distance (already stored for every vector) and only apply the
@@ -2427,7 +2526,7 @@ impl Hnsw {
         // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
         let _ = unsafe { self.ensure_visited(n) };
         let mut epoch;
-        let visited_ptr = self.visited_cell.get();
+        let visited_ptr = self.visited_ptr();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
             epoch = unsafe { self.bump_epoch() };
@@ -2485,7 +2584,7 @@ impl Hnsw {
         // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
         let _ = unsafe { self.ensure_visited(n) };
         let mut epoch;
-        let visited_ptr = self.visited_cell.get();
+        let visited_ptr = self.visited_ptr();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
             epoch = unsafe { self.bump_epoch() };
@@ -2533,7 +2632,7 @@ impl Hnsw {
         // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
         let _ = unsafe { self.ensure_visited(n) };
         let mut epoch;
-        let visited_ptr = self.visited_cell.get();
+        let visited_ptr = self.visited_ptr();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
             epoch = unsafe { self.bump_epoch() };
@@ -2788,7 +2887,7 @@ impl Hnsw {
         // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
         let _ = unsafe { self.ensure_visited(n) };
         let mut epoch;
-        let visited_ptr = self.visited_cell.get();
+        let visited_ptr = self.visited_ptr();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
             epoch = unsafe { self.bump_epoch() };
@@ -2861,7 +2960,7 @@ impl Hnsw {
         // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
         let _ = unsafe { self.ensure_visited(n) };
         let mut epoch;
-        let visited_ptr = self.visited_cell.get();
+        let visited_ptr = self.visited_ptr();
         let mut cur = entry;
         for lvl in (1..=self.max_level).rev() {
             epoch = unsafe { self.bump_epoch() };
@@ -2884,18 +2983,66 @@ impl Hnsw {
         if lo >= hi {
             return Vec::new();
         }
-        // Pick the tallest base node in [lo, hi) as the start.
-        let mut entry = lo;
-        for g in lo..hi {
-            if self.nodes[g].neighbors.len() > self.nodes[entry].neighbors.len() {
-                entry = g;
+        // Pick a tall node in [lo, hi) as the start.
+        //
+        // This used to be `for g in lo..hi`, an unconditional linear scan of the
+        // whole range — to choose a *starting point* for a search whose entire
+        // purpose is to be sublinear. `merge_into` calls this once per appended
+        // vector with `hi = base_n`, so a 64-vector `VADDBATCH` re-walked the
+        // entire base 64 times:
+        //
+        //   base 100k:      64 × 100k × 1,562 batches ≈ 1.0e10  (~7s, tolerable)
+        //   base 1M:        64 × 1M   × 15,625 batches ≈ 1.0e12  (~forever)
+        //
+        // 10x the data, 100x the work. Worse, the scan is a dependent chase
+        // through a 1M-element array of `Vec`s reading only `.len()`, so it is
+        // memory-latency-bound, not compute-bound — it pegs no core (~2% CPU)
+        // while holding the graph write lock, which also blocks every other
+        // ingest client. Low CPU, idle GPU, no progress.
+        //
+        // Two ways out, in order of preference:
+        //
+        // 1. `self.entry` is maintained as the max-level node of the whole
+        //    graph. If it falls inside [lo, hi) then it is *by definition* the
+        //    tallest node in the range, so the scan cannot beat it. O(1).
+        //
+        // 2. Otherwise sample instead of sweeping. HNSW level assignment is
+        //    geometric, so tall nodes are common enough that a bounded sample
+        //    finds one at essentially the same quality — and the start node is
+        //    only a hint, since the descent below re-converges regardless.
+        const MAX_ENTRY_PROBE: usize = 1024;
+        let mut entry = match self.entry {
+            Some(e) if e >= lo && e < hi => e,
+            _ => {
+                let span = hi - lo;
+                let stride = span.div_ceil(MAX_ENTRY_PROBE).max(1);
+                let mut best = lo;
+                let mut g = lo;
+                while g < hi {
+                    if self.nodes[g].neighbors.len() > self.nodes[best].neighbors.len() {
+                        best = g;
+                    }
+                    g += stride;
+                }
+                best
+            }
+        };
+        // The descent below computes `neighbors.len() - 1`, so an entry with no
+        // levels at all underflows. The old full sweep started at `lo` and only
+        // ever moved up, so it hit this too whenever the whole range was
+        // level-less; sampling just makes it reachable more often. Fall back to
+        // the first node that has levels, and give up only if none does.
+        if self.nodes[entry].neighbors.is_empty() {
+            match (lo..hi).find(|&g| !self.nodes[g].neighbors.is_empty()) {
+                Some(g) => entry = g,
+                None => return Vec::new(),
             }
         }
         let n = self.nodes.len();
         // Ensure buffer is large enough. Epoch is bumped inside each loop iteration.
         let _ = unsafe { self.ensure_visited(n) };
         let mut epoch;
-        let visited_ptr = self.visited_cell.get();
+        let visited_ptr = self.visited_ptr();
         let mut cur = entry;
         let top = self.nodes[entry].neighbors.len() - 1;
         for lvl in (1..=top).rev() {
@@ -2932,6 +3079,7 @@ impl Hnsw {
     /// Build a segment using index indirection: reads `data[perm[off+i]]` instead
     /// of contiguous rows. Avoids the 1.5-3 GB shuffled copy.
     fn build_segment_indexed(data: &[f32], dim: usize, perm: &[usize], off: usize, count: usize, base_id: u64, attrs: &[u32]) -> Hnsw {
+        eprintln!("[MITM] build_segment: off={} count={} dim={} base_id={}", off, count, dim, base_id);
         let mut h = Hnsw::new();
         h.dim = dim;
         for row in 0..count {
@@ -2954,6 +3102,7 @@ impl Hnsw {
     /// small-world backbone spanning all shards without rebuilding any
     /// segment's internal structure.
     fn merge_segments(mut segments: Vec<Hnsw>, bridge: usize, mut tier: Option<&mut MmapTier>) -> Hnsw {
+        eprintln!("[MITM] merge_segments: {} segments, bridge={}", segments.len(), bridge);
         if segments.is_empty() {
             return Hnsw::new();
         }
@@ -2999,9 +3148,12 @@ impl Hnsw {
                 merged.all_norm = Vec::with_capacity(total);
             }
         }
-        merged.visited_cell = UnsafeCell::new(vec![0u32; total]);
+        // Nothing to pre-size for the visited buffer: it is thread-local now,
+        // and `ensure_visited` grows it to the node count on first search.
+        eprintln!("[MITM] merge_segments: total={} total_f32_bytes={}", total, total * dim * 4);
 
         for (si, seg) in segments.iter().enumerate() {
+            if si == 0 { eprintln!("[MITM] merge: first node in segment 0"); }
             for (li, node) in seg.nodes.iter().enumerate() {
                 let gidx = offsets[si] + li;
                 merged.id_to_idx.insert(node.id, gidx);
@@ -3015,6 +3167,7 @@ impl Hnsw {
                 let o = li * dim;
                 merged.all_i8.extend_from_slice(&seg.all_i8[o..o + dim]);
                 let go = gidx * dim;
+                if si == 0 && li < 3 { eprintln!("[MITM] merge: node {} all_i8 OK, dim={}", li, dim); }
                 if let Some(t) = tier.as_mut() {
                     // Write directly to mmap — avoids RAM intermediate.
                     let go_tier = gidx; // tier uses same indexing
@@ -3075,7 +3228,8 @@ impl Hnsw {
 
         // INTER-SEGMENT BRIDGE — GPU-accelerated batch distance + CPU graph walks.
         // Phase 1: Nearest-entry per node (GPU or CPU).
-        let gpu_ready = gpu::gpu_init();
+        // CpuOnly mode must not touch the GPU even if one is initialized.
+        let gpu_ready = gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly && gpu::gpu_init();
         let k_seg = segments.len();
         let total = merged.nodes.len();
         let nearest_b: Vec<usize> = if gpu_ready {
@@ -3086,6 +3240,7 @@ impl Hnsw {
                 entry_flat.extend_from_slice(&merged.all_i8[gb * dim..gb * dim + dim]);
             }
             let mut all_dists: Vec<f32> = vec![f32::MAX; total * k_seg];
+            eprintln!("  [GPU] bridge: computing {k_seg} entry distances for {total} nodes ({} MB vectors)", merged.all_i8.len() / 1024 / 1024);
             for b in 0..k_seg {
                 if let Some(dists) = gpu::gpu_cosine_dist(
                     &entry_flat[b * dim..(b + 1) * dim], &merged.all_i8, total, dim)
@@ -3238,7 +3393,9 @@ impl Hnsw {
         }
         self.entry = Some(best_entry);
         self.max_level = best_lvl;
-        unsafe { *self.visited_cell.get() = vec![0u32; self.nodes.len()]; }
+        // The visited buffer used to be reset here. It is thread-local now, and
+        // resetting it is unnecessary anyway: every search bumps the epoch
+        // first, which invalidates every stamp left in the buffer.
 
         // BRIDGE pass — identical strategy to `merge_segments`. The live graph
         // is treated as segment 0 when non-empty. For EVERY node we compare it
@@ -3269,7 +3426,29 @@ impl Hnsw {
             let e = seg.entry.unwrap_or(0);
             entries.push(seg.all_i8[e * dim..e * dim + dim].to_vec());
         }
-        for ga in 0..total {
+        // WHICH nodes run the bridge. The full `0..total` sweep is what a BULK
+        // merge needs: when several comparably-sized segments are fused, every
+        // node should get to pick its own cross-segment neighbours, and that is
+        // where this function's recall comes from.
+        //
+        // It is the wrong thing to do for an INCREMENTAL append. `VADDBATCH`
+        // merges ~64 new vectors into a base that grows to 100k+, and re-running
+        // the sweep over the whole base each time makes ingest O(N²/batch):
+        // ~78M node-bridges to load 100k vectors in 64-vector batches. Measured
+        // as 7 minutes and climbing for a load the VADD path did in ~12s.
+        //
+        // Restricting the sweep to the appended nodes costs nothing in
+        // connectivity, because the edges added below are MUTUAL — a base node
+        // still gains an edge to every new node that picks it. It only loses the
+        // base node's ability to re-pick its own neighbours, which is exactly
+        // what ordinary HNSW incremental insert also declines to do.
+        let new_n = total - base_n;
+        let incremental = has_base && new_n * 4 < base_n;
+        let scan_from = if incremental { base_n } else { 0 };
+        // Nodes whose adjacency actually grew, so the prune below is proportional
+        // to the batch and not to the graph.
+        let mut touched: Vec<usize> = Vec::with_capacity(new_n * 2 * bridge.max(1));
+        for ga in scan_from..total {
             // Own segment of `ga`.
             let own = if has_base && ga < base_n {
                 0usize
@@ -3304,10 +3483,52 @@ impl Hnsw {
                     let lvl = la.min(lb);
                     if !self.nodes[ga].neighbors[lvl].contains(&gb) {
                         self.nodes[ga].neighbors[lvl].push(gb);
+                        touched.push(ga);
                     }
                     if !self.nodes[gb].neighbors[lvl].contains(&ga) {
                         self.nodes[gb].neighbors[lvl].push(ga);
+                        touched.push(gb);
                     }
+                }
+            }
+        }
+
+        // DEGREE CAP. The bridge pass above only ever pushes; it never pruned.
+        // For a one-shot bulk merge that is survivable, but under incremental
+        // `VADDBATCH` every merge appended up to `2 * bridge` edges to the same
+        // base nodes, and nothing ever removed them. Adjacency grew without
+        // bound: ~7.8 GB resident for 153 MB of vectors, and search slowed down
+        // in step because it walks those lists.
+        //
+        // Cap exactly the way `insert` does — keep the `m_max0` nearest by the
+        // same `cos_dist_q` the search navigates with — so a merged graph and a
+        // serially-built graph have the same degree distribution.
+        //
+        // The cap is a multiple of `m_max0` so it can be A/B'd against recall
+        // without recompiling: `DBSTRIKE_MERGE_CAP_MULT=4` keeps four times the
+        // edges (still bounded — 100k nodes at degree 256 is ~200 MB, not the
+        // 7.8 GB the uncapped version reached). Default 1 = identical degree
+        // budget to the serial insert path.
+        let cap = self.m_max0 * merge_cap_mult();
+        if !mitm().noprune {
+            touched.sort_unstable();
+            touched.dedup();
+            for &gi in &touched {
+                let nvec: Vec<i8> = self.all_i8[gi * dim..gi * dim + dim].to_vec();
+                for lvl in 0..self.nodes[gi].neighbors.len() {
+                    if self.nodes[gi].neighbors[lvl].len() <= cap {
+                        continue;
+                    }
+                    let list = std::mem::take(&mut self.nodes[gi].neighbors[lvl]);
+                    let mut nn: Vec<(f32, usize)> = list
+                        .iter()
+                        .map(|&x| {
+                            (cos_dist_q(&nvec, &self.all_i8[x * dim..x * dim + dim]), x)
+                        })
+                        .collect();
+                    nn.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    nn.truncate(cap);
+                    self.nodes[gi].neighbors[lvl] = nn.into_iter().map(|(_, x)| x).collect();
                 }
             }
         }
@@ -3393,6 +3614,7 @@ impl VectorIndex {
     /// spilled, so live RAM at 100M+ scale drops to ~int8-only while recall is
     /// byte-identical (the rerank still reads exact f32 — just through mmap).
     pub fn build_parallel_tiered(data: &[f32], dim: usize, n_shards: usize, tiered: bool) -> Self {
+        eprintln!("[MITM] build_parallel_tiered: n={} dim={} shards={} tiered={}", data.len()/dim, dim, n_shards, tiered);
         let n = data.len() / dim;
         let shards = n_shards.max(1).min(n.max(1));
         // bridge=4: each node gets 4 cross-shard edges (good recall at low cost).
@@ -3438,7 +3660,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert(i as u64, v);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) };
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -3447,86 +3669,244 @@ impl VectorIndex {
         let perm_arc: Arc<Vec<usize>> = Arc::new(perm);
         let attr_arc: Arc<Vec<u32>> = Arc::new(zero_attr);
 
-        // GPU graph construction: serialize with Mutex to prevent VRAM OOM.
-        // Each gpu_build_knn_graph call allocates ~534MB GPU RAM.
-        // Multiple concurrent calls would exceed 8GB VRAM.
-        let gpu_build_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        // ═══ GPU-accelerated HNSW (CAGRA approach) ═══
+        // ═══ GPU-accelerated HNSW (APGC approach) ═══
         // GPU computes kNN graph for the ENTIRE dataset in one pass.
         // Then build ONE HNSW from those edges — no segments, no copies.
         // CPU only wires edges (fast). GPU does all distance computation.
-        let use_gpu_build = gpu::gpu_get_mode() == gpu::ComputeMode::Turbo;
+        // GPU build with GPU-side top-k eliminates PCIe bottleneck.
+        // GPU computes kNN graph, CPU only wires edges.
+        // ~5-10s for 1M×384d vs 187s CPU path (see research/BUILD_BOTTLENECK.md).
+        // Respect ComputeMode: CpuOnly must NEVER touch the GPU, even when a
+        // GPU is present (gpu_init() may have been called by the harness).
+        let use_gpu_build = gpu::gpu_available()
+            && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly;
         if use_gpu_build {
-            eprintln!("[GPU] Turbo: CAGRA-style — GPU builds kNN, HNSW wires edges");
+            eprintln!("[GPU] APGC build: GPU computes kNN, CPU wires HNSW edges");
         }
 
         if use_gpu_build {
-            // GPU PATH: single kNN graph → single HNSW. No segments, no copies.
+            // APGC Algorithm 1 (GPU): two-phase kNN construction via GPU-side top-k.
+            // Phase 1: Seeds (2% of nodes) compute kNN against ALL vectors.
+            // Phase 2: Non-seeds find nearest seeds.
+            // Bridge: connect ALL nodes across segments via entry-node edges.
+            // GPU-side top-k eliminates PCIe readback of full Q×N distance matrices.
             let k_init = 32;
-            let knn_graph = {
-                let i8_data: Vec<i8> = perm_arc.iter().flat_map(|&r| {
-                    (0..dim).map(move |d| (data[r * dim + d] * 127.0) as i8)
-                }).collect();
-                gpu::gpu_build_knn_graph(&i8_data, n, dim, k_init)
-                    .unwrap_or_else(|| {
-                        eprintln!("[GPU] GPU kNN failed, CPU fallback");
-                        let mut flat = vec![0usize; n * k_init];
-                        for i in 0..n {
-                            let mut dists: Vec<(i32, usize)> = (0..n).filter(|&j| j != i).map(|j| {
-                                let mut dot = 0i32;
-                                for d in 0..dim { dot += i8_data[i*dim+d] as i32 * i8_data[j*dim+d] as i32; }
-                                (dot, j)
-                            }).collect();
-                            dists.select_nth_unstable_by(k_init, |a, b| b.0.cmp(&a.0));
-                            dists.truncate(k_init);
-                            let base = i * k_init;
-                            for (j, (_, idx)) in dists.into_iter().enumerate().take(k_init) {
-                                flat[base + j] = idx;
+            let bridge = 16;
+
+            // Convert full dataset to INT8 for GPU
+            let i8_all: Vec<i8> = (0..n).flat_map(|i| {
+                let row = perm_arc[i];
+                (0..dim).map(move |d| (data[row * dim + d] * 127.0) as i8)
+            }).collect();
+
+            // Call APGC GPU build: seeds+kNN against all vectors, non-seeds→seeds
+            let knn_flat = if let Some(graph) = gpu::gpu_build_knn_graph(&i8_all, n, dim, k_init) {
+                graph
+            } else {
+                eprintln!("[GPU] APGC build failed, falling back to segment kNN");
+                // Fallback graph MUST be in PERM-POSITION space: the HNSW
+                // below indexes nodes by perm position (node i ↔ i8_all row i).
+                // The previous version pushed TRUE-ROW ids here — every edge
+                // pointed at the wrong node → zero recall.
+                let mut all_knn: Vec<Vec<(i32, i32)>> = vec![Vec::new(); n];
+                let seg_ranges: Vec<(usize, usize)> = ranges.clone();
+                for (si, &(lo, hi)) in seg_ranges.iter().enumerate() {
+                    let seg_n = hi - lo;
+                    if seg_n < 2 { continue; }
+                    let seg_i8 = &i8_all[lo * dim..hi * dim];
+                    if let Some((indices, distances)) = gpu::gpu_batch_cosine_dist_topk(
+                        seg_i8, seg_i8, seg_n, seg_n, dim, k_init)
+                    {
+                        for local_i in 0..seg_n {
+                            let global_i = lo + local_i; // perm position
+                            for j in 0..k_init {
+                                let idx = indices[local_i * k_init + j];
+                                if idx >= 0 && (idx as usize) != local_i {
+                                    let global_j = lo + idx as usize; // perm position
+                                    let d = distances[local_i * k_init + j];
+                                    all_knn[global_i].push(((d * 1000.0) as i32, global_j as i32));
+                                }
                             }
                         }
-                        flat
-                    })
+                    }
+                    eprintln!("[GPU] segment {}/{}: {} nodes", si+1, seg_ranges.len(), seg_n);
+                }
+                // Bridge: nearest entry per node (all in perm-position space)
+                let entries: Vec<usize> = seg_ranges.iter()
+                    .filter_map(|&(lo, _)| if lo < n { Some(lo) } else { None })
+                    .collect();
+                let entry_i8: Vec<i8> = entries.iter().flat_map(|&e| {
+                    i8_all[e * dim..(e + 1) * dim].iter().copied()
+                }).collect();
+                let mut nearest_entry: Vec<usize> = vec![0; n];
+                let mut nearest_entry_dists: Vec<f32> = vec![0.0; n];
+                if let Some((entry_topk_idx, entry_topk_dist)) = gpu::gpu_batch_cosine_dist_topk(
+                    &entry_i8, &i8_all, entries.len(), n, dim, bridge * 4)
+                {
+                    let mut node_entry_best: Vec<(f32, usize)> = vec![(f32::MAX, 0); n];
+                    for ei in 0..entries.len() {
+                        let eg = entries[ei];
+                        for j in 0..(bridge * 4).min(n) {
+                            let idx = entry_topk_idx[ei * (bridge * 4).min(n) + j] as usize;
+                            let d = entry_topk_dist[ei * (bridge * 4).min(n) + j];
+                            if idx < n && d < node_entry_best[idx].0 {
+                                node_entry_best[idx] = (d, eg);
+                            }
+                        }
+                    }
+                    for i in 0..n { nearest_entry[i] = node_entry_best[i].1; nearest_entry_dists[i] = node_entry_best[i].0; }
+                    for ei in 0..entries.len() {
+                        let eg = entries[ei];
+                        for j in 0..(bridge * 4).min(n) {
+                            let idx = entry_topk_idx[ei * (bridge * 4).min(n) + j] as usize;
+                            let d = entry_topk_dist[ei * (bridge * 4).min(n) + j];
+                            if idx < n && idx != eg && !all_knn[eg].iter().any(|&(_, nb)| nb == idx as i32) {
+                                all_knn[eg].push(((d * 1000.0) as i32, idx as i32));
+                                all_knn[idx].push(((d * 1000.0) as i32, eg as i32));
+                            }
+                        }
+                    }
+                }
+                for i in 0..n {
+                    let eg = nearest_entry[i];
+                    let d = (nearest_entry_dists[i] * 1000.0) as i32;
+                    if eg != i { all_knn[i].push((d, eg as i32)); all_knn[eg].push((d, i as i32)); }
+                }
+                for i in 0..n {
+                    let entry_global = nearest_entry[i];
+                    let entry_dist = nearest_entry_dists[i];
+                    let mut edges = std::mem::take(&mut all_knn[i]);
+                    edges.sort_by(|a, b| a.0.cmp(&b.0));
+                    edges.dedup_by_key(|e| e.1);
+                    let has_entry = edges.iter().take(k_init).any(|&(_, nb)| nb == entry_global as i32);
+                    if !has_entry && entry_global != i { edges.insert(0, ((entry_dist * 1000.0) as i32, entry_global as i32)); }
+                    edges.truncate(k_init);
+                    all_knn[i] = edges;
+                }
+                let mut knnf = vec![0usize; n * k_init];
+                for i in 0..n { for j in 0..k_init.min(all_knn[i].len()) { knnf[i * k_init + j] = all_knn[i][j].1 as usize; } }
+                knnf
             };
-            // Build ONE HNSW from the GPU kNN edges
+
+            // Build HNSW from flat kNN graph
             let mut h = Hnsw::new();
             h.dim = dim;
-            // Insert vectors via index indirection (no all_f32 copy for GPU path)
-            // Store INT8 only — f32 rerank reads from mmap tier.
             h.all_i8.reserve(n * dim);
+            h.all_f32.reserve(n * dim);
             for i in 0..n {
                 let true_row = perm_arc[i];
                 let base = true_row * dim;
-                for d in 0..dim {
-                    h.all_i8.push((data[base + d] * 127.0) as i8);
-                }
+                for d in 0..dim { h.all_i8.push((data[base + d] * 127.0) as i8); }
+                h.all_f32.extend_from_slice(&data[base..base + dim]);
                 h.nodes.push(Node {
                     id: true_row as u64,
                     neighbors: vec![Vec::new(); h.max_level + 1],
-                    deleted: false,
-                    attr: 0,
+                    deleted: false, attr: 0,
                 });
                 h.id_to_idx.insert(true_row as u64, i);
             }
-            // Wire edges from flat kNN graph (N × k_init contiguous)
             for i in 0..n {
                 let base = i * k_init;
                 for j in 0..k_init {
-                    if base + j < knn_graph.len() {
-                        h.nodes[i].neighbors[0].push(knn_graph[base + j]);
+                    let nb = if base + j < knn_flat.len() { knn_flat[base + j] } else { i };
+                    if nb != i && nb < n { h.nodes[i].neighbors[0].push(nb); }
+                }
+            }
+            // Reverse edges: kNN edges are directed (i → its neighbors). HNSW
+            // greedy search needs back-links or whole regions become
+            // unreachable. Cap merged degree at k_init + 16 (48 for k=32).
+            {
+                let max_deg = k_init + 16;
+                let mut rev: Vec<Vec<u32>> = vec![Vec::new(); n];
+                for i in 0..n {
+                    for &nb in &h.nodes[i].neighbors[0] {
+                        if rev[nb].len() < 16 { rev[nb].push(i as u32); }
+                    }
+                }
+                for i in 0..n {
+                    let fwd = &mut h.nodes[i].neighbors[0];
+                    for &r in &rev[i] {
+                        let r = r as usize;
+                        if fwd.len() >= max_deg { break; }
+                        if !fwd.contains(&r) { fwd.push(r); }
                     }
                 }
             }
-            eprintln!("[GPU] HNSW built from GPU kNN: {n} nodes, {k_init} edges/node");
-            drop(perm_arc);
-            drop(attr_arc);
 
+            // VUGVA v2 three-tier: construct mmap for f32 data if tiered
             let mut pre_tier = if tiered { MmapTier::new(n * dim) } else { None };
-            let mut merged = h;
-            if let Some(t) = pre_tier {
-                merged.f32_tier = Some(t);
-                merged.all_f32 = Vec::new();
+            if let Some(ref mut t) = pre_tier {
+                let slice = t.as_mut_slice();
+                for i in 0..n {
+                    let true_row = perm_arc[i];
+                    let go = i * dim;
+                    slice[go..go + dim].copy_from_slice(&data[true_row * dim..(true_row + 1) * dim]);
+                }
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) };
+
+            drop(perm_arc); drop(attr_arc);
+
+            // Build multi-level HNSW on top of APGC flat graph:
+            // Level 0: APGC kNN edges (32 per node, from GPU build)
+            // Level 1+: seeds with small-world long-range edges
+            let ml: f32 = 1.0 / (k_init as f32).ln();
+            let mut rng_state: u64 = 0x9E3779B97F4A7C15u64;
+            for i in 0..n {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let r = (rng_state >> 33) as f32 / (1u64 << 31) as f32;
+                let level = (-r.ln() * ml) as usize;
+                h.nodes[i].neighbors.resize(level + 1, Vec::new());
+            }
+            h.max_level = h.nodes.iter().map(|n| n.neighbors.len().max(1) - 1).max().unwrap_or(0);
+            let node_levels: Vec<usize> = h.nodes.iter().map(|n| n.neighbors.len().max(1) - 1).collect();
+            // Small-world: add random long-range edges at level 1+
+            // Each node at level L gets 4 edges to random OTHER nodes at same level
+            let long_range_edges = 4;
+            for level in 1..=h.max_level {
+                let at_level: Vec<usize> = (0..n).filter(|&i| node_levels[i] >= level).collect();
+                if at_level.len() < 2 { continue; }
+                for &i in &at_level {
+                    let mut buddies: Vec<usize> = Vec::with_capacity(long_range_edges);
+                    // Add random long-range edges (ensuring diversity)
+                    for _ in 0..long_range_edges * 3 {
+                        if buddies.len() >= long_range_edges { break; }
+                        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let ri = (rng_state as usize) % at_level.len();
+                        let candidate = at_level[ri];
+                        if candidate != i && !buddies.contains(&candidate)
+                            && !h.nodes[i].neighbors[0].contains(&candidate)
+                        {
+                            buddies.push(candidate);
+                        }
+                    }
+                    // Also include up to 2 nearest from level-0 if available
+                    for &nb in &h.nodes[i].neighbors[0] {
+                        if buddies.len() >= long_range_edges + 2 { break; }
+                        if node_levels[nb] >= level && nb != i && !buddies.contains(&nb) {
+                            buddies.push(nb);
+                        }
+                    }
+                    h.nodes[i].neighbors[level] = buddies;
+                }
+            }
+            // Entry: highest-level seed
+            h.entry = (0..n).find(|&i| node_levels[i] >= h.max_level.saturating_sub(1)).or(Some(0));
+            // Increase k_init to include multi-level edges for GPU upload
+            let k_init = (k_init + long_range_edges + 2).max(32);
+            eprintln!("[GPU] APGC HNSW: n={n}, max_level={}, entry={:?}, k_init={}, nodes/level: {:?}",
+                h.max_level, h.entry, k_init,
+                (0..=h.max_level).map(|l| (l, node_levels.iter().filter(|&&nl| nl >= l).count())).collect::<Vec<_>>());
+
+            let mut merged = h;
+            if let Some(t) = pre_tier { merged.f32_tier = Some(t); merged.all_f32 = Vec::new(); }
+
+            let _ = k_init;
+            return Self {
+                engine: Engine::open_for_build(),
+                hnsw: RwLock::new(merged),
+                sparse: RwLock::new(SparseIndex::new()),
+                gpu_idx: RwLock::new(None),
+            };
         }
 
         // ═══ CPU PATH: standard HNSW segments with shared index indirection ═══
@@ -3561,7 +3941,7 @@ impl VectorIndex {
             merged.f32_tier = Some(t);
             merged.all_f32 = Vec::new();
         }
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) }
+        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// MODULE 4 constructor: build the graph in parallel like
@@ -3610,7 +3990,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert_attr(i as u64, v, attrs[i]);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) };
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -3642,7 +4022,7 @@ impl VectorIndex {
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let merged = Hnsw::merge_segments(segments, bridge, None);
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) }
+        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// Like `build_parallel_attr`, but maps each row to an ARBITRARY client
@@ -3703,7 +4083,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert_attr(ids[i], v, attrs[i]);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) };
+            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -3739,7 +4119,7 @@ impl VectorIndex {
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let merged = Hnsw::merge_segments(segments, bridge, None);
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) }
+        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// MODULE 5 constructor: build the dense HNSW in parallel (like
@@ -3915,15 +4295,12 @@ pub struct VectorIndex {
     /// MODULE 5: sparse / lexical index over the SAME doc ids as `hnsw`. None
     /// for pure-dense indexes. Hybrid queries fuse the two in-engine.
     sparse: RwLock<SparseIndex>,
-    /// GPU-resident index for CAGRA-style GPU search. None if no GPU or not built.
+    /// GPU-resident index for APGC-style GPU search. None if no GPU or not built.
     gpu_idx: RwLock<Option<gpu::GpuIndex>>,
-    /// VUGVA Virtual Memory Table — manages GPU VRAM + CPU RAM for hybrid mode.
-    /// Splits vectors into chunks, prefetches hot chunks to GPU on demand.
-    vugva_vmt: RwLock<Option<Arc<gpu::vugva::VugvaVmt>>>,
 }
 
 impl VectorIndex {
-    /// Upload vectors + flat CSR graph to GPU for CAGRA-style GPU search.
+    /// Upload vectors + flat CSR graph to GPU for APGC-style GPU search.
     /// Uses VUGVA-style unified memory: GPU reads from RAM directly.
     /// No cuMemcpyHtoD — CUDA page migrator handles data transfer.
     pub fn upload_to_gpu(&self) {
@@ -3931,52 +4308,88 @@ impl VectorIndex {
         let g = self.hnsw.read().unwrap();
         let n = g.nodes.len();
         let dim = g.dim;
-        let degree = g.nodes.first().map(|n| n.neighbors.first().map_or(0, |l| l.len())).unwrap_or(0);
+        let degree = g.nodes.first().map(|n| {
+            let total: usize = n.neighbors.iter().map(|l| l.len()).sum();
+            total.max(32)
+        }).unwrap_or(0);
         if degree == 0 || n == 0 { return; }
-        // Build flat CSR graph: n × degree × i32
-        // Pad missing neighbors with self-loops (node→self) so the GPU kernel
-        // always has valid neighbors to explore. -1 holes break graph traversal.
-        let mut graph_flat: Vec<i32> = vec![-1i32; n * degree];
+        // Flat CSR: merge ALL HNSW levels into one wide graph for GPU kernel
+        let gpu_degree = degree.min(64); // cap at 64 to fit in shared memory
+        let mut graph_flat: Vec<i32> = vec![-1i32; n * gpu_degree];
         for (i, node) in g.nodes.iter().enumerate() {
             let i32_i = i as i32;
-            if let Some(level0) = node.neighbors.first() {
-                for (j, &neighbor) in level0.iter().enumerate().take(degree) {
-                    graph_flat[i * degree + j] = neighbor as i32;
+            let mut pos = 0;
+            for level in &node.neighbors {
+                for &nb in level {
+                    if pos >= gpu_degree { break; }
+                    let nbi = nb as i32;
+                    if nbi >= 0 && nbi < n as i32 && nbi != i32_i {
+                        // dedup within flattened edges
+                        let mut dup = false;
+                        for p in 0..pos {
+                            if graph_flat[i * gpu_degree + p] == nbi { dup = true; break; }
+                        }
+                        if !dup {
+                            graph_flat[i * gpu_degree + pos] = nbi;
+                            pos += 1;
+                        }
+                    }
                 }
+                if pos >= gpu_degree { break; }
             }
-            // Pad remaining slots with self-loop
-            for j in 0..degree {
-                if graph_flat[i * degree + j] == -1 {
-                    graph_flat[i * degree + j] = i32_i;
-                }
+            // Pad with self-loops (safe fallback)
+            for j in pos..gpu_degree {
+                graph_flat[i * gpu_degree + j] = i32_i;
             }
         }
-        // VUGVA: allocate unified memory for vectors (GPU reads from RAM directly)
         let vectors_i8: Vec<i8> = g.all_i8.clone();
+        // OpusEdge δ signal: graph hubness (normalized in-degree). The ANN
+        // analogue of token importance — hub nodes carry connectivity, cold
+        // nodes are candidates for SelKV pruning. Range [0.1, 1.0] so no
+        // node has δ=0 (never fully evicted from routing).
+        let mut indeg = vec![0u32; n];
+        for &nb in graph_flat.iter() {
+            let nu = nb as usize;
+            if nb >= 0 && nu < n { indeg[nu] += 1; }
+        }
+        let max_indeg = indeg.iter().copied().max().unwrap_or(1).max(1) as f32;
+        let delta_scores: Vec<f32> = indeg.iter().map(|&d| 0.1 + 0.9 * d as f32 / max_indeg).collect();
+        // OpusEdge Delta-AR: pre-sort each adjacency list by δ descending so
+        // the kernel's top-K neighbor routing is a prefix read (O(1) routing
+        // decisions — the paper's core "pre-computation routing" idea).
+        for i in 0..n {
+            let row = &mut graph_flat[i * gpu_degree..(i + 1) * gpu_degree];
+            row.sort_by(|&a, &b| {
+                let da = if a >= 0 { delta_scores[a as usize] } else { -1.0 };
+                let db = if b >= 0 { delta_scores[b as usize] } else { -1.0 };
+                db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         drop(g);
-        match gpu::gpu_build_index(&vectors_i8, &graph_flat, n, dim, degree) {
-            Some(idx) => {
-                eprintln!("[GPU] VectorIndex uploaded: {n} vectors, degree={degree} (unified memory)");
+        match gpu::gpu_build_index(&vectors_i8, &graph_flat, &delta_scores, n, dim, gpu_degree) {
+            Some(mut idx) => {
+                // Fused GPU rerank: hand the kernel the exact corpus so it can
+                // rescore its own top-k instead of shipping ids back for the
+                // host to dot in f32. Guarded inside — if the corpus does not
+                // fit free VRAM the host rerank simply stays on.
+                {
+                    let g = self.hnsw.read().unwrap();
+                    let corpus = g.f32_corpus();
+                    if corpus.len() >= n * dim {
+                        idx.upload_f32_corpus(corpus);
+                    } else {
+                        eprintln!("[GPU] no contiguous f32 corpus ({} of {} floats) — host rerank",
+                            corpus.len(), n * dim);
+                    }
+                }
+                eprintln!("[GPU] VectorIndex uploaded: {n} vectors, degree={gpu_degree}, multi-level merged, OpusEdge SelKV ready");
+                let first_entries: Vec<i32> = graph_flat[..gpu_degree.min(10)].to_vec();
+                let valid = graph_flat.iter().filter(|&&x| x >= 0 && (x as usize) < n).count();
+                eprintln!("[GPU] graph_flat: {} valid entries / {} total, first={:?}", valid, n*gpu_degree, first_entries);
                 *self.gpu_idx.write().unwrap() = Some(idx);
             }
             None => eprintln!("[GPU] VectorIndex upload failed"),
         }
-    }
-
-    /// Initialize VUGVA Virtual Memory Table for hybrid mode.
-    /// Splits all INT8 vectors into chunks, tracks which chunks are in VRAM vs RAM.
-    /// GPU reads vectors on demand via chunk prefetch — the VUGVA paper's core idea.
-    pub fn init_vugva(&self, vram_budget_bytes: usize) {
-        let g = self.hnsw.read().unwrap();
-        let vectors_i8 = g.all_i8.clone();
-        let dim = g.dim;
-        let n_nodes = g.nodes.len();
-        drop(g);
-        let chunk_size = (vram_budget_bytes / dim / 2).max(1024); // ~50% VRAM per chunk
-        let vmt = gpu::vugva::VugvaVmt::new(&vectors_i8, dim, chunk_size, vram_budget_bytes);
-        let stats = gpu::vugva::vugva_stats(&vmt);
-        eprintln!("[VUGVA] Initialized for {n_nodes} vectors: {:?}", stats);
-        *self.vugva_vmt.write().unwrap() = Some(Arc::new(vmt));
     }
 
     /// Open the index and rebuild the graph from any persisted raw f32 vectors.
@@ -3989,7 +4402,7 @@ impl VectorIndex {
                 hnsw.insert(id, v);
             }
         }
-        Self { engine, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None), vugva_vmt: RwLock::new(None) }
+        Self { engine, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// Insert/replace a vector: durable f32 write + graph update with a
@@ -4091,7 +4504,14 @@ impl VectorIndex {
         }
         self.engine.put_batch(kvs)?;
         // Shard the batch into as-even ranges and build each in its own thread.
-        let shards = n_shards.max(1).min(n);
+        // At least MIN_PER_SHARD vectors per shard. A `VADDBATCH` of 64 was
+        // being split across 16 shards of 4 vectors each: 16 thread
+        // spawn/join round-trips and 16 near-empty segments handed to
+        // `merge_into`, all to build 4-node graphs. The thread overhead and the
+        // per-segment merge cost both dwarfed the work. Below the threshold this
+        // collapses to a single shard and the build runs inline.
+        const MIN_PER_SHARD: usize = 1024;
+        let shards = n_shards.max(1).min(n.div_ceil(MIN_PER_SHARD)).max(1).min(n);
         let per = (n as f64 / shards as f64).ceil() as usize;
         let ranges: Vec<(usize, usize)> = (0..shards)
             .map(|s| {
@@ -4101,7 +4521,15 @@ impl VectorIndex {
             })
             .filter(|(lo, hi)| hi > lo)
             .collect();
-        let segments: Vec<Hnsw> = ranges
+        // Spawn ALL segment builders, THEN join. `.map(spawn).map(join)` on a
+        // lazy iterator looks parallel but is not: `collect` pulls one item at a
+        // time, so each thread is spawned *and joined* before the next is
+        // spawned. This ran the entire "parallel" build serially — measured at
+        // 103% CPU on a 16-core box — and paid a thread spawn/join round-trip
+        // per shard on top. Collecting the handles first is what actually makes
+        // the shards concurrent. (The same function 500 lines up already does it
+        // correctly; these two copies drifted.)
+        let handles: Vec<_> = ranges
             .into_iter()
             .map(|(lo, hi)| {
                 let ids_seg: Vec<u64> = ids[lo..hi].to_vec();
@@ -4118,8 +4546,8 @@ impl VectorIndex {
                     h
                 })
             })
-            .map(|h| h.join().unwrap())
             .collect();
+        let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let mut g = self.hnsw.write().unwrap();
         g.merge_into(segments, 8);
         Ok(())
@@ -4139,7 +4567,14 @@ impl VectorIndex {
         if n == 0 {
             return;
         }
-        let shards = n_shards.max(1).min(n);
+        // At least MIN_PER_SHARD vectors per shard. A `VADDBATCH` of 64 was
+        // being split across 16 shards of 4 vectors each: 16 thread
+        // spawn/join round-trips and 16 near-empty segments handed to
+        // `merge_into`, all to build 4-node graphs. The thread overhead and the
+        // per-segment merge cost both dwarfed the work. Below the threshold this
+        // collapses to a single shard and the build runs inline.
+        const MIN_PER_SHARD: usize = 1024;
+        let shards = n_shards.max(1).min(n.div_ceil(MIN_PER_SHARD)).max(1).min(n);
         let per = (n as f64 / shards as f64).ceil() as usize;
         let ranges: Vec<(usize, usize)> = (0..shards)
             .map(|s| {
@@ -4150,7 +4585,9 @@ impl VectorIndex {
             .filter(|(lo, hi)| hi > lo)
             .collect();
         let zero_attr: Vec<u32> = vec![0u32; n];
-        let segments: Vec<Hnsw> = ranges
+        // Spawn all, then join — see `insert_many_parallel` for why chaining
+        // `.map(spawn).map(join)` silently serialises the whole build.
+        let handles: Vec<_> = ranges
             .into_iter()
             .map(|(lo, hi)| {
                 let ids_seg: Vec<u64> = ids[lo..hi].to_vec();
@@ -4167,8 +4604,8 @@ impl VectorIndex {
                     h
                 })
             })
-            .map(|h| h.join().unwrap())
             .collect();
+        let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let mut g = self.hnsw.write().unwrap();
         g.merge_into(segments, 8);
     }
@@ -4314,73 +4751,68 @@ impl VectorIndex {
         l2_normalize(&mut q);
         let qq = quantize(&q);
         let mode = gpu::gpu_get_mode();
-        static SEARCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = SEARCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // ── TURBO: Real GPU graph traversal (CAGRA) ──
-        if mode == gpu::ComputeMode::Turbo && gpu::gpu_available() {
+        // ── TURBO: GPU graph walk + exact f32 rerank ──
+        // Over-fetch GPU_TOPK_MAX (64) int8 candidates from the graph walk,
+        // then rescore them exactly — pure int8 costs ~15% recall on its own.
+        //
+        // Where the rerank runs depends on whether the exact corpus made it
+        // into VRAM (`gpu_rerank_on_device`). If it did, the kernel already
+        // reranked in shared memory and `dists` are exact — Turbo then touches
+        // the CPU only for id lookup and the tombstone check, which is what
+        // "GPU-only" should have meant all along. If it did not (corpus larger
+        // than free VRAM), we fall back to the host dot below. Recall is the
+        // same either way; only where the FLOPs land changes.
+        //
+        // The mode is NEVER silently changed here: if the GPU index is missing
+        // or the launch fails we just fall through to the CPU path.
+        if mode == gpu::ComputeMode::Turbo {
             let guard = self.gpu_idx.read().unwrap();
             if let Some(ref idx) = *guard {
-                let itopk = ef.max(k * 4).max(64);
-                let max_iters = (itopk as f32).sqrt() as usize + 5;
-                if let Some((indices, _distances)) = gpu::gpu_search(
-                    idx, &qq, 1, k, itopk, max_iters, 0,
-                ) {
-                    if count < 3 {
-                        let valid: Vec<_> = indices.iter().filter(|&&i| i >= 0).collect();
-                        eprintln!("[DEBUG] GPU search query#{}: {} valid results out of {} total, first 5: {:?}",
-                            count, valid.len(), k, &indices[..k.min(indices.len())]);
-                    }
-                    if count % 100 == 0 {
-                        eprintln!("[MITM] search_ef#{count} mode=Turbo GPU_CAGRA n={}", idx.n);
-                    }
+                let fetch_k = gpu::GPU_TOPK_MAX.min(idx.n).max(k.min(idx.n));
+                // APGC paper search: GPU beam search over the graph (not a
+                // brute-force scan). itopk = beam width (ef-class), bounded
+                // iterations; entry = HNSW top-level entry point.
+                let entry = self.hnsw.read().unwrap().entry.unwrap_or(0);
+                let itopk = ef.max(fetch_k).max(gpu::gpu_search_itopk()).min(idx.n);
+                let on_device = idx.gpu_rerank_on_device();
+                if let Some((indices, dists)) = gpu::gpu_search(
+                    idx, &qq, &q, 1, fetch_k, itopk, gpu::gpu_search_iters(), entry)
+                {
                     let g = self.hnsw.read().unwrap();
-                    let results: Vec<(u64, f32)> = indices.iter().filter(|&&i| i >= 0).filter_map(|&i| {
-                        let idx = i as usize;
-                        let node = g.nodes.get(idx)?;
-                        if node.deleted { return None; }
-                        let dot = dot_f32(&q, g.vec_at_f32(idx));
-                        let d = (1.0 - dot).max(0.0).min(2.0);
-                        Some((node.id, d))
-                    }).collect();
-                    if count < 3 {
-                        eprintln!("[DEBUG] GPU results: {:?}", &results[..results.len().min(5)]);
-                    }
-                    return results;
+                    let mut results: Vec<(u64, f32)> = indices
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &i)| i >= 0)
+                        .filter_map(|(rank, &i)| {
+                            let ix = i as usize;
+                            let node = g.nodes.get(ix)?;
+                            if node.deleted { return None; }
+                            let d = if on_device {
+                                dists[rank]
+                            } else {
+                                (1.0 - dot_f32(&q, g.vec_at_f32(ix))).max(0.0).min(2.0)
+                            };
+                            Some((node.id, d))
+                        })
+                        .collect();
+                    // Already sorted when the kernel reranked, but deletions can
+                    // punch holes and the host path is unsorted — cheap at k≤64.
+                    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    results.truncate(k);
+                    if !results.is_empty() { return results; }
                 }
             }
-            if count % 100 == 0 {
-                eprintln!("[MITM] search_ef#{count} mode=Turbo NO_GPU_IDX → auto-downgrade to Hybrid");
-            }
-            // Auto-downgrade: GPU index unavailable, switch to Hybrid
-            gpu::gpu_set_mode(gpu::ComputeMode::Hybrid);
         }
 
-        // ── HYBRID: CPU graph walk + CPU rerank (VUGVA manages RAM chunks) ──
-        // VUGVA VMT tracks which chunks are hot/warm but distance computation
-        // still runs on CPU. GPU distance path requires a dedicated kernel that
-        // reads from VUGVA GPU-resident chunks — not yet implemented.
+        // ── CPU / HYBRID: INT8 graph traversal + exact f32 rerank ──
+        // Hybrid keeps distance computation on CPU; VUGVA's VMT manages
+        // which chunks are GPU-resident for the batch path (search_many).
         let g = self.hnsw.read().unwrap();
         let qf = g.query_f32(&q);
         let rerank_k = (k * 4).max(64);
         let candidates = g.search_indices(&qq, rerank_k, ef.max(rerank_k), &qf);
 
-        if mode != gpu::ComputeMode::CpuOnly {
-            // Prefetch chunks via VUGVA (data management only, CPU computes)
-            let vmt_guard = self.vugva_vmt.read().unwrap();
-            if vmt_guard.is_some() && count % 500 == 0 {
-                let vmt = vmt_guard.as_ref().unwrap();
-                let chunk_indices: Vec<usize> = candidates.iter().map(|&(idx, _)| vmt.chunk_of(idx)).collect();
-                let _prefetched = vmt.prefetch_batch(&chunk_indices);
-                let stats = gpu::vugva::vugva_stats(vmt);
-                eprintln!("[MITM] search_ef#{count} mode={mode:?} VUGVA_PREFETCH {:?}", stats);
-            }
-        }
-
-        // ── CPU fallback: per-candidate f32 rerank ──
-        if count % 100 == 0 {
-            eprintln!("[MITM] search_ef#{count} mode={mode:?} CPU_FALLBACK candidates={}", candidates.len());
-        }
         let mut rescored: Vec<(u64, f32)> = candidates
             .into_iter()
             .filter_map(|(idx, _int8_dist)| {
@@ -4451,37 +4883,63 @@ impl VectorIndex {
         let num_queries = queries.len();
 
         // ── TURBO: Batch ALL queries into ONE GPU kernel call ──
-        // This is the CAGRA way: Q blocks × 256 threads, one kernel launch.
+        // This is the APGC way: Q blocks × 256 threads, one kernel launch.
         // GPU stays busy the entire time — no per-query overhead.
         if mode == gpu::ComputeMode::Turbo && gpu::gpu_available() {
             let guard = self.gpu_idx.read().unwrap();
             if let Some(ref idx) = *guard {
-                // Quantize all queries
+                // Normalize once, keep BOTH representations: int8 drives the
+                // graph walk, f32 feeds the kernel's fused rerank phase.
                 let mut all_qq: Vec<i8> = Vec::with_capacity(num_queries * idx.dim);
+                let mut all_qf: Vec<f32> = Vec::with_capacity(num_queries * idx.dim);
                 for q in queries {
                     let mut qn = q.clone();
                     l2_normalize(&mut qn);
                     all_qq.extend_from_slice(&quantize(&qn));
+                    all_qf.extend_from_slice(&qn);
                 }
-                let itopk = 128.max(k * 4);
-                let max_iters = 20;
-                if let Some((all_indices, _all_dists)) = gpu::gpu_search(
-                    idx, &all_qq, num_queries, k, itopk, max_iters, 0,
-                ) {
-                    // f32 rerank from CPU (read f32 vectors from RAM)
+                // Over-fetch 64 candidates per query for exact f32 rerank,
+                // and chunk into the persistent buffer capacity (max_q).
+                let fetch_k = gpu::GPU_TOPK_MAX.min(idx.n).max(k.min(idx.n));
+                let qdim = idx.dim;
+                let mut all_indices: Vec<i32> = Vec::with_capacity(num_queries * fetch_k);
+                let mut all_dists: Vec<f32> = Vec::with_capacity(num_queries * fetch_k);
+                let mut gpu_ok = true;
+                // APGC graph beam search per query block (paper §3.4).
+                let entry = self.hnsw.read().unwrap().entry.unwrap_or(0);
+                let itopk = fetch_k.max(gpu::gpu_search_itopk()).min(idx.n);
+                let on_device = idx.gpu_rerank_on_device();
+                for cs in (0..num_queries).step_by(idx.max_q) {
+                    let ce = (cs + idx.max_q).min(num_queries);
+                    match gpu::gpu_search(idx, &all_qq[cs * qdim..ce * qdim], &all_qf[cs * qdim..ce * qdim],
+                        ce - cs, fetch_k, itopk, gpu::gpu_search_iters(), entry)
+                    {
+                        Some((idxs, ds)) => {
+                            all_indices.extend_from_slice(&idxs);
+                            all_dists.extend_from_slice(&ds);
+                        }
+                        None => { gpu_ok = false; break; }
+                    }
+                }
+                if gpu_ok {
+                    // When the corpus is VRAM-resident the kernel already did
+                    // the exact rescoring, so this loop is pure id mapping.
+                    // Otherwise fall back to dotting f32 from RAM.
                     let g = self.hnsw.read().unwrap();
                     let mut results = Vec::with_capacity(num_queries);
                     for qi in 0..num_queries {
-                        let mut hits: Vec<(u64, f32)> = (0..k).filter_map(|ki| {
-                            let global_i = all_indices[qi * k + ki];
+                        let qn = &all_qf[qi * qdim..(qi + 1) * qdim];
+                        let mut hits: Vec<(u64, f32)> = (0..fetch_k).filter_map(|ki| {
+                            let global_i = all_indices[qi * fetch_k + ki];
                             if global_i < 0 { return None; }
                             let idx = global_i as usize;
                             let node = g.nodes.get(idx)?;
                             if node.deleted { return None; }
-                            let mut qn = queries[qi].clone();
-                            l2_normalize(&mut qn);
-                            let dot = dot_f32(&qn, g.vec_at_f32(idx));
-                            let d = (1.0 - dot).max(0.0).min(2.0);
+                            let d = if on_device {
+                                all_dists[qi * fetch_k + ki]
+                            } else {
+                                (1.0 - dot_f32(qn, g.vec_at_f32(idx))).max(0.0).min(2.0)
+                            };
                             Some((node.id, d))
                         }).collect();
                         hits.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -4724,6 +5182,173 @@ mod tests {
         use std::time::{SystemTime, UNIX_EPOCH};
         let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         Engine::open(dir.join(format!("vec_{n}.wal"))).unwrap()
+    }
+
+    /// Read this process's VmRSS in MB.
+    fn test_rss_mb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("VmRSS:").map(|r| r.to_string()))
+            })
+            .and_then(|r| r.split_whitespace().next()?.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+            .unwrap_or(0)
+    }
+
+    /// Incremental `VADDBATCH` ingest must use memory LINEAR in the vector count.
+    ///
+    /// It did not. Loading 200k × 384d over the wire drove the server to 29.3 GB
+    /// resident (61.7 GB virtual) and the kernel OOM-killer took it out — for a
+    /// dataset whose raw f32 payload is 307 MB. The same load at 100k finished
+    /// comfortably at 850 MB, so the growth is not just steep, it is superlinear:
+    /// 2x the vectors for ~34x the memory.
+    ///
+    /// This reproduces it in-process, without the server or the wire, so it can
+    /// run under a bounded cgroup instead of taking a desktop down. It ingests in
+    /// 64-vector batches — the batch size the bench uses, and the size that makes
+    /// `merge_into` run thousands of times — and asserts bytes-per-vector stays
+    /// bounded as `n` grows.
+    ///
+    /// Ignored by default because it is a memory stress test, not a unit test.
+    /// Run it deliberately, and cap it:
+    ///
+    ///   systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0 \
+    ///     cargo test --release -p views incremental_ingest_memory_is_linear \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn incremental_ingest_memory_is_linear() {
+        const DIM: usize = 384;
+        const BATCH: usize = 64;
+        let n_total: usize = std::env::var("DBSTRIKE_TEST_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+
+        let idx = VectorIndex::open(eng());
+        let base_rss = test_rss_mb();
+        // Deterministic pseudo-random unit vectors; no dataset dependency.
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / 16_777_216.0 - 0.5
+        };
+
+        let mut worst_bpv = 0f64;
+        let mut ids = Vec::with_capacity(BATCH);
+        let mut vecs = Vec::with_capacity(BATCH * DIM);
+        let mut done = 0usize;
+        while done < n_total {
+            let this = BATCH.min(n_total - done);
+            ids.clear();
+            vecs.clear();
+            for i in 0..this {
+                ids.push((done + i) as u64);
+                let mut v: Vec<f32> = (0..DIM).map(|_| next()).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+                vecs.extend_from_slice(&v);
+            }
+            let attrs = vec![0u32; this];
+            idx.insert_many_parallel(&ids, &vecs, DIM, 8, &attrs).unwrap();
+            done += this;
+
+            if done % 20_000 == 0 || done == n_total {
+                let rss = test_rss_mb().saturating_sub(base_rss);
+                let bpv = (rss as f64 * 1_048_576.0) / done as f64;
+                worst_bpv = worst_bpv.max(bpv);
+                println!(
+                    "  n={done:>7}  rss={rss:>6} MB  {bpv:>8.0} bytes/vector",
+                    );
+            }
+        }
+
+        // A vector costs DIM*4 (f32 corpus) + DIM (i8) + the graph. At m_max0=64
+        // and cap mult 2 the adjacency is ~128 usize plus Vec overhead, so ~3 KB
+        // per vector is generous and 8 KB is already alarming. The observed
+        // blowup was ~150 KB/vector.
+        assert!(
+            worst_bpv < 8192.0,
+            "incremental ingest used {worst_bpv:.0} bytes/vector — superlinear growth is back \
+             (raw payload is {} bytes/vector)",
+            DIM * 4
+        );
+    }
+
+    /// Same ingest, but from 8 client threads at once — the shape the bench and
+    /// the server actually use.
+    ///
+    /// `incremental_ingest_memory_is_linear` shows the single-threaded path is
+    /// flat at ~6.3 KB/vector all the way to 200k, so whatever drove the server
+    /// to 29 GB is not the merge algorithm. This isolates the next variable:
+    /// concurrency. If this stays flat too, the blowup lives above the index —
+    /// in the RESP layer or the connection handling — and not in `views` at all.
+    ///
+    /// Ignored by default; run capped, same as the test above.
+    #[test]
+    #[ignore]
+    fn concurrent_ingest_memory_is_linear() {
+        const DIM: usize = 384;
+        const BATCH: usize = 64;
+        const CLIENTS: usize = 8;
+        let n_total: usize = std::env::var("DBSTRIKE_TEST_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+
+        let idx = Arc::new(VectorIndex::open(eng()));
+        let base_rss = test_rss_mb();
+        let per_client = n_total / CLIENTS;
+
+        let handles: Vec<_> = (0..CLIENTS)
+            .map(|c| {
+                let idx = Arc::clone(&idx);
+                std::thread::spawn(move || {
+                    let mut seed = 0x9E3779B97F4A7C15u64 ^ ((c as u64 + 1) << 32);
+                    let mut next = move || {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        (seed >> 40) as f32 / 16_777_216.0 - 0.5
+                    };
+                    let mut done = 0usize;
+                    while done < per_client {
+                        let this = BATCH.min(per_client - done);
+                        let mut ids = Vec::with_capacity(this);
+                        let mut vecs = Vec::with_capacity(this * DIM);
+                        for i in 0..this {
+                            ids.push(((c * per_client) + done + i) as u64);
+                            let mut v: Vec<f32> = (0..DIM).map(|_| next()).collect();
+                            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            for x in v.iter_mut() {
+                                *x /= norm;
+                            }
+                            vecs.extend_from_slice(&v);
+                        }
+                        let attrs = vec![0u32; this];
+                        idx.insert_many_parallel(&ids, &vecs, DIM, 8, &attrs).unwrap();
+                        done += this;
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let rss = test_rss_mb().saturating_sub(base_rss);
+        let bpv = (rss as f64 * 1_048_576.0) / (per_client * CLIENTS) as f64;
+        println!("  {CLIENTS} clients  n={}  rss={rss} MB  {bpv:.0} bytes/vector", per_client * CLIENTS);
+        assert!(
+            bpv < 8192.0,
+            "concurrent ingest used {bpv:.0} bytes/vector (single-threaded is ~6300)"
+        );
     }
 
     #[test]

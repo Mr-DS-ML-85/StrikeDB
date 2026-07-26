@@ -17,6 +17,8 @@
 //!
 //! Pure Rust. Zero external crates.
 
+pub mod memtrack;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};

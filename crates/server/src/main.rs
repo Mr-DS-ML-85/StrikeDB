@@ -22,6 +22,21 @@
 
 mod acl;
 
+/// Keep the allocator's books for this process.
+///
+/// A 200k × 384d ingest over the wire drove this server to 29.3 GB resident and
+/// the OOM-killer took it out, while the *same* index built in-process stayed at
+/// 1.2 GB. RSS alone cannot close that gap — it reports the total but never the
+/// owner — so the allocator does the accounting instead, and `MEMTRACK` reads
+/// the books back over RESP. That means a phase can be attributed live, without
+/// attaching a profiler or restarting the server under one.
+///
+/// Cost is two relaxed atomic adds per allocation: no syscalls, no locks, small
+/// enough to leave installed on the hot ingest path without perturbing the very
+/// behaviour it is measuring.
+#[global_allocator]
+static ALLOC: mitm::memtrack::TrackingAlloc = mitm::memtrack::TrackingAlloc;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -178,6 +193,8 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
     // clearer and just as fast.
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut tmp = [0u8; 32 * 1024];
+    // Read once per connection, not once per command.
+    let trace = std::env::var("DBSTRIKE_TRACE").is_ok_and(|v| v != "0");
     // ACL: track which user this connection is authenticated as.
     // If no requirepass, default user is pre-authenticated.
     let mut current_user: String = if db.acl.requires_auth() {
@@ -209,7 +226,21 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
                     }
                 }
                 Ok(None) => break, // partial command; wait for more bytes
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A genuine protocol error (NOT a truncated frame —
+                    // `try_parse` reports those as `Ok(None)`). Reply the way
+                    // Redis does, then close. Previously this bare `return
+                    // Err(e)` dropped the socket, and `is_benign_disconnect`
+                    // matched the message and suppressed the log, so the client
+                    // saw an unexplained `ConnectionReset` and the server said
+                    // nothing at all. Send the reason down the wire first.
+                    let _ = write_resp_buf(&mut out, &err(&format!("ERR Protocol error: {e}")));
+                    if let Ok(mut s) = stream.lock() {
+                        let _ = s.write_all(&out);
+                        let _ = s.flush();
+                    }
+                    return Err(e);
+                }
             }
         }
         if cursor > 0 {
@@ -335,12 +366,21 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
                 continue;
             }
 
-            let t_start = std::time::Instant::now();
-            let resp = dispatch(&db, &name, args);
-            let elapsed_ms = t_start.elapsed().as_micros() as f64 / 1000.0;
-            // Log command with password redaction.
-            let redacted = redact_cmd(&name, args);
-            eprintln!("[CMD] {:>6.1}ms {}", elapsed_ms, redacted);
+            // Per-command trace, OFF by default (`DBSTRIKE_TRACE=1` to enable).
+            // This used to be unconditional, and it is not a cheap line: it
+            // formats every argument, so a single 384-dim VSEARCH prints ~5 KB.
+            // One 1.7s bench section produced a 160 MB log, and the formatting
+            // plus the write syscall sat directly in the command hot path.
+            let resp = if trace {
+                let t_start = std::time::Instant::now();
+                let resp = dispatch(&db, &name, args);
+                let elapsed_ms = t_start.elapsed().as_micros() as f64 / 1000.0;
+                // Redacts passwords — see `redact_cmd`.
+                eprintln!("[CMD] {:>6.1}ms {}", elapsed_ms, redact_cmd(&name, args));
+                resp
+            } else {
+                dispatch(&db, &name, args)
+            };
             write_resp_buf(&mut out, &resp)?;
             if name == "QUIT" {
                 quit = true;
@@ -1366,6 +1406,35 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
         "CDCLEN" => Resp::Int(db.reactive.cdc_len() as i64),
+
+        // MEMTRACK [tag] — read the allocator's books.
+        //
+        // Call it at phase boundaries (post-ingest, post-search, per step of a
+        // concurrency sweep) and the deltas attribute growth to a phase. Two
+        // numbers do the real work:
+        //
+        //   * `rss` vs `live` — agreement means the heap is genuinely that big;
+        //     rss far above live means the allocator is sitting on memory it has
+        //     already freed, i.e. fragmentation, and freeing more will not bring
+        //     rss down.
+        //   * `mean` object size — tens of bytes next to a multi-GB `live` is the
+        //     death-by-small-object signature, which is what a RESP frame parsed
+        //     into tens of thousands of tiny `Vec<u8>`s would look like.
+        //
+        // MEMTRACK HIST adds the cumulative size histogram, which separates a
+        // handful of runaway buffers from millions of small allocations.
+        "MEMTRACK" => {
+            let tag = args
+                .first()
+                .map(|a| String::from_utf8_lossy(a).to_string())
+                .unwrap_or_else(|| "now".to_string());
+            if tag.eq_ignore_ascii_case("hist") {
+                let s = mitm::memtrack::snapshot();
+                Resp::Bulk(format!("{}\n{}", mitm::memtrack::report("hist"), s.histogram()).into_bytes())
+            } else {
+                Resp::Bulk(mitm::memtrack::report(&tag).into_bytes())
+            }
+        }
 
         // GPU.LOAD <kernel> — compile and load a CUDA kernel on demand.
         // Kernels: cosine_dist, matmul. Lazy: only compiled when first requested.

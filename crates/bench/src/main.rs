@@ -12,7 +12,7 @@
 //! Exit code 0 = all green, 1 = any failure.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -33,6 +33,7 @@ static FAILED: AtomicUsize = AtomicUsize::new(0);
 
 fn section(title: &str) {
     println!("\n\x1b[1m=== {title} ===\x1b[0m");
+    flush_out();
 }
 
 fn check(name: &str, cond: bool, detail: impl AsRef<str>) {
@@ -52,6 +53,7 @@ fn check(name: &str, cond: bool, detail: impl AsRef<str>) {
             println!("  \x1b[31mFAIL\x1b[0m  {name}  ({detail})");
         }
     }
+    flush_out();
 }
 
 fn pctl(samples: &mut [u64], p: f64) -> u64 {
@@ -83,6 +85,84 @@ fn print_rss(tag: &str) {
     if let Some(mb) = rss_mb() {
         println!("  \x1b[90mRSS[{tag}] = {mb} MB\x1b[0m");
     }
+    flush_out();
+}
+
+/// Push stdout to the OS at every phase boundary.
+///
+/// `println!` line-buffers to a terminal but *block*-buffers to a pipe or a
+/// file, so redirecting a run into `tail` or a log silently holds the last few
+/// KB in userspace. If the process is then killed — OOM, cgroup, SIGKILL — that
+/// tail is lost, and the log's final line is wherever the buffer happened to
+/// end rather than wherever execution stopped.
+///
+/// That is not a cosmetic problem. It made a run that was killed later *look*
+/// like it died right after the recall phase, and sent me hunting a memory bug
+/// in the wrong function. A diagnostic log that truncates on the exact failure
+/// it is meant to explain is worse than none.
+fn flush_out() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// `MemAvailable` from /proc/meminfo, in MB. This is the kernel's own estimate
+/// of what a new allocation can actually get without swapping — deliberately
+/// not `MemFree`, which excludes reclaimable page cache and would make a
+/// healthy machine look full.
+fn mem_available_mb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            return rest.split_whitespace().next()?.parse::<u64>().ok().map(|kb| kb / 1024);
+        }
+    }
+    None
+}
+
+/// Projected peak RSS in MB for an `n × dim` run, summed across the server and
+/// this process.
+///
+/// Fitted to measurements rather than guessed. Two 100k runs, server RSS at
+/// peak, with the f32 rerank corpus and the i8 copy subtracted out:
+///
+///   384d: 980 MB total − (153 f32 + 38 i8) = 789 MB unaccounted
+///   768d: 1211 MB total − (307 f32 + 77 i8) = 827 MB unaccounted
+///
+/// The remainder is flat in `dim`, which is what you'd expect — it is the graph
+/// adjacency, and an edge costs the same whatever the vector length. It works
+/// out to ~8 KB per node. So the model is `dim`-proportional storage (f32 + i8
+/// ≈ 5 bytes per component) plus a flat per-node graph cost, and then the
+/// dataset this process holds in memory on top.
+fn projected_peak_mb(n: usize, dim: usize) -> u64 {
+    let server_vecs = (n as u64 * dim as u64 * 5) / 1_000_000; // f32 corpus + i8 copy
+    let server_graph = (n as u64 * 8) / 1024; // ~8 KB/node of adjacency
+    let bench_dataset = (n as u64 * dim as u64 * 4) / 1_000_000; // our own f32 copy
+    server_vecs + server_graph + bench_dataset
+}
+
+/// Refuse to start a run that the machine cannot hold.
+///
+/// This exists because `--xlarge` once took the whole desktop down with it: the
+/// OOM killer does not politely pick the benchmark, and a run that dies at 90%
+/// tells you nothing anyway. Checking first costs a file read.
+///
+/// Requires a 1.3x margin over the projection, because the projection is a fit
+/// and allocator behaviour at peak is spiky. Set `DBSTRIKE_BENCH_NO_MEMGUARD=1`
+/// to run anyway — but read the number it prints before you do.
+fn memory_guard(n: usize, dim: usize, what: &str) -> bool {
+    let need = projected_peak_mb(n, dim) * 13 / 10;
+    let Some(avail) = mem_available_mb() else { return true };
+    if avail >= need {
+        println!("  \x1b[90mmemguard: {what} projects ~{need} MB peak, {avail} MB available — ok\x1b[0m");
+        return true;
+    }
+    if std::env::var_os("DBSTRIKE_BENCH_NO_MEMGUARD").is_some() {
+        println!("  \x1b[33mmemguard OVERRIDDEN: {what} projects ~{need} MB peak, only {avail} MB available\x1b[0m");
+        return true;
+    }
+    println!("  \x1b[31mSKIPPED: {what} projects ~{need} MB peak but only {avail} MB is available.\x1b[0m");
+    println!("  \x1b[31m  Free memory and re-run, or set DBSTRIKE_BENCH_NO_MEMGUARD=1 to force it.\x1b[0m");
+    false
 }
 
 fn latency_report(name: &str, mut samples: Vec<u64>) {
@@ -102,7 +182,7 @@ fn latency_report(name: &str, mut samples: Vec<u64>) {
 // ── fresh WAL path helper ──────────────────────────────────────────────────
 
 fn fresh_wal(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("dbstrike_bench_{}", std::process::id()));
+    let dir = scratch_dir().join(format!("dbstrike_bench_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{tag}.wal"));
     let _ = std::fs::remove_file(&p);
@@ -754,31 +834,41 @@ fn vadd_cmd(id: u64, v: &[f32]) -> Vec<u8> {
     cmd
 }
 
+/// Append one RESP bulk string, deriving `$len` from the payload itself.
+///
+/// Every hand-written `b"$8\r\nVADDBATCH\r\n"` literal is a place where the
+/// declared length and the payload can silently disagree — and one did:
+/// `VADDBATCH` is 9 bytes, not 8. The server consumed 8 bytes plus a 2-byte
+/// CRLF that wasn't there, landed on `\n` instead of `$`, and rejected the
+/// frame as "expected bulk string". Because a `-ERR` reply was being treated as
+/// success by the client, the bench reported a full 100k ingest against an
+/// index that had received nothing. Compute the length; never type it.
+fn push_bulk(cmd: &mut Vec<u8>, payload: &[u8]) {
+    cmd.extend_from_slice(format!("${}\r\n", payload.len()).as_bytes());
+    cmd.extend_from_slice(payload);
+    cmd.extend_from_slice(b"\r\n");
+}
+
 /// Build a RESP `VADDBATCH [PAR] dim id0 f0.. id1 f1.. ...` command.
 /// If `parallel` is true, prepends "PAR" flag for parallel graph rebuild.
 fn vaddbatch_cmd(dim: usize, ids: &[u64], vecs: &[f32], parallel: bool) -> Vec<u8> {
     // N args = [PAR?] + VADDBATCH + dim + for each vec: (1 id + dim floats)
     let n_args = if parallel { 3 } else { 2 } + ids.len() * (1 + dim);
     let mut cmd: Vec<u8> = format!("*{}\r\n", n_args).into_bytes();
+    // Command name FIRST, then the optional flag. The server takes `cmds[i][0]`
+    // as the command name and only then looks for `PAR` in `args`, so emitting
+    // `PAR` ahead of `VADDBATCH` would make the command name literally "PAR".
+    // Latent until now only because every caller passes `parallel = false`.
+    push_bulk(&mut cmd, b"VADDBATCH");
     if parallel {
-        cmd.extend_from_slice(b"$3\r\nPAR\r\n");
+        push_bulk(&mut cmd, b"PAR");
     }
-    cmd.extend_from_slice(b"$8\r\nVADDBATCH\r\n");
-    let ds = dim.to_string();
-    cmd.extend_from_slice(format!("${}\r\n", ds.len()).as_bytes());
-    cmd.extend_from_slice(ds.as_bytes());
-    cmd.extend_from_slice(b"\r\n");
+    push_bulk(&mut cmd, dim.to_string().as_bytes());
     for (i, &id) in ids.iter().enumerate() {
-        let ids_str = id.to_string();
-        cmd.extend_from_slice(format!("${}\r\n", ids_str.len()).as_bytes());
-        cmd.extend_from_slice(ids_str.as_bytes());
-        cmd.extend_from_slice(b"\r\n");
+        push_bulk(&mut cmd, id.to_string().as_bytes());
         let base = i * dim;
         for j in 0..dim {
-            let s = format!("{}", vecs[base + j]);
-            cmd.extend_from_slice(format!("${}\r\n", s.len()).as_bytes());
-            cmd.extend_from_slice(s.as_bytes());
-            cmd.extend_from_slice(b"\r\n");
+            push_bulk(&mut cmd, format!("{}", vecs[base + j]).as_bytes());
         }
     }
     cmd
@@ -828,7 +918,31 @@ impl Client {
     /// reply into a Vec<(u64, f32)>. Used by the unified-module wire bench.
     fn vsearch_collect(&mut self, k: usize, flags: &[Vec<u8>], q: &[f32]) -> std::io::Result<Vec<(u64, f32)>> {
         self.send_raw(&vsearch_flags_cmd(k, flags, q))?;
+        self.read_id_dist_array()
+    }
+
+    /// Read the ids from an already-sent VSEARCH, leaving the connection
+    /// positioned exactly at the end of that reply.
+    ///
+    /// This exists because the recall check reuses one connection for many
+    /// queries. The previous code wrapped `stream.try_clone()` in a fresh
+    /// `BufReader` per query, which is only safe when the connection is thrown
+    /// away afterwards: the `BufReader` reads ahead into its own buffer and
+    /// takes any bytes belonging to the *next* reply with it when it drops.
+    /// Going through `Client`'s own buffer keeps the stream consistent.
+    fn vsearch_reply_ids(&mut self) -> std::io::Result<Vec<u64>> {
+        Ok(self.read_id_dist_array()?.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// Parse one `[id, dist, id, dist, ...]` array reply.
+    fn read_id_dist_array(&mut self) -> std::io::Result<Vec<(u64, f32)>> {
         let line = self.read_line()?;
+        if line.first() == Some(&b'-') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("server replied {}", String::from_utf8_lossy(&line)),
+            ));
+        }
         if line.first() == Some(&b'*') {
             let n: i64 = std::str::from_utf8(&line[1..]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
             let mut out = Vec::new();
@@ -885,16 +999,20 @@ fn wire_ingest_with(addr: &str, n: u64, dim: usize, n_threads: usize,
         let addr = addr.to_string();
         let done_count = Arc::clone(&done_count);
         let vec_of = Arc::clone(&vec_of);
-        handles.push(thread::spawn(move || {
-            let mut c = Client::connect(&addr).unwrap();
+        handles.push(thread::spawn(move || -> Result<(), String> {
+            let mut c = Client::connect(&addr)
+                .map_err(|e| format!("client {tid}: connect {addr}: {e}"))?;
             let start = (tid * per) as u64;
             let end = ((tid + 1) * per).min(n as usize) as u64;
             for i in start..end {
                 let v = vec_of(i);
-                c.send_raw(&vadd_cmd(i, &v)).unwrap();
-                c.drain_reply().unwrap();
+                c.send_raw(&vadd_cmd(i, &v))
+                    .map_err(|e| format!("client {tid}: VADD id {i}: send: {e}"))?;
+                c.drain_reply()
+                    .map_err(|e| format!("client {tid}: VADD id {i}: reply: {e}"))?;
                 done_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            Ok(())
         }));
     }
     let mut last = t0;
@@ -908,8 +1026,22 @@ fn wire_ingest_with(addr: &str, n: u64, dim: usize, n_threads: usize,
         }
         thread::sleep(Duration::from_millis(200));
     }
+    let mut errs: Vec<String> = Vec::new();
     for h in handles {
-        h.join().unwrap();
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => errs.push(e),
+            Err(_) => errs.push("ingest client thread panicked".to_string()),
+        }
+    }
+    let done = done_count.load(std::sync::atomic::Ordering::Relaxed);
+    if !errs.is_empty() {
+        eprintln!("  \x1b[31mingest FAILED after {done}/{n} vectors:\x1b[0m");
+        for e in errs.iter().take(4) {
+            eprintln!("    {e}");
+        }
+        eprintln!("    (server log: {}/dbstrike_server_*.log)", scratch_dir().display());
+        return 0.0;
     }
     let dt = t0.elapsed().as_secs_f64();
     let rate = n as f64 / dt;
@@ -922,7 +1054,24 @@ fn wire_ingest_with(addr: &str, n: u64, dim: usize, n_threads: usize,
 fn wire_ingest_pipelined(addr: &str, n: u64, dim: usize, n_threads: usize,
                          batch_size: usize,
                          vec_of: std::sync::Arc<dyn Fn(u64) -> Vec<f32> + Send + Sync>) -> f64 {
-    println!("  ingesting {n} × {dim}d over RESP VADDBATCH PAR (batch={batch_size}, {n_threads} clients) ...");
+    wire_ingest_pipelined_range(addr, 0, n, dim, n_threads, batch_size, vec_of)
+}
+
+/// Ingest ids `id_lo .. id_lo + n` over the wire. Returns vectors/second.
+///
+/// The offset exists so an ingest can be walked in stages against one server —
+/// `--memprobe` reads the allocator's books between stages, and that only
+/// attributes anything if the stages land in the same index rather than each
+/// starting from id 0.
+fn wire_ingest_pipelined_range(addr: &str, id_lo: u64, n: u64, dim: usize, n_threads: usize,
+                         batch_size: usize,
+                         vec_of: std::sync::Arc<dyn Fn(u64) -> Vec<f32> + Send + Sync>) -> f64 {
+    // Not "VADDBATCH PAR". `send_batch` below passes `parallel = false`, so the
+    // PAR flag never reaches the wire and the server takes the incremental
+    // merge path, not the rebuild one. The old label advertised a code path
+    // this function does not exercise — a benchmark log that names the wrong
+    // path is worse than no log, because it survives into the README.
+    println!("  ingesting {n} × {dim}d over RESP VADDBATCH (batch={batch_size}, {n_threads} clients) ...");
     let t0 = Instant::now();
     let per = (n as usize).div_ceil(n_threads);
     let done_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -931,12 +1080,28 @@ fn wire_ingest_pipelined(addr: &str, n: u64, dim: usize, n_threads: usize,
         let addr = addr.to_string();
         let done_count = Arc::clone(&done_count);
         let vec_of = Arc::clone(&vec_of);
-        handles.push(thread::spawn(move || {
-            let mut c = Client::connect(&addr).unwrap();
-            let start = (tid * per) as u64;
-            let end = ((tid + 1) * per).min(n as usize) as u64;
+        handles.push(thread::spawn(move || -> Result<(), String> {
+            let mut c = Client::connect(&addr)
+                .map_err(|e| format!("client {tid}: connect {addr}: {e}"))?;
+            let start = id_lo + (tid * per) as u64;
+            let end = id_lo + ((tid + 1) * per).min(n as usize) as u64;
             let mut batch_ids: Vec<u64> = Vec::with_capacity(batch_size);
             let mut batch_vecs: Vec<f32> = Vec::with_capacity(batch_size * dim);
+            // One VADDBATCH round-trip, with the failure annotated by the id
+            // range that was in flight. A bare `ConnectionReset` from an
+            // `.unwrap()` said nothing about *which* command killed the server;
+            // this says exactly how far the ingest got and how big the command
+            // was, which is what you need to reproduce it.
+            let send_batch = |c: &mut Client, ids: &[u64], vecs: &[f32]| -> Result<(), String> {
+                let cmd = vaddbatch_cmd(dim, ids, vecs, false);
+                let span = format!(
+                    "client {tid}: VADDBATCH ids {}..={} ({} vecs × {dim}d, {} bytes)",
+                    ids[0], ids[ids.len() - 1], ids.len(), cmd.len()
+                );
+                c.send_raw(&cmd).map_err(|e| format!("{span}: send: {e}"))?;
+                c.drain_reply().map_err(|e| format!("{span}: reply: {e}"))?;
+                Ok(())
+            };
             for i in start..end {
                 let v = vec_of(i);
                 batch_ids.push(i);
@@ -947,20 +1112,17 @@ fn wire_ingest_pipelined(addr: &str, n: u64, dim: usize, n_threads: usize,
                     // when batches are small. The incremental path does parallel
                     // segment build + serial merge_into, which is faster for
                     // repeated small batches.
-                    let cmd = vaddbatch_cmd(dim, &batch_ids, &batch_vecs, false);
-                    c.send_raw(&cmd).unwrap();
-                    c.drain_reply().unwrap();
+                    send_batch(&mut c, &batch_ids, &batch_vecs)?;
                     done_count.fetch_add(batch_ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     batch_ids.clear();
                     batch_vecs.clear();
                 }
             }
             if !batch_ids.is_empty() {
-                let cmd = vaddbatch_cmd(dim, &batch_ids, &batch_vecs, false);
-                c.send_raw(&cmd).unwrap();
-                c.drain_reply().unwrap();
+                send_batch(&mut c, &batch_ids, &batch_vecs)?;
                 done_count.fetch_add(batch_ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
+            Ok(())
         }));
     }
     let mut last = t0;
@@ -974,8 +1136,28 @@ fn wire_ingest_pipelined(addr: &str, n: u64, dim: usize, n_threads: usize,
         }
         thread::sleep(Duration::from_millis(200));
     }
+    // Collect wire failures instead of unwrapping them. A reset connection is a
+    // *result* — the section's `check()` should fail with an explanation — not a
+    // reason to abort the whole bench run and leave the server orphaned.
+    let mut errs: Vec<String> = Vec::new();
     for h in handles {
-        h.join().unwrap();
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => errs.push(e),
+            Err(_) => errs.push("ingest client thread panicked".to_string()),
+        }
+    }
+    let done = done_count.load(std::sync::atomic::Ordering::Relaxed);
+    if !errs.is_empty() {
+        eprintln!("  \x1b[31mingest FAILED after {done}/{n} vectors:\x1b[0m");
+        for e in errs.iter().take(4) {
+            eprintln!("    {e}");
+        }
+        if errs.len() > 4 {
+            eprintln!("    ... and {} more", errs.len() - 4);
+        }
+        eprintln!("    (server log: {}/dbstrike_server_*.log)", scratch_dir().display());
+        return 0.0;
     }
     let dt = t0.elapsed().as_secs_f64();
     let rate = n as f64 / dt;
@@ -1079,52 +1261,97 @@ fn wire_concurrent_qps(addr: &str, dim: usize, n_clusters: u64,
 /// so dot == cosine similarity), then compare to the server's ANN top-10.
 /// No cluster-membership shortcut — recall here means "did the ANN return
 /// the actual nearest 10". Works for both synthetic and real datasets.
+///
+/// This function used to be the single largest allocator in the benchmark, and
+/// it was the reason a 200k run got OOM-killed. Three separate mistakes stacked
+/// multiplicatively:
+///
+///   1. `data.to_vec()` copied the entire corpus a second time, purely to get
+///      an owned `Arc` — 307 MB at 200k×384d, 1.5 GB at 1M, on top of the two
+///      copies the caller already holds.
+///   2. Every query got its own thread, spawned all at once with no pool. 200
+///      queries meant 200 live threads and 200 simultaneous server connections.
+///   3. Each of those threads built `Vec<(f32, u64)>` with capacity `n` to find
+///      ten elements. `(f32, u64)` is 16 bytes after padding, so that is 3.2 MB
+///      per thread at 200k and 16 MB at 1M — times 200 threads, 640 MB and
+///      3.2 GB respectively, then sorted in full to read off the first ten.
+///
+/// All three are fixed below: the corpus is borrowed rather than copied, the
+/// queries run on a bounded pool, and the exact top-10 comes from a
+/// fixed-size insertion buffer that is O(k) memory instead of O(n). Sorting n
+/// items to take 10 was also the dominant cost in time, not just space.
 fn wire_cluster_recall(addr: &str, dim: usize, n: u64, n_queries: usize,
                        data: &[f32],
                        query_of: std::sync::Arc<dyn Fn(u64) -> Vec<f32> + Send + Sync>) -> f64 {
     println!("  Recall@10 vs brute-force ground truth ({n_queries} q, true NN) ...");
     let t_r = Instant::now();
-    let data = std::sync::Arc::new(data.to_vec());
-    // Per-query: brute-force exact top-10, then ask the server, then compare.
-    let overlaps: Vec<f64> = (0..n_queries)
-        .map(|qi| {
+
+    // Bounded pool. The point of this phase is ground truth, not load
+    // generation — the QPS sections measure concurrency deliberately, and
+    // letting an unrelated correctness check open 200 connections meant the
+    // server's peak memory depended on how many queries we happened to ask for.
+    let workers = n_queries.min(8).max(1);
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let total_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Borrow the corpus across scoped threads instead of cloning it. The
+    // brute force only ever reads it.
+    thread::scope(|s| {
+        for _ in 0..workers {
             let addr = addr.to_string();
-            let data = std::sync::Arc::clone(&data);
             let query_of = std::sync::Arc::clone(&query_of);
-            thread::spawn(move || {
-                let q = query_of(qi as u64);
-                // Exact top-10 by dot product (L2-normalized => cosine).
-                let mut scored: Vec<(f32, u64)> = Vec::with_capacity(n as usize);
-                for i in 0..n {
-                    let base = (i as usize) * dim;
-                    let mut d = 0f32;
-                    for j in 0..dim {
-                        d += q[j] * data[base + j];
+            let next = Arc::clone(&next);
+            let total_hits = Arc::clone(&total_hits);
+            let data: &[f32] = data;
+            s.spawn(move || {
+                let mut c = match Client::connect(&addr) {
+                    Ok(c) => c,
+                    Err(e) => { eprintln!("  recall worker: connect {addr}: {e}"); return; }
+                };
+                loop {
+                    let qi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if qi >= n_queries { break; }
+                    let q = query_of(qi as u64);
+
+                    // Exact top-10 by dot product (L2-normalized => cosine),
+                    // kept in a 10-slot buffer. `worst` is the current
+                    // admission threshold, so the common case is one compare
+                    // and no write at all.
+                    const K: usize = 10;
+                    let mut top: Vec<(f32, u64)> = Vec::with_capacity(K + 1);
+                    let mut worst = f32::NEG_INFINITY;
+                    for i in 0..n {
+                        let base = (i as usize) * dim;
+                        let row = &data[base..base + dim];
+                        let mut d = 0f32;
+                        for j in 0..dim {
+                            d += q[j] * row[j];
+                        }
+                        if top.len() == K && d <= worst { continue; }
+                        let pos = top.partition_point(|&(s, _)| s > d);
+                        top.insert(pos, (d, i));
+                        if top.len() > K { top.pop(); }
+                        worst = top[top.len() - 1].0;
                     }
-                    scored.push((d, i));
+                    let truth: std::collections::BTreeSet<u64> =
+                        top.iter().map(|(_, id)| *id).collect();
+
+                    // Server ANN top-10, on this worker's own reused
+                    // connection rather than a fresh one per query.
+                    if c.send_raw(&vsearch_cmd(&q)).is_err() { return; }
+                    let got = match c.vsearch_reply_ids() {
+                        Ok(g) => g,
+                        Err(e) => { eprintln!("  recall worker: query {qi}: {e}"); return; }
+                    };
+                    let hit = got.iter().filter(|id| truth.contains(id)).count();
+                    total_hits.fetch_add(hit, std::sync::atomic::Ordering::Relaxed);
                 }
-                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-                let truth: std::collections::BTreeSet<u64> =
-                    scored.iter().take(10).map(|(_, id)| *id).collect();
-                // Server ANN top-10.
-                let cmd = vsearch_cmd(&q);
-                let mut c = Client::connect(&addr).unwrap();
-                c.send_raw(&cmd).unwrap();
-                let mut reader = BufReader::new(c.stream.try_clone().unwrap());
-                let reply = read_resp_array(&mut reader).unwrap_or_default();
-                let got: Vec<u64> = reply.iter().step_by(2)
-                    .filter_map(|b| std::str::from_utf8(b).ok())
-                    .filter_map(|s| s.trim().parse::<u64>().ok())
-                    .collect();
-                let hit = got.iter().filter(|id| truth.contains(id)).count();
-                hit as f64 / 10.0
-            })
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|h| h.join().unwrap())
-        .collect();
-    let recall = overlaps.iter().sum::<f64>() / n_queries as f64;
+            });
+        }
+    });
+
+    let recall = total_hits.load(std::sync::atomic::Ordering::Relaxed) as f64
+        / (n_queries as f64 * 10.0);
     println!("  Recall@10: {:.3} (in {:.1}s)", recall, t_r.elapsed().as_secs_f64());
     recall
 }
@@ -1159,9 +1386,9 @@ fn s13_real_scale_vectors() {
     const N: u64 = 100_000;
     const DIM: usize = 384;
     const N_CLUSTERS: u64 = 200;
-    let port = 30000 + (std::process::id() as u16 % 20000);
+    let port = free_port();
     let addr = format!("127.0.0.1:{port}");
-    let wal = format!("/tmp/dbstrike_s13_{port}.wal");
+    let wal = scratch_path(&format!("s13_{port}"), "wal");
     let _ = std::fs::remove_file(&wal);
     let _child = spawn_dbstrike(port, &wal, false);
 
@@ -1300,9 +1527,9 @@ fn s15_million_vectors() {
     const N: u64 = 1_000_000;
     const DIM: usize = 128;
     const N_CLUSTERS: u64 = 1000;
-    let port = 40000 + (std::process::id() as u16 % 20000);
+    let port = free_port();
     let addr = format!("127.0.0.1:{port}");
-    let wal = format!("/tmp/dbstrike_s15_{port}.wal");
+    let wal = scratch_path(&format!("s15_{port}"), "wal");
     let _ = std::fs::remove_file(&wal);
     let _child = spawn_dbstrike(port, &wal, false);
 
@@ -1389,7 +1616,16 @@ impl Client {
     fn drain_reply(&mut self) -> std::io::Result<()> {
         let line = self.read_line()?;
         match line.first() {
-            Some(b'+') | Some(b'-') | Some(b':') => Ok(()),
+            // A `-ERR ...` reply is a FAILURE, not a drained reply. Treating it
+            // as `Ok(())` is how a rejected VADDBATCH still incremented the
+            // "done" counter: the ingest reported 100k vectors stored while the
+            // index was empty, and the recall/QPS numbers measured afterwards
+            // were meaningless. Surface the server's own message instead.
+            Some(b'-') => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("server replied {}", String::from_utf8_lossy(&line)),
+            )),
+            Some(b'+') | Some(b':') => Ok(()),
             Some(b'$') => {
                 let n: i64 = std::str::from_utf8(&line[1..]).ok()
                     .and_then(|s| s.trim().parse().ok())
@@ -1417,6 +1653,37 @@ impl Client {
     fn cmd(&mut self, args: &[&[u8]]) -> std::io::Result<()> {
         self.send(args)?;
         self.drain_reply()
+    }
+    /// Send a command and return its bulk-string payload as text.
+    ///
+    /// `drain_reply` deliberately throws the body away, which is right for a
+    /// throughput loop and useless for a diagnostic: `MEMTRACK` exists entirely
+    /// for what it says, not for the fact that it answered.
+    fn cmd_text(&mut self, args: &[&[u8]]) -> std::io::Result<String> {
+        self.send(args)?;
+        let line = self.read_line()?;
+        match line.first() {
+            Some(b'-') => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("server replied {}", String::from_utf8_lossy(&line)),
+            )),
+            Some(b'$') => {
+                let n: i64 = std::str::from_utf8(&line[1..]).ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .ok_or_else(|| std::io::Error::new(
+                        std::io::ErrorKind::InvalidData, "bad bulk hdr"))?;
+                if n < 0 {
+                    return Ok(String::new());
+                }
+                let body = self.read_n(n as usize + 2)?;
+                Ok(String::from_utf8_lossy(&body[..n as usize]).into_owned())
+            }
+            Some(b'+') | Some(b':') => {
+                Ok(String::from_utf8_lossy(&line[1..]).into_owned())
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData, "expected bulk reply")),
+        }
     }
 }
 
@@ -1504,14 +1771,82 @@ fn s16_ycsb(tcp: &str) {
 // 17. Jepsen-style chaos — SIGKILL under load, verify acked-write durability
 // ══════════════════════════════════════════════════════════════════════════
 
+/// Scratch directory for server WALs and logs.
+///
+/// Deliberately NOT `/tmp`: on this machine `/tmp` is a small tmpfs shared
+/// with the rest of the desktop session, and a 1M-vector WAL there has already
+/// filled it mid-run (an ENOSPC inside the server, which then dies and shows up
+/// on the client as a bare `ConnectionReset`). Keeping scratch inside the repo
+/// puts it on the same big disk as the datasets and makes leftovers visible.
+/// Override with `DBSTRIKE_BENCH_SCRATCH` if you want it elsewhere.
+fn scratch_dir() -> std::path::PathBuf {
+    let dir = std::env::var("DBSTRIKE_BENCH_SCRATCH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("bench-out/scratch"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Path to a scratch file, e.g. `scratch_path("s13", "wal")`.
+fn scratch_path(tag: &str, ext: &str) -> String {
+    scratch_dir().join(format!("dbstrike_{tag}.{ext}")).to_string_lossy().into_owned()
+}
+
+/// Ask the OS for a genuinely free TCP port by binding one and immediately
+/// dropping the listener.
+///
+/// The old scheme was `BASE + (pid % RANGE)`, which is not a port allocator —
+/// it is a hash of the pid. Two bench runs, or one run whose previous server
+/// leaked, collide on the same number. That failure is nastier than it sounds:
+/// `spawn_dbstrike`'s readiness probe would PING the *leftover* server, see it
+/// answer, and hand back a handle to a child that had actually died with
+/// "address already in use". Every subsequent command then went to a stale
+/// server holding a stale index.
+///
+/// There is still a small TOCTOU window between our unbind and the child's
+/// bind, but the kernel hands out ports it believes are free, so collisions
+/// need another process to grab the exact same port inside a few milliseconds.
+/// That is dramatically better than deterministically reusing one.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("could not allocate a free TCP port")
+}
+
 /// RAII guard that SIGKILLs the spawned server on drop, so an aborted bench
 /// run can't leak a listening `dbstrike` (which would wedge a later run that
 /// re-picks the same port).
-struct ChildGuard(std::process::Child);
+///
+/// Also carries the path to the server's captured log so a failing section can
+/// print *why* the server misbehaved instead of leaving a bare I/O error.
+struct ChildGuard {
+    child: std::process::Child,
+    log: String,
+}
+impl ChildGuard {
+    /// Tail of the server's stdout+stderr. This is the diagnostic that used to
+    /// be thrown away by `Stdio::null()`.
+    fn log_tail(&self, lines: usize) -> String {
+        match std::fs::read_to_string(&self.log) {
+            Ok(s) => {
+                let all: Vec<&str> = s.lines().collect();
+                let start = all.len().saturating_sub(lines);
+                all[start..].join("\n")
+            }
+            Err(e) => format!("(could not read {}: {e})", self.log),
+        }
+    }
+    /// `Some(status)` if the server has already exited — i.e. the connection
+    /// error the client just saw was the server dying, not a transient reset.
+    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+}
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -1529,32 +1864,58 @@ fn spawn_dbstrike(port: u16, wal: &str, sync: bool) -> ChildGuard {
             if p.exists() { Some(p) } else { None }
         })
         .unwrap_or_else(|| std::path::PathBuf::from("./target/release/dbstrike"));
+
+    // Capture the server's stdout+stderr to a file rather than discarding it.
+    // With `Stdio::null()` a server-side panic, an ENOSPC, or an "address
+    // already in use" was completely invisible: the only symptom reaching the
+    // bench was `ConnectionReset` on some unrelated-looking command, because a
+    // panicking connection thread drops its `TcpStream` and the kernel sends an
+    // RST. Keeping the log is what turns that into an actual error message.
+    let log_path = scratch_path(&format!("server_{port}"), "log");
+    let log = std::fs::File::create(&log_path)
+        .unwrap_or_else(|e| panic!("cannot create server log {log_path}: {e}"));
+    let log_err = log.try_clone().expect("dup server log fd");
+
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg(format!("127.0.0.1:{port}"))
         .env("DBSTRIKE_WAL", wal)
         .env("DBSTRIKE_SYNC", if sync { "1" } else { "0" })
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = cmd
-        .spawn()
-        .expect("spawn dbstrike");
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    let child = cmd.spawn().expect("spawn dbstrike");
+    let mut guard = ChildGuard { child, log: log_path.clone() };
+
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
+        // Check liveness BEFORE probing. If the child already exited (failed to
+        // bind, bad WAL path, ...) then any PING that succeeds is being answered
+        // by somebody else's server on this port — accepting it would silently
+        // run the whole section against a stale process. Fail loudly instead.
+        if let Some(status) = guard.exited() {
+            panic!(
+                "dbstrike exited during startup with {status}\n\
+                 --- server log ({log_path}) ---\n{}",
+                guard.log_tail(40)
+            );
+        }
         if let Ok(mut c) = Client::connect(&format!("127.0.0.1:{port}")) {
             if c.cmd(&[b"PING"]).is_ok() {
-                return ChildGuard(child);
+                return guard;
             }
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    panic!("server never accepted PING within 5s");
+    panic!(
+        "server never accepted PING within 5s on port {port}\n\
+         --- server log ({log_path}) ---\n{}",
+        guard.log_tail(40)
+    );
 }
 
 fn s17_chaos(iterations: usize) {
     section("17. Chaos — SIGKILL under load, verify acked-write durability");
-    let port = 60000 + (std::process::id() as u16 % 2000);
-    let wal = format!("/tmp/dbstrike_chaos_{port}.wal");
+    let port = free_port();
+    let wal = scratch_path(&format!("chaos_{port}"), "wal");
     let _ = std::fs::remove_file(&wal);
 
     // Baseline: bring up, insert 500 keys, clean shutdown, verify all survive.
@@ -1568,9 +1929,9 @@ fn s17_chaos(iterations: usize) {
         // Clean SIGINT so group-commit flushes the tail.
         #[cfg(unix)]
         unsafe {
-            libc_kill(child.0.id() as i32, 2 /*SIGINT*/);
+            libc_kill(child.child.id() as i32, 2 /*SIGINT*/);
         }
-        let _ = child.0.wait();
+        let _ = child.child.wait();
     }
 
     // Iterate: spawn, write until we ack N writes, RECORD the last acked seq,
@@ -1598,7 +1959,7 @@ fn s17_chaos(iterations: usize) {
         drop(c);
         #[cfg(unix)]
         unsafe {
-            libc_kill(child.0.id() as i32, 9 /*SIGKILL*/);
+            libc_kill(child.child.id() as i32, 9 /*SIGKILL*/);
         }
         let _ = spawn_wait(child);
 
@@ -1633,7 +1994,7 @@ fn s17_chaos(iterations: usize) {
         );
         #[cfg(unix)]
         unsafe {
-            libc_kill(child.0.id() as i32, 2 /*SIGINT*/);
+            libc_kill(child.child.id() as i32, 2 /*SIGINT*/);
         }
         let _ = spawn_wait(child);
     }
@@ -1649,7 +2010,7 @@ fn s17_chaos(iterations: usize) {
 }
 
 fn spawn_wait(mut c: ChildGuard) -> std::io::Result<std::process::ExitStatus> {
-    c.0.wait()
+    c.child.wait()
 }
 
 // Minimal libc kill shim — pure Rust FFI, no libc crate.
@@ -1696,9 +2057,17 @@ fn s19_real_dataset(path: &str, tag: &str) {
     println!("\n\x1b[1m── REAL dataset: {n} × {dim}d ({tag}) ──\x1b[0m");
     println!("  loaded {path}");
 
-    let port = 51000 + (std::process::id() as u16 % 10000) + (dim % 100) as u16;
+    // Guard AFTER the load, because `n` and `dim` come out of the file header —
+    // but the load itself is bounded by the file size, which is knowable and
+    // modest next to the graph we are about to build. The dangerous allocation
+    // is the server's index, and that is still ahead of us.
+    if !memory_guard(n, dim, &format!("REAL {n}×{dim}d")) {
+        return;
+    }
+
+    let port = free_port();
     let addr = format!("127.0.0.1:{port}");
-    let wal = format!("/tmp/dbstrike_real_{dim}_{port}.wal");
+    let wal = scratch_path(&format!("real_{dim}_{port}"), "wal");
     let _ = std::fs::remove_file(&wal);
     let _child = spawn_dbstrike(port, &wal, false);
 
@@ -1801,11 +2170,17 @@ fn s19b_adaptive_vs_fixed(path: &str) {
     let (n, dim, data, norm) = load_fbin(path);
     println!("\n\x1b[1m── ADAPTIVE vs FIXED-ef (REAL {n} × {dim}d, in-process) ──\x1b[0m");
 
+    // Same graph size as the wire section above, except the index lives in this
+    // process instead of the server's — so the projection is the same number.
+    if !memory_guard(n, dim, &format!("ADAPTIVE vs FIXED {n}×{dim}d")) {
+        return;
+    }
+
     // Build index in-process. Use graph-only insert (no WAL fsync per
     // vector) — same fast path the wire benches use — so we measure pure
     // search-algorithm behavior, not fsync throughput. Graph + f32 mirror
     // are still built, which is all the search path needs.
-    let dir = std::env::temp_dir().join(format!("dbstrike_adp_{}_{}", std::process::id(), dim));
+    let dir = scratch_dir().join(format!("dbstrike_adp_{}_{}", std::process::id(), dim));
     std::fs::create_dir_all(&dir).unwrap();
     let wal = dir.join("adp.wal");
     let _ = std::fs::remove_file(&wal);
@@ -1886,7 +2261,7 @@ fn s21_real_ingest(path: &str) {
     let (n, dim, _data, norm) = load_fbin(path);
     println!("\n\x1b[1m── REAL INGEST: {n} × {dim}d ({path}) ──\x1b[0m");
 
-    let dir = std::env::temp_dir().join(format!("dbstrike_ri_{}_{}", std::process::id(), dim));
+    let dir = scratch_dir().join(format!("dbstrike_ri_{}_{}", std::process::id(), dim));
     std::fs::create_dir_all(&dir).unwrap();
     let wal = dir.join("ri.wal");
     let _ = std::fs::remove_file(&wal);
@@ -1984,9 +2359,9 @@ fn xlarge_run_one(dim: usize, tag: &str) {
     let n_clusters = N_CLUSTERS;
     println!("\n\x1b[1m── 1M × {dim}d ({tag}) ──\x1b[0m");
 
-    let port = 50000 + (std::process::id() as u16 % 10000) + (dim % 100) as u16;
+    let port = free_port();
     let addr = format!("127.0.0.1:{port}");
-    let wal = format!("/tmp/dbstrike_xl_{dim}_{port}.wal");
+    let wal = scratch_path(&format!("xl_{dim}_{port}"), "wal");
     let _ = std::fs::remove_file(&wal);
     let _child = spawn_dbstrike(port, &wal, false);
 
@@ -2037,6 +2412,120 @@ fn s18_xlarge_vectors() {
     xlarge_run_one(384, "BGE / e5-small");
     xlarge_run_one(768, "OpenAI text-embedding-3-small / cohere");
     xlarge_run_one(1536, "OpenAI ada-002 / text-embedding-3-large");
+}
+
+// 20. Memory probe (--memprobe <path.fbin>) — attribute server RSS to a phase.
+// ══════════════════════════════════════════════════════════════════════════
+//
+// The question this exists to answer: a 200k × 384d ingest over the wire drove
+// the server to 29.3 GB resident and got it OOM-killed, while the identical
+// index built in-process stayed flat at 1.2 GB. Every layer below the server
+// has already been exonerated by bounded in-process tests — single-threaded,
+// 8-way concurrent, and with `DBSTRIKE_SYNC=0` all land within 1% of 1205 MB —
+// so the ~1.9 GB of overhead and the later runaway both live in the server.
+//
+// RSS cannot name an owner, so this walks the ingest in stages and asks the
+// server's own allocator (`MEMTRACK`, backed by `mitm::memtrack`) after each
+// one. Two comparisons carry the diagnosis:
+//
+//   * `live` climbing in step with `rss` means the server genuinely holds that
+//     memory, and the delta per stage says which phase allocated it.
+//   * `rss` climbing while `live` stays flat means the allocator is hoarding
+//     freed memory — fragmentation — and no amount of freeing will return it.
+//
+// The `mean` object size separates those further: tens of bytes beside a
+// multi-GB `live` is death-by-small-object, which is what one 447 KB VADDBATCH
+// frame parsed into ~24,600 individual `Vec<u8>`s would look like.
+//
+// This never runs uncapped. Drive it under a cgroup so a runaway kills the
+// benchmark and nothing else:
+//
+//   systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0 \
+//     ./target/release/bench --memprobe ~/datasets/scale_384_200000.fbin
+fn s20_memprobe(path: &str) {
+    section("20. Memory probe — attribute server RSS to an ingest phase");
+    let (n, dim, _data, norm) = load_fbin(path);
+    println!("  loaded {path}: {n} × {dim}d");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let wal = scratch_path(&format!("memprobe_{port}"), "wal");
+    let _ = std::fs::remove_file(&wal);
+    // SYNC=0: the WAL is skipped entirely, which removes it as a suspect
+    // rather than leaving it as a confound.
+    let _child = spawn_dbstrike(port, &wal, false);
+
+    let mut probe = Client::connect(&addr).expect("probe client");
+    let read = |probe: &mut Client, tag: &str| match probe.cmd_text(&[b"MEMTRACK", tag.as_bytes()]) {
+        Ok(s) => println!("  {s}"),
+        Err(e) => println!("  MEMTRACK {tag}: {e}"),
+    };
+    read(&mut probe, "baseline");
+
+    // Ingest in stages so growth is attributable to a range of ids, not just to
+    // "the ingest". A leak that is linear in n looks different here from one
+    // that is linear in the number of batches or connections.
+    let norm = std::sync::Arc::new(norm);
+    const STAGES: usize = 5;
+    let per_stage = n.div_ceil(STAGES);
+    let mut done = 0usize;
+    while done < n {
+        let upto = (done + per_stage).min(n);
+        let lo = done as u64;
+        let count = (upto - done) as u64;
+        let rate = wire_ingest_pipelined_range(&addr, lo, count, dim, 8, 64,
+            std::sync::Arc::new({
+                let norm = std::sync::Arc::clone(&norm);
+                move |i| norm[i as usize * dim..(i as usize + 1) * dim].to_vec()
+            }));
+        println!("  stage {lo}..{upto}: {rate:.0} vec/s");
+        read(&mut probe, &format!("after-{upto}"));
+        done = upto;
+    }
+
+    // The capped 200k run died here, not during ingest — it had already
+    // finished ingest, search and recall (0.970) before the sweep killed it.
+    // So walk the concurrency ladder one rung at a time and read the books
+    // between rungs: if memory tracks client count rather than query count,
+    // the cost is per-connection state, not per-query garbage.
+    // The ladder runs past 32 on purpose. `wire_cluster_recall` does not throttle
+    // at all — it spawns one thread *per query* and each opens its own
+    // connection, so the 200-query recall phase puts 200 simultaneous
+    // connections on the server. A sweep that stops at 32 never reaches the
+    // conditions under which the server actually died.
+    for clients in [1usize, 8, 32, 64, 128, 200] {
+        let mut handles = Vec::with_capacity(clients);
+        for tid in 0..clients {
+            let addr = addr.clone();
+            let norm = std::sync::Arc::clone(&norm);
+            handles.push(thread::spawn(move || {
+                let mut c = match Client::connect(&addr) { Ok(c) => c, Err(_) => return };
+                for i in 0..200usize {
+                    // Vary the query, exactly as the QPS sections do. Hammering
+                    // one vector repeatedly walks one path through the graph and
+                    // touches one small working set — which is why an earlier
+                    // version of this sweep reported memory dead flat while the
+                    // real benchmark was driving the server to 3.4 GB. A probe
+                    // has to reproduce the access *pattern*, not just the load.
+                    let idx = ((tid * 100_000 + i) * 7919) % n;
+                    let q = &norm[idx * dim..(idx + 1) * dim];
+                    if c.send_raw(&vsearch_cmd(q)).is_err() { return; }
+                    if c.drain_reply().is_err() { return; }
+                }
+            }));
+        }
+        for h in handles { let _ = h.join(); }
+        read(&mut probe, &format!("sweep-{clients}c"));
+    }
+
+    // The histogram is cumulative, so it is read once at the end: it says
+    // whether the allocations were a few enormous buffers or a flood of small
+    // ones, which is the choice between a runaway Vec and fragmentation.
+    match probe.cmd_text(&[b"MEMTRACK", b"HIST"]) {
+        Ok(s) => println!("\n{s}"),
+        Err(e) => println!("  MEMTRACK HIST: {e}"),
+    }
+    print_rss("bench-process");
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -2093,6 +2582,29 @@ fn main() {
         s13_real_scale_vectors();
         let dt = t_start.elapsed().as_secs_f64();
         println!("\n\x1b[1m=== RESULTS (wire-qps only) ===\x1b[0m  ({dt:.1}s)");
+        std::process::exit(0);
+    }
+
+    // `--real <path> --only` runs ONLY the real-dataset section.
+    //
+    // Plain `--real` runs all 18 standard sections first, which is right for a
+    // release sweep and wrong for iterating on the vector path: the 100k×384d
+    // synthetic wire section alone costs ~12s and the whole preamble ran to a
+    // minute before the real dataset was even loaded. When you are bisecting an
+    // ingest regression you want the ingest, immediately.
+    //
+    // `--only` also skips the in-process ADAPTIVE-vs-FIXED comparison, which
+    // builds a second full index and roughly doubles the wall clock.
+    if let (Some(path), true) = (real_path.as_deref(), args.iter().any(|a| a == "--only")) {
+        s19_real_dataset(path, "real .fbin embeddings");
+        let dt = t_start.elapsed().as_secs_f64();
+        println!("\n\x1b[1m=== RESULTS (real-only) ===\x1b[0m  ({dt:.1}s)");
+        std::process::exit(0);
+    }
+
+    // `--memprobe <path.fbin>` — attribute the server's memory to a phase.
+    if let Some(p) = args.iter().position(|a| a == "--memprobe").and_then(|i| args.get(i + 1).cloned()) {
+        s20_memprobe(&p);
         std::process::exit(0);
     }
 
@@ -2661,9 +3173,9 @@ fn s27_resp_unified(path: &str) {
     let norm = std::sync::Arc::new(norm);
     println!("\n\x1b[1m── MODULE 6 UNIFIED RESP: {n} × {dim}d ({path}) ──\x1b[0m");
 
-    let port = 51000 + (std::process::id() as u16 % 10000) + (dim % 100) as u16 + 7;
+    let port = free_port();
     let addr = format!("127.0.0.1:{port}");
-    let wal = format!("/tmp/dbstrike_unified_{port}.wal");
+    let wal = scratch_path(&format!("unified_{port}"), "wal");
     let _ = std::fs::remove_file(&wal);
     let _child = spawn_dbstrike(port, &wal, false);
     // Give the server a moment to bind + print its listening line.
@@ -2835,7 +3347,7 @@ fn s28_qdrant_faceoff(_path: &str) {
                 queries: &[Vec<f32>],
                 mode: views::vector::QuantMode)
                 -> (f64, f64, f64, f64) {
-        let dir = std::env::temp_dir().join(format!("dbstrike_qd_{}_{}", n, dim));
+        let dir = scratch_dir().join(format!("dbstrike_qd_{}_{}", n, dim));
         std::fs::create_dir_all(&dir).unwrap();
         let wal = dir.join("q.wal");
         let _ = std::fs::remove_file(&wal);
@@ -3047,7 +3559,7 @@ fn s20_ingest_profile(_path: &str) {
     eprintln!("\n=== INGEST PROFILE: 384d synthetic, in-process (pid {}) ===", std::process::id());
     std::io::stderr().flush().ok();
 
-    let dir = std::env::temp_dir().join(format!("dbstrike_ingp_{}", std::process::id()));
+    let dir = scratch_dir().join(format!("dbstrike_ingp_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let wal = dir.join("ingp.wal");
     let _ = std::fs::remove_file(&wal);
