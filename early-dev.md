@@ -173,16 +173,22 @@ that lands.
 
 ---
 
-### 2.5 GPU search is slower than CPU search — the biggest open perf question
-Once `upload_to_gpu` was actually called (it had one caller in the tree, so
-`GpuIndex` was never built outside `quick_bench`), the real device numbers
-appeared and Turbo is **0.62× single-thread / 0.77× concurrent** against CPU
-search at 100k×384d — ~545 µs/query vs ~340 µs.
+### 2.5 GPU search — **resolved**: it needs batches, not threads
+Turbo at 100k×384d: **0.61×** CPU single-query, **0.80×** at 16 threads, and
+**11.20×** on a 256-query batch (33,690 vs 3,009 QPS).
 
-Per-query launch + PCIe round-trip exceed the graph walk they replace.
-`QueryCoalescer` exists to amortize exactly this and evidently is not engaging
-on this path — that is the first thing to check. Until it is understood, the
-defensible claim is **GPU-accelerated *build***, not GPU-accelerated search.
+A graph query is *one CUDA block*, so a lone query leaves 23 of 24 SMs idle, and
+16 client threads is still only 16 blocks — which is why raising thread count
+never rescued it. Batching fills the device.
+
+Ruled out along the way: the coalescer is **not** the cause. `GPU_COALESCE=0`
+moves single-query throughput by ~1% (1,824 vs 1,804 QPS), so the cost is real
+per-launch and PCIe latency, not a batch-window stall. Shared memory is also
+fine — 7–12 KB against the 48 KB limit at every `itopk` the bench uses, so the
+audit's suspected smem cliff is not being hit.
+
+Remaining here: route latency-sensitive single queries to CPU automatically
+rather than making the user pick a mode.
 
 ## 4. Unproven / unmeasured — needed before publishing
 

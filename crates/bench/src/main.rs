@@ -2765,7 +2765,7 @@ fn s_gpu_bench(path: &str) {
         ("Hybrid", gpu::ComputeMode::Hybrid),
     ];
 
-    let mut rows: Vec<(String, f64, f64, f32, f64, f64)> = Vec::new();
+    let mut rows: Vec<(String, f64, f64, f32, f64, f64, f64)> = Vec::new();
     for (label, mode) in modes {
         // Select the mode BEFORE probing availability: `gpu_available` only
         // brings the driver up when a GPU mode is actually current, so asking
@@ -2826,27 +2826,47 @@ fn s_gpu_bench(path: &str) {
         let qps_c =
             (cores * rounds * probes) as f64 / t_c.elapsed().as_secs_f64().max(1e-9);
 
+        // Batched throughput — the shape a GPU actually wants.
+        //
+        // A single graph query is one CUDA block. On a 24-SM device that leaves
+        // almost the whole GPU idle, which is why per-query GPU search loses to
+        // CPU no matter how many client threads push: 16 concurrent queries is
+        // still only 16 blocks. Submitting a batch is what fills the machine,
+        // and it is also how a real workload arrives — a RAG server scoring a
+        // page of candidates, or an agent embedding a document set at once.
+        let batch = 256usize.min(nq.max(1));
+        let qs: Vec<Vec<f32>> = (0..batch)
+            .map(|qi| norm[qi * dim..(qi + 1) * dim].to_vec())
+            .collect();
+        let batch_rounds = 20usize;
+        let t_b = Instant::now();
+        for _ in 0..batch_rounds {
+            std::hint::black_box(idx.search_many(&qs, 10));
+        }
+        let qps_b = (batch_rounds * batch) as f64 / t_b.elapsed().as_secs_f64().max(1e-9);
+
         println!(
             "  [{label}] build {build_dt:.2}s ({rate:.0} vec/s) · Recall@10 {recall:.3} · \
-             {qps1:.0} QPS (1t) · {qps_c:.0} QPS ({cores}t)"
+             {qps1:.0} 1t · {qps_c:.0} {cores}t · {qps_b:.0} batch{batch}"
         );
-        rows.push((label.to_string(), build_dt, rate, recall, qps1, qps_c));
+        rows.push((label.to_string(), build_dt, rate, recall, qps1, qps_c, qps_b));
     }
 
     println!("\n\x1b[1m  summary — {n} × {dim}d\x1b[0m");
-    println!("  | mode | build | vec/s | Recall@10 | QPS (1t) | QPS ({cores}t) |");
-    println!("  |---|---:|---:|---:|---:|---:|");
-    for (label, dt, rate, recall, qps1, qpsc) in &rows {
-        println!("  | {label} | {dt:.2}s | {rate:.0} | {recall:.3} | {qps1:.0} | {qpsc:.0} |");
+    println!("  | mode | build | vec/s | Recall@10 | QPS (1t) | QPS ({cores}t) | QPS (batch) |");
+    println!("  |---|---:|---:|---:|---:|---:|---:|");
+    for (label, dt, rate, recall, qps1, qpsc, qpsb) in &rows {
+        println!("  | {label} | {dt:.2}s | {rate:.0} | {recall:.3} | {qps1:.0} | {qpsc:.0} | {qpsb:.0} |");
     }
     if let Some(base) = rows.iter().find(|r| r.0 == "CPU-only") {
         for r in rows.iter().filter(|r| r.0 != "CPU-only") {
             println!(
-                "  {} vs CPU-only: build {:.2}× · QPS(1t) {:.2}× · QPS({cores}t) {:.2}×  (recall {:+.3})",
+                "  {} vs CPU-only: build {:.2}× · 1t {:.2}× · {cores}t {:.2}× · batch {:.2}×  (recall {:+.3})",
                 r.0,
                 base.1 / r.1.max(1e-9),
                 r.4 / base.4.max(1e-9),
                 r.5 / base.5.max(1e-9),
+                r.6 / base.6.max(1e-9),
                 r.3 - base.3
             );
         }

@@ -96,30 +96,31 @@ GPU-accelerated distance computation using Tensor Cores:
 ## Measured performance
 
 Real embeddings, 100k × 384-d, RTX 4060 (8 GB) + Ryzen 7700 (16 threads).
-Reproduce with `dbstrike-bench --gpu-bench <vectors.fbin>` (~20 s).
+Reproduce with `dbstrike-bench --gpu-bench <vectors.fbin>` (~25 s).
 
-| mode | build | vec/s | Recall@10 | QPS (1t) | QPS (16t) | search runs on |
-|---|---:|---:|---:|---:|---:|---|
-| CPU-only | 7.23 s | 13,823 | **0.999** | 2,970 | 27,459 | CPU |
-| Turbo | **2.49 s** | **40,216** | 0.993 | 1,833 | 21,219 | GPU |
-| Hybrid (VUGVA) | **2.77 s** | **36,074** | 0.994 | 8,704 | 86,869 | CPU |
+| mode | build | vec/s | Recall@10 | QPS (1t) | QPS (16t) | QPS (batch 256) | search on |
+|---|---:|---:|---:|---:|---:|---:|---|
+| CPU-only | 7.41 s | 13,498 | **0.999** | 2,991 | 26,568 | 3,009 | CPU |
+| Turbo | **2.54 s** | **39,325** | 0.993 | 1,834 | 21,263 | **33,690** | GPU |
+| Hybrid (VUGVA) | 2.81 s | 35,572 | 0.994 | 8,720 | **92,434** | 8,488 | CPU |
 
 **What this shows, including what it does not.**
 
-*Build is where the GPU wins.* 2.49 s against 7.23 s — **2.9×** — at a cost of
+*Build is where the GPU wins.* 2.54 s against 7.41 s — **2.9×** — at a cost of
 0.006 recall. Phase 1 (pivot assignment) and the NN-descent refine both run on
 device; the CPU only wires edges.
 
-*GPU search currently loses.* Turbo is **0.62×** single-thread and **0.77×**
-concurrent versus CPU search. At ~545 µs/query against the CPU's ~340 µs, the
-per-query launch and PCIe round-trip cost more than the graph walk they replace.
-This should invert on larger corpora or with batched queries — `QueryCoalescer`
-exists for exactly that — but it is unproven at any scale we have measured, and
-should not be presented as a win.
+*Batched GPU search wins by 11.2×; single-query search loses by 0.61×.* A graph
+query is one CUDA block, so on a 24-SM device a lone query leaves 23 SMs idle —
+and 16 concurrent client threads is still only 16 blocks, which is why raising
+thread count does not rescue it. Batching 256 queries fills the device and
+yields 33,690 QPS against the CPU's 3,009. Note this is *not* the coalescer:
+disabling it (`GPU_COALESCE=0`) changes single-query throughput by ~1%, so the
+cost is genuine per-launch and PCIe latency rather than a batch-window stall.
 
 *Hybrid's QPS column is not a GPU number.* `search_ef` takes the device path only
 under `Turbo`. Hybrid serves its corpus through VUGVA's `TieredPool` and then
-searches on CPU, so 86,869 measures the CPU search path over a GPU-built graph.
+searches on CPU, so 92,434 measures the CPU search path over a GPU-built graph.
 The graph really is better; the number is not evidence about tiering.
 
 *The tiering is not stressed here.* 36 MB fits VRAM, so nothing demotes or
