@@ -98,27 +98,29 @@ GPU-accelerated distance computation using Tensor Cores:
 Real embeddings, 100k × 384-d, RTX 4060 (8 GB) + Ryzen 7700 (16 threads).
 Reproduce with `dbstrike-bench --gpu-bench <vectors.fbin>` (~25 s).
 
-| mode | build | vec/s | Recall@10 | QPS (1t) | QPS (16t) | QPS (batch 256) |
+| mode | build | vec/s | Recall@10 | QPS (1t) | QPS (16t) | QPS (batch) |
 |---|---:|---:|---:|---:|---:|---:|
-| CPU-only | 7.16 s | 13,964 | **0.999** | 2,900 | 23,675 | 2,832 |
-| Turbo | **2.57 s** | **38,916** | 0.994 | **7,607** | **86,641** | **35,198** |
-| Hybrid (VUGVA) | 2.85 s | 35,105 | 0.994 | 8,288 | 80,133 | 27,747 |
+| CPU-only | 7.31 s | 13,683 | **0.999** | 2,781 | **27,894** | 2,860 |
+| Turbo | **2.46 s** | **40,723** | 0.994 | 8,590 | 72,044 | 22,116 |
+| Hybrid (VUGVA) | 2.70 s | 37,081 | 0.994 | 7,576 | 76,983 | 18,542 |
 
-Turbo vs CPU-only: build **2.79×** · 1t **2.62×** · 16t **3.66×** · batch **12.43×**
+All search columns at beam 128 so every mode does equal work per query.
+Build **2.98×** (~3.5× steady-state; NVRTC compile is inside the timer).
+Batched GPU is **7.73× one CPU core but 0.79× the 16-thread CPU** — on this
+hardware a saturated CPU beats the device at search.
 
 **What this shows, including what it does not.**
 
-*Build is where the GPU wins.* 2.57 s against 7.16 s — **2.79×** — at a cost of
-0.005 recall. Phase 1 (pivot assignment) and the NN-descent refine both run on
+*Build is where the GPU wins.* 2.46 s against 7.31 s — **2.98×**, and ~3.5×
+steady-state since NVRTC compilation (~0.39 s) is charged inside the timer — at
+a cost of 0.005 recall. Phase 1 (pivot assignment) and the NN-descent refine both run on
 device; the CPU only wires edges.
 
-*Only the batch column is GPU search: 12.4×.* 35,198 QPS against the CPU's
-2,832. A graph query is one CUDA block, so a lone query leaves 23 of 24 SMs idle
-— and 16 client threads is still only 16 blocks, which is why raising thread
-count never rescued it. Single queries are therefore routed to the CPU in every
-mode; `DBSTRIKE_GPU_SINGLE=1` forces the device path and reproduces the 0.61×
-regression. Ruled out as causes: the coalescer (`GPU_COALESCE=0` moves it ~1%)
-and a shared-memory cliff (7–12 KB used against the 48 KB limit).
+*Batched GPU search does not beat a saturated CPU.* 22,116 QPS against 2,860 on
+one core (7.73×) but 27,894 across sixteen (0.79×). An earlier revision claimed
+12.4×; that compared an unequal beam (`search_many` dropped `ef` to 64 against
+the CPU's 128) to a single-threaded baseline, and is retracted. Batch recall is
+also unverified — recall is measured through `search_ef` only.
 
 *The 1t and 16t columns measure graph quality, not hardware.* Every row runs the
 same CPU search code there, and Turbo still wins 2.62× and 3.66× because the

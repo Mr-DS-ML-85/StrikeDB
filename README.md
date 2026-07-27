@@ -393,21 +393,30 @@ scenario, where the headline metric is QPS, not per-request p99.
 
 ### 🔥 GPU / Tiered Compute (APGC + VUGVA) — **experimental**
 
-> **Status, stated plainly.** The GPU wins on **index construction** (2.79×) and
-> on **batched search** (12.4×). Single queries run on the CPU in every mode
-> because the device loses them (0.61× when forced) — that number is published
-> here too. Every row comes from `--gpu-bench` on the hardware named beneath it;
-> nothing is inferred.
+> **Status, stated plainly.** The GPU wins on **index construction (~3×)**. It
+> does **not** beat a saturated 16-core CPU on search at this scale — batched
+> GPU search reaches 0.79× the 16-thread CPU figure. An earlier revision of this
+> section claimed 12.4× for batched search; that was wrong twice over (unequal
+> search beam, and a single-threaded CPU baseline) and is retracted. Every row
+> below comes from `--gpu-bench` at a matched beam on the hardware named.
 
 **Measured — 100k × 384-d real embeddings, RTX 4060 + Ryzen 7700 (16 threads):**
 
-| mode | build | vec/s | Recall@10 | QPS (1 thread) | QPS (16 threads) | QPS (batch 256) |
-|---|---:|---:|---:|---:|---:|---:|
-| CPU-only | 7.16 s | 13,964 | **0.999** | 2,900 | 23,675 | 2,832 |
-| **Turbo** | **2.57 s** | **38,916** | 0.994 | **7,607** | **86,641** | **35,198** |
-| **Hybrid** (VUGVA) | 2.85 s | 35,105 | 0.994 | 8,288 | 80,133 | 27,747 |
+All search columns at `ef`/`itopk` = 128, so every mode does equal work per query.
 
-**Turbo vs CPU-only: build 2.79× · 1 thread 2.62× · 16 threads 3.66× · batch 12.43×**
+| mode | build | vec/s | Recall@10 | QPS (1 thread) | QPS (16 threads) | QPS (batch, 1 submitter) |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU-only | 7.31 s | 13,683 | **0.999** | 2,781 | **27,894** | 2,860 |
+| **Turbo** | **2.46 s** | **40,723** | 0.994 | 8,590 | 72,044 | 22,116 |
+| **Hybrid** (VUGVA) | 2.70 s | 37,081 | 0.994 | 7,576 | 76,983 | 18,542 |
+
+**Build: ~3× and rising** — NVRTC kernel compilation (~0.39 s) is charged inside
+the GPU build timer, so the measured 2.98× understates the steady-state figure
+(~3.5× once kernels are cached).
+
+**Search: the GPU does not win here.** Batched GPU is 7.73× a *single-threaded*
+CPU but **0.79× the 16-thread CPU (22,116 vs 27,894)**. On this hardware, at
+this scale, a saturated CPU beats the device.
 
 ```bash
 ./target/release/dbstrike-bench --gpu-bench /path/to/vectors.fbin   # ~25 s
@@ -415,29 +424,29 @@ scenario, where the headline metric is QPS, not per-request p99.
 
 **Read the table honestly:**
 
-* **Batched search runs on the GPU: 12.4×.** 35,198 QPS against the CPU's 2,832.
-  This is the one column that is genuinely GPU search, and it is where the
-  device belongs — a RAG server scoring a page of candidates, or an agent
-  embedding a document set at once.
-* **Build is the other GPU win: 2.79×.** 2.57 s vs 7.16 s for −0.005 recall. An
-  agent rebuilding an index waits 2.6 s, not 22 s.
-* **The 1-thread and 16-thread gains are *not* GPU search — they are graph
-  quality.** Single queries are deliberately routed to the CPU even under Turbo
-  (see below), so those columns run the same CPU code in every row. Turbo still
-  wins them 2.62× and 3.66×, because the APGC graph — flat, degree-54,
-  locality-ordered — is simply cheaper to walk than the CPU-built M=32
-  hierarchy. Worth knowing: **you get most of that speedup on a CPU-only
-  deployment, as long as the index was built on a GPU.**
-* **Why single queries go to CPU.** Forced onto the device
-  (`DBSTRIKE_GPU_SINGLE=1`) a lone query manages 1,834 QPS against the CPU's
-  2,900 — 0.61×. A graph query is *one CUDA block*, so 23 of 24 SMs idle, and 16
-  client threads is still only 16 blocks. Rather than making you know that and
-  pick a mode, `search_ef` routes by query shape and `search_many` gets the
-  device. The regression stays reachable behind the env var so it remains
-  measurable.
-* **VUGVA is live but unstressed here.** A 36 MB corpus fits VRAM comfortably, so
-  the tier never has to demote or spill. The larger-than-VRAM case is what T2
-  exists for and is not yet benchmarked end to end.
+* **Build is the GPU's win, and it is solid.** ~3× measured, ~3.5× steady-state.
+  An agent rebuilding an index waits 2.5 s instead of 7.3 s.
+* **Batched GPU search loses to a saturated CPU — 0.79×.** It beats one core by
+  7.73×, which is the comparison an earlier revision of this table made, and
+  that comparison was not fair. If you have 16 cores, use them.
+* **Batch recall is not yet verified.** Recall above is measured through
+  `search_ef`; nothing currently validates `search_many` output against ground
+  truth. Treat the batch column as throughput-only until that lands.
+* **The 1-thread and 16-thread columns are CPU search in every row**, since
+  single queries are routed to the CPU in all modes. Turbo still wins them
+  (~2.6–3.1×) because the APGC graph is cheaper to walk — see below. That is a
+  graph-structure result, not a hardware one, and **a CPU-only deployment keeps
+  it provided the index was built on a GPU.**
+* **The graph comparison is not iso-recall.** APGC reaches 0.994 against HNSW's
+  0.999, and carries a lower level-0 degree (48 vs M0=64), so part of the
+  traversal saving is simply fewer edges. Read ~2.6–3.1× as an upper bound until
+  a QPS-vs-recall curve exists.
+* **Queries are drawn from the indexed set**, so each has a guaranteed
+  self-match. That inflates every row equally (~0.0007 on recall); ratios hold,
+  absolutes are optimistic.
+* **VUGVA is live but unstressed.** A 36 MB corpus fits VRAM, so the tier never
+  demotes or spills. The larger-than-VRAM case has unit and hardware coverage
+  but no end-to-end benchmark.
 
 Three compute modes. GPU kernels are compiled at runtime via NVRTC, so there is
 no build-time CUDA dependency and no `cublas`/`cudnn` linkage — the only things
