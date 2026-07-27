@@ -985,7 +985,7 @@ kill -9 $SVR; wait 2>/dev/null; true</code></pre>
       </table></div>
 
       <h3>Vector Search — real embeddings, 1M scale</h3>
-      <p style="font-size:13px; color:var(--muted);">Single node, single user. One Ryzen 7 7700 (AVX2), 32 GB, no GPU, no replication. Real datasets (768-d = Sreenath/million-text-embeddings; 384-d = all-MiniLM-L6-v2 on Wikipedia), Recall@10 vs true brute-force cosine ground truth, over the RESP wire.</p>
+      <p style="font-size:13px; color:var(--muted);">Single node, single user. One Ryzen 7 7700 (AVX2), 32 GB, no replication. These rows are CPU-only; GPU figures are in the section below. Real datasets (768-d = Sreenath/million-text-embeddings; 384-d = all-MiniLM-L6-v2 on Wikipedia), Recall@10 vs true brute-force cosine ground truth, over the RESP wire.</p>
       <div class="table-wrap"><table>
         <tr><th>Dataset (real)</th><th>Ingest</th><th>VSEARCH p99</th><th>Recall@10</th><th>8-thread QPS</th><th>RSS</th></tr>
         <tr><td>100k × 768-d</td><td>2,083 v/s</td><td>658us</td><td><strong>0.999</strong></td><td>5,680</td><td>1.3 GB</td></tr>
@@ -994,6 +994,17 @@ kill -9 $SVR; wait 2>/dev/null; true</code></pre>
         <tr><td><strong>1M × 384-d</strong></td><td>2,142 v/s</td><td><strong>505us</strong></td><td><strong>0.968</strong></td><td><strong>12,440</strong> (16c: 14,435)</td><td>3.6 GB</td></tr>
       </table></div>
       <p>Peak-QPS sweep (N client threads on the one node): 1M×768-d 7,723 / 8,555 / 8,048 QPS at 8 / 16 / 32 clients; 1M×384-d 12,440 / 14,435 / 12,897 QPS. <strong>Faithful wire head-to-head vs Qdrant over the real RESP server (100k×384-d, Int8, ef=128, Recall@10=0.942):</strong> the <em>same two scenarios Qdrant separates</em> — 1 client ("Latency case") = <strong>4,652 QPS / 0.30 ms p99</strong> vs Qdrant ~450 QPS / ~8 ms p99 (~10× throughput, ~27× lower latency); 100 clients ("RPS case", Qdrant's headline over gRPC) = <strong>38,120 QPS / 8.4 ms p99</strong> vs Qdrant ~13,000 RPS (~2.9×). Note Qdrant publishes only a <em>single-client</em> p99 (~8 ms); dbstrike's 100-client p99 (~8.4 ms under 100 concurrent clients) is in that same ballpark — i.e. dbstrike adds ~100× the concurrency before reaching the tail Qdrant shows at one client. Measured on a single node, Ryzen 7700 / 16 cores.</p>
+
+      <h3>GPU — APGC build + batched search (experimental)</h3>
+      <p style="font-size:13px; color:var(--muted);">100k × 384-d real embeddings on one RTX 4060 (8 GB, 24 SMs) + Ryzen 7 7700 (16 threads). Kernels compiled at runtime via NVRTC — no cuBLAS, no BLAS, no build-time CUDA dependency. Reproduce in ~25s: <code>dbstrike-bench --gpu-bench &lt;vectors.fbin&gt;</code>.</p>
+      <div class="table-wrap"><table>
+        <tr><th>mode</th><th>build</th><th>vec/s</th><th>Recall@10</th><th>QPS (1 thread)</th><th>QPS (16 threads)</th><th>QPS (batch 256)</th><th>search on</th></tr>
+        <tr><td>CPU-only</td><td>7.41 s</td><td>13,498</td><td><strong>0.999</strong></td><td>2,991</td><td>26,568</td><td>3,009</td><td>CPU</td></tr>
+        <tr><td><strong>Turbo</strong></td><td><strong>2.54 s</strong></td><td><strong>39,325</strong></td><td>0.993</td><td>1,834</td><td>21,263</td><td><strong>33,690</strong></td><td><strong>GPU</strong></td></tr>
+        <tr><td><strong>Hybrid</strong> (VUGVA)</td><td>2.81 s</td><td>35,572</td><td>0.994</td><td>8,720</td><td><strong>92,434</strong></td><td>8,488</td><td>CPU</td></tr>
+      </table></div>
+      <p><strong>The GPU wins on build (2.9×) and on batched search (11.2×), and loses on single queries (0.61×).</strong> A graph query is one CUDA block, so a lone query leaves 23 of 24 SMs idle — and 16 client threads is still only 16 blocks, which is why raising concurrency never rescues it. Batching 256 queries fills the device: 33,690 QPS against the CPU's 3,009. If your workload is one latency-sensitive query at a time, use CPU mode — we publish that number rather than hiding it. Two candidate explanations were tested and ruled out: the query coalescer (<code>GPU_COALESCE=0</code> moves single-query throughput ~1%) and a shared-memory cliff (7–12 KB used against the 48 KB limit, so no silent fallback to brute force).</p>
+      <p><strong>Caveats.</strong> Hybrid's QPS columns are CPU numbers — <code>search_ef</code> takes the device path only under Turbo, so Hybrid serves its corpus through VUGVA and then searches on CPU; that column measures graph quality, not tiering. VUGVA's VRAM→DRAM→NVMe tier is wired and hardware-tested (a corpus 1.5× the DRAM budget spills to NVMe and promotes back byte-exact; look-ahead prefetch overlaps transport at 3.2×), but a 36 MB corpus never stresses it, so the larger-than-VRAM case is not yet benchmarked end to end. 1M×384-d and 1M×768-d GPU figures are not yet measured. Wire ingest still uses the serial append path.</p>
 
       <h3>YCSB A / B / C / F</h3>
       <div class="table-wrap"><table>

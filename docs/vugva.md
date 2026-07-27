@@ -94,11 +94,41 @@ that range is server-class hardware, and this box is a single-socket desktop on
 PCIe 4.0 ×8 whose practical ceiling is ~13 GB/s. The pinned path essentially
 reaches it. Claiming the paper's number on this hardware would be dishonest.
 
+### Look-Ahead prefetch (§3.2)
+
+`TieredPool::prefetch(name, gpu_idx)` issues the DRAM→VRAM copy on the prefetch
+stream and records an event; `access` claims it and only waits on that event.
+This is what turns `T_total = max(T_compute(n), T_transport(n+1))` from a
+description into observed behaviour.
+
+Measured, 8 × 32 MiB (256 MB total), RTX 4060:
+
+| path | time |
+|---|---:|
+| cold promote (no prefetch) | 40.81 ms |
+| prefetch issue | 7.47 ms |
+| **claim after prefetch** | **12.69 ms** |
+
+**3.2× on the claim.** Covered by
+`paper_prefetch_overlaps_transport_with_compute`, which asserts both halves —
+the timing *and* that each page carries its own bytes. Timing alone would pass
+for a prefetch handing back the wrong page's pointer; correctness alone would
+pass for one that does nothing.
+
+A prefetch issued for a different GPU is discarded rather than reused (the
+pointer is invalid in the requesting context), and any prefetch failure is a
+no-op — speculative work must never break the access behind it.
+
 ### Not yet implemented
 
-- **Look-Ahead prefetch and the DMA descriptor ring are scaffolding.** Promotion
-  works but is synchronous — there is no overlap of transport with compute, so
-  the paper's §3.2 latency hiding is design intent, not shipped behaviour.
+- **Cold (T2) pages are not prefetched.** A file read has to complete before any
+  device copy can start, and blocking there defeats the purpose. They promote
+  synchronously.
+- **`prefetch.rs::prefetch_ahead` is superseded but still present.** Its `Dram`
+  and `Ssd` arms are empty stubs (`// here we record the intent`); only its
+  VRAM→VRAM peer copy is real. Use `TieredPool::prefetch` instead.
+- **The DMA descriptor ring is bookkeeping.** Real transfers go through
+  `cuMemcpy*Async` on the stream pool, not the ring.
 - **End-to-end larger-than-VRAM search is unbenchmarked.** The memory layer is
   covered by the tests above, but `search_ef` takes the device path only under
   `Turbo`, and `Turbo` uses a plain VRAM allocation rather than the tier. So no
