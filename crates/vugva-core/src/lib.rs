@@ -11,6 +11,7 @@
 //! - [`dma`]          — CPU-Bypass DMA engine (GPUDirect + IOMMU P2P)
 //! - [`prefetch`]     — Look-Ahead Attention Tracking (predictive prefetch)
 //! - [`gpu`]          — GPU device + peer-access discovery via NUMA mapping
+//! - [`membrane`]     — LGM tier membrane: frequency-driven T0/T1/T2 placement
 //! - [`streams`]      — CUDA stream management for async pipelines
 //! - [`nvrtc_kernel`] — NVRTC runtime CUDA kernel compilation
 //! - [`ffi::cuda`]    — Raw FFI to libcuda.so (CUDA Driver API)
@@ -40,6 +41,7 @@ pub mod context;
 pub mod dma;
 pub mod ffi;
 pub mod gpu;
+pub mod membrane;
 pub mod nvrtc_kernel;
 pub mod prefetch;
 pub mod range_alloc;

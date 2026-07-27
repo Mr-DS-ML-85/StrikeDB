@@ -83,6 +83,14 @@ pub struct TieredPool {
     /// transfer overlaps whatever the compute stream is doing. `access` then
     /// finds the work already in flight and only has to wait on the event.
     inflight: std::collections::HashMap<String, (usize, u64, usize, crate::streams::CudaEvent)>,
+    /// LGM tier membrane: decayed per-page access rates driving placement.
+    membrane: crate::membrane::Membrane,
+    /// Scoring policy the membrane ranks with.
+    policy: crate::membrane::TierPolicy,
+    /// VRAM the membrane may fill, per GPU. `None` disables membrane-driven
+    /// sweeps and keeps the original idle-timeout behaviour, which is what
+    /// callers that have not opted in should get.
+    membrane_budget: Option<usize>,
     /// Idle timeout for demotion (nanoseconds).
     idle_threshold_ns: u64,
     /// Hot-access threshold for proactive promotion.
@@ -345,6 +353,9 @@ impl TieredPool {
             vram_free: vec![Vec::new(); num_gpus],
             spill: None,
             inflight: std::collections::HashMap::new(),
+            membrane: crate::membrane::Membrane::new(),
+            policy: crate::membrane::TierPolicy::default(),
+            membrane_budget: None,
             idle_threshold_ns: DEFAULT_IDLE_NS,
             hot_threshold: HOT_ACCESS_THRESHOLD,
         })
@@ -473,6 +484,11 @@ impl TieredPool {
     /// Total data transferred: megabytes.
     pub fn access(&mut self, name: &str, gpu_idx: usize) -> Result<u64> {
         let now = current_time_ns();
+        // Every access is a sample for the membrane, including one satisfied
+        // from VRAM — a page that is hot *because it is resident* still has to
+        // register as hot, or it loses its place at the next sweep and the
+        // policy oscillates.
+        self.membrane.observe(name);
 
         // A prefetch may already have moved this page. Claiming it turns the
         // access into a wait on an event that is very likely already signalled,
@@ -839,8 +855,88 @@ impl TieredPool {
         Ok(())
     }
 
+    /// Enable LGM membrane-driven placement with `vram_budget` bytes per GPU.
+    ///
+    /// Opt-in rather than default, because it is a different contract. The
+    /// idle-timeout policy promises "touched recently implies resident"; the
+    /// membrane ranks pages *against each other* and fills VRAM to a high-water
+    /// mark, so it will evict a page that is still being touched when something
+    /// hotter needs the space. Callers depending on the old promise should not
+    /// have it changed underneath them.
+    pub fn enable_membrane(&mut self, vram_budget: usize) {
+        self.membrane_budget = Some(vram_budget);
+    }
+
+    /// Decayed access rate for `name` — diagnostics and tests.
+    pub fn membrane_rate(&self, name: &str) -> f64 {
+        self.membrane.rate(name)
+    }
+
+    /// One membrane sweep: decay rates, rank every page, make residence match.
+    ///
+    /// Order matters. Decay first, so the plan sees this window's traffic.
+    /// Evict before promoting, so the space a promotion needs is already free —
+    /// otherwise each promotion triggers its own eviction and the transfers
+    /// serialise behind one another.
+    fn membrane_sweep(&mut self) -> Result<()> {
+        let budget = match self.membrane_budget {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        self.membrane.decay();
+
+        let cands: Vec<(String, crate::membrane::PageObs)> = self
+            .vmt
+            .iter()
+            .map(|(name, page)| {
+                (
+                    name.clone(),
+                    crate::membrane::PageObs {
+                        rate: self.membrane.rate(name),
+                        bytes: page.size_bytes,
+                        resident: page.tier == Tier::Vram,
+                        pinned: page.pinned,
+                    },
+                )
+            })
+            .collect();
+
+        let (keep, evict) = self.membrane.plan(&self.policy, &cands, budget);
+
+        for name in &evict {
+            let resident = self
+                .vmt
+                .lookup(name)
+                .map(|p| p.tier == Tier::Vram)
+                .unwrap_or(false);
+            if resident {
+                self.demote(name)?;
+            }
+        }
+        // Promotion failure is not fatal: the page stays warm and correct, and
+        // the next sweep retries with whatever space eviction has since freed.
+        // Treating it as an error would abort the sweep and leave placement
+        // half-applied.
+        for name in &keep {
+            let resident = self
+                .vmt
+                .lookup(name)
+                .map(|p| p.tier == Tier::Vram)
+                .unwrap_or(true);
+            if !resident {
+                let _ = self.access(name, 0);
+            }
+        }
+        Ok(())
+    }
+
     /// Background sweep: demote idle pages, promote hot DRAM pages.
+    ///
+    /// Delegates to the membrane when one is enabled.
     pub fn background_sweep(&mut self) -> Result<()> {
+        if self.membrane_budget.is_some() {
+            return self.membrane_sweep();
+        }
         let now = current_time_ns();
         let mut to_promote: Vec<String> = Vec::new();
         let mut to_demote: Vec<String> = Vec::new();
