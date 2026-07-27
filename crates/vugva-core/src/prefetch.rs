@@ -13,9 +13,8 @@
 //!              ↑ overlap hidden behind compute ↑
 //! ```
 
-use crate::ffi::cuda::*;
-use crate::streams::{CudaEvent, CudaStream};
-use crate::vmt::{Tier, VirtualMemoryTable};
+use crate::streams::CudaEvent;
+use crate::vmt::Tier;
 use crate::Result;
 
 // ============================================================================
@@ -76,88 +75,23 @@ impl LookAheadPrefetcher {
         }
     }
 
-    /// Prefetch layers `current_layer+1` through `current_layer+depth`.
-    ///
-    /// For each future layer, determines the source tier and dispatches
-    /// the appropriate transfer:
-    /// - **VRAM→VRAM**: `cuMemcpyPeerAsync` (P2P, CPU-bypass)
-    /// - **DRAM→VRAM**: DMA descriptor submission (CPU-bypass, §3.3)
-    /// - **SSD→VRAM**: GPUDirect Storage read (CPU-bypass, §3.3)
-    ///
-    /// # Arguments
-    ///
-    /// * `schedule` — the global layer→location mapping.
-    /// * `current_layer` — index of the layer currently being computed.
-    /// * `current_gpu` — ordinal of the GPU running the compute.
-    /// * `vmt` — the virtual memory table (to resolve device pointers).
-    /// * `alloc_name` — VMT name prefix for weight allocations.
-    /// * `src_ctxs` — CUDA contexts indexed by GPU position, for peer copy.
-    /// * `prefetch_stream` — the high-priority prefetch stream for dst GPU.
-    #[allow(clippy::too_many_arguments)]
-    pub fn prefetch_ahead(
-        &mut self,
-        schedule: &LayerSchedule,
-        current_layer: usize,
-        current_gpu: i32,
-        vmt: &VirtualMemoryTable,
-        src_ctxs: &[CUcontext],
-        dst_ctx: CUcontext,
-        dst_ptr: u64,
-        bytes_per_layer: usize,
-        prefetch_stream: &CudaStream,
-    ) -> Result<()> {
-        let depth = self
-            .depth
-            .min(schedule.len().saturating_sub(current_layer + 1));
-
-        for offset in 1..=depth {
-            let future_layer = current_layer + offset;
-            if future_layer >= schedule.len() {
-                break;
-            }
-
-            let loc = &schedule[future_layer];
-
-            match loc.tier {
-                Tier::Vram => {
-                    // VRAM→VRAM: peer async copy
-                    if let Some(page) = vmt.lookup(&loc.name) {
-                        if let Some(src_chunk) = page.vram_chunks.first() {
-                            if src_chunk.gpu_ordinal != current_gpu {
-                                let src_idx = src_chunk.gpu_ordinal.try_into().unwrap_or(0usize);
-                                let _dst_idx = current_gpu.try_into().unwrap_or(0usize);
-
-                                unsafe {
-                                    cuMemcpyPeerAsync(
-                                        CUdeviceptr(dst_ptr),
-                                        dst_ctx,
-                                        CUdeviceptr(src_chunk.device_ptr),
-                                        src_ctxs.get(src_idx).copied().unwrap_or(src_ctxs[0]),
-                                        bytes_per_layer,
-                                        prefetch_stream.as_raw(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Tier::Dram => {
-                    // DRAM→VRAM: submit DMA descriptor (CPU-bypass)
-                    // The DMA engine handles the actual transfer.
-                    // In a full implementation this would write to the
-                    // DMA command ring; here we record the intent.
-                    // See dma.rs for the ring implementation.
-                }
-                Tier::Ssd => {
-                    // SSD→VRAM: GPUDirect Storage read
-                    // GDS would be initialized via dma.rs.
-                    // This path submits an async GDS read descriptor.
-                }
-            }
-        }
-
-        Ok(())
-    }
+    // NOTE: `prefetch_ahead` was removed here.
+    //
+    // It took a layer schedule and dispatched per tier, but only its
+    // VRAM->VRAM peer-copy arm did anything: the `Dram` and `Ssd` arms were
+    // empty bodies carrying the comment "here we record the intent". Read
+    // casually the function looked like the paper's §3.2 prefetcher; it was a
+    // shell around one third of it, with zero callers anywhere in the tree.
+    //
+    // `TieredPool::prefetch` supersedes it and is the real implementation:
+    // it issues the DRAM->VRAM copy on the prefetch stream, records an event,
+    // and `access` claims it. Measured at 3.2x on the claim (8 x 32 MiB: issue
+    // 7.47 ms + claim 12.69 ms against 40.81 ms cold), covered by
+    // `paper_prefetch_overlaps_transport_with_compute`.
+    //
+    // Cold T2 pages are still promoted synchronously — a file read has to
+    // complete before any device copy can start, and blocking the prefetch
+    // stream on I/O defeats the purpose.
 
     /// Block until all in-flight prefetches complete.
     pub fn sync_all(&mut self) -> Result<()> {
