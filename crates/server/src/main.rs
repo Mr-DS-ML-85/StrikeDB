@@ -203,6 +203,22 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
         "default".to_string()
     };
 
+    // Buffer length at which the next parse attempt is worth making.
+    //
+    // `try_parse` restarts from byte zero every call, so retrying it after each
+    // 64 KB read makes a large frame quadratic in its own size: a 96 MB
+    // `VADDBATCH` needs ~1500 reads and re-parses ~48 MB on average each time,
+    // which is roughly 72 GB of parsing for one command. Measured, that command
+    // made *zero* progress in ten minutes — it read fine, it just never finished
+    // parsing.
+    //
+    // Backing off geometrically makes the total O(n log n): a partial frame is
+    // re-examined only after the buffer has grown by half again, so the number
+    // of full re-parses is logarithmic in frame size rather than linear. Small
+    // commands are unaffected because they parse completely on the first
+    // attempt and reset the threshold.
+    let mut retry_at = 0usize;
+
     loop {
         // Block until we have SOMETHING to parse (or the client closes).
         let n = {
@@ -214,6 +230,11 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
         }
         buf.extend_from_slice(&tmp[..n]);
 
+        // Still short of the point where re-parsing is worth the scan.
+        if buf.len() < retry_at {
+            continue;
+        }
+
         // ── Drain every complete command from `buf` ────────────────────
         let mut cmds: Vec<Vec<Vec<u8>>> = Vec::new();
         let mut cursor = 0usize;
@@ -221,11 +242,22 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
             match try_parse(&buf[cursor..]) {
                 Ok(Some((cmd, consumed))) => {
                     cursor += consumed;
+                    // A frame completed, so the next one starts from scratch
+                    // and must not inherit this frame's backoff.
+                    retry_at = 0;
                     if !cmd.is_empty() {
                         cmds.push(cmd);
                     }
                 }
-                Ok(None) => break, // partial command; wait for more bytes
+                Ok(None) => {
+                    // Partial command. Wait for the buffer to grow by half
+                    // again before scanning from the start once more; see
+                    // `retry_at`. `+ 64 KiB` keeps the threshold moving for
+                    // small buffers, where 1.5x of a few bytes would not.
+                    let remaining = buf.len() - cursor;
+                    retry_at = buf.len() + (remaining / 2).max(64 * 1024);
+                    break;
+                }
                 Err(e) => {
                     // A genuine protocol error (NOT a truncated frame —
                     // `try_parse` reports those as `Ok(None)`). Reply the way
