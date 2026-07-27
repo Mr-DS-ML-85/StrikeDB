@@ -1527,15 +1527,32 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             } else {
                 let mode_str = String::from_utf8_lossy(&args[0]).to_lowercase();
                 match mode_str.as_str() {
+                    // Select the mode BEFORE probing for a device.
+                    //
+                    // `gpu_available()` only brings the driver up when a GPU
+                    // mode is already current — that gating exists so `CpuOnly`
+                    // never touches the device. Probing first therefore always
+                    // answered "no device" on a fresh server, whose mode
+                    // defaults to `CpuOnly`, so `GPU.MODE turbo` returned
+                    // "ERR no GPU detected" on a machine with a working GPU and
+                    // there was no way to enable GPU execution over RESP at all.
+                    //
+                    // Set, probe, roll back on genuine absence — so a machine
+                    // without a device still gets an honest error.
                     "turbo" | "gpu" => {
+                        gpu::gpu_set_mode(gpu::ComputeMode::Turbo);
                         if !gpu::gpu_available() {
+                            gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly);
                             return err("ERR no GPU detected");
                         }
-                        gpu::gpu_set_mode(gpu::ComputeMode::Turbo);
                         Resp::Simple("OK compute mode = Turbo (full GPU)".into())
                     }
                     "hybrid" => {
                         gpu::gpu_set_mode(gpu::ComputeMode::Hybrid);
+                        if !gpu::gpu_available() {
+                            gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly);
+                            return err("ERR no GPU detected");
+                        }
                         Resp::Simple("OK compute mode = Hybrid (GPU+RAM+CPU)".into())
                     }
                     "cpu" | "cpu_only" | "off" => {

@@ -123,7 +123,13 @@ pages, LGM.md.
 ### 3.1 RESP wiring audit ← **highest value**
 Features exist but the server may not reach them. Verify each:
 - [ ] `VBULKLOAD` at 100k with `DBSTRIKE_GPU=turbo` — time it, confirm APGC runs
-- [ ] Does `GPU.MODE turbo` over RESP actually change the server's build path?
+- [x] **`GPU.MODE turbo` was broken** — probed `gpu_available()` *before*
+      setting the mode, but availability only initialises the driver when a GPU
+      mode is already current. On a fresh server (default `CpuOnly`) it always
+      answered "no device", so `GPU.MODE turbo` returned `ERR no GPU detected`
+      on a machine with a working GPU. **There was no way to enable GPU
+      execution over RESP at all.** Fixed: set, probe, roll back on genuine
+      absence. Same ordering bug appeared independently in `--gpu-bench`.
 - [ ] Does `VSEARCH` use `search_many` for pipelined batches?
 - [ ] Is the LGM membrane reachable from the server at all? (currently not)
 
