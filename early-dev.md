@@ -32,57 +32,31 @@ NVMe Gen4. Datasets in `/home/irfan/datasets/real_{384,768}_{100k,1M}.fbin`.
 
 ## 1. Blocking — item 1, the biggest single win
 
-### 1.1 Route bulk `VADDBATCH` ingest to the GPU builder
-**Status:** attempted, reverted, root cause found.
-**Value:** wire ingest 5,812 vec/s → ~42,000 vec/s (the fast path is proven:
-`build_parallel_tiered` measures 9.29× serial at 100k×384d, recall 0.994).
+### 1.1 Route bulk ingest to the GPU builder — **done**
+`build_parallel_ids` now delegates to `build_parallel_tiered` when a GPU mode is
+selected and remaps `node.id` through `ids` (exact: that builder labels nodes
+with the original row index in every branch).
 
-**Why the obvious fix fails.** Delegating `build_parallel_ids`
-(`crates/views/src/vector.rs:4124`) to `build_parallel_tiered` and remapping
-`node.id` through `ids` *looks* exact — that builder does label nodes with the
-original row index — but it fails
-`parallel_build_labels_each_vector_with_its_own_id` with **599/600 wrong**.
+Getting there required fixing a **latent bug in the GPU build path**, which the
+first attempt exposed by failing
+`parallel_build_labels_each_vector_with_its_own_id` at 599/600. The id remap was
+correct; the input contract was not. `l2_normalize` runs *inside*
+`Hnsw::insert_attr` (`vector.rs:1988`, `:2021`), so every CPU path normalizes
+internally and all `build_parallel*` callers legitimately pass raw vectors — the
+GPU block was the only place quantizing with a bare `(x * 127.0) as i8`, which
+saturates for any coordinate over 1.0. It passed on `real_*.fbin` only because
+sentence-transformer embeddings arrive normalized. Three sites now normalize:
+the `i8_all` upload, `h.all_i8`, and `h.all_f32` (which must hold the
+*normalized* vector, or the exact rerank ranks by magnitude instead of angle and
+fights the traversal it is refining). The mmap tier (`pre_tier`) had the same
+defect and is fixed too.
 
-The id remap is correct. The **input contract** is not:
-
-- `build_parallel_tiered`'s GPU path quantizes with a bare
-  `(data[row * dim + d] * 127.0) as i8` — it requires **L2-normalized** input
-  (its own doc says "row-major L2-normalized").
-- `build_parallel_ids` is called from `insert_many_parallel_rebuild`
-  (`vector.rs:~4784`) with **raw client vectors** straight off `VADDBATCH`.
-- Un-normalized coordinates saturate the `i8` cast → the graph is built on
-  garbage. Not mislabelled: genuinely wrong neighbours.
-
-**Survey done — the diagnosis is worse than "normalize before routing".**
-`l2_normalize` is called *inside* `Hnsw::insert_attr` (`vector.rs:1988`,
-`:2021`), so every CPU insert path normalizes internally and **all**
-`build_parallel*` callers legitimately pass raw data. The GPU block is the only
-place that quantizes without normalizing first.
-
-That makes this a **latent bug in the GPU build path itself**, not merely a
-routing mismatch:
-
-- It works on `real_*.fbin` only because sentence-transformer embeddings happen
-  to arrive L2-normalized already. The 9.29× / recall-0.994 result is therefore
-  correct *for that data* and would silently degrade on any un-normalized corpus.
-- Two sites need it, both in `build_parallel_tiered`'s GPU block:
-  - `let i8_all = ... (data[row * dim + d] * 127.0) as i8` (~`:3786`)
-  - `for d in 0..dim { h.all_i8.push((data[base + d] * 127.0) as i8) }` (~`:3889`)
-- `h.all_f32` (~`:3890`) must store the **normalized** vector too, since the
-  exact-f32 rerank dots it against a normalized query — check what the CPU path
-  puts in `all_f32` and match it exactly, or rerank scores will disagree with
-  traversal scores.
-
-**To finish:**
-1. Normalize per row inside the GPU block (all three sites above), matching what
-   `insert_attr` does. Do **not** normalize at the call site — that would leave
-   the latent bug in place for every other GPU-build caller.
-2. Re-run `parallel_build_labels_each_vector_with_its_own_id` under
-   `DBSTRIKE_GPU=turbo`; must pass at 1, 4, **and** 8 shards (1 shard skips the
-   shuffle, so it passes even when broken — 4/8 are the meaningful cases).
-3. Then measure the wire ingest number.
-
-A note explaining all this is already in the source at the call site.
+**Still open:** the *wire* path. `VADDBATCH` takes the serial append route, so
+the 5,812 vec/s figure in the README is unchanged. `insert_many_parallel_rebuild`
+reaches the GPU builder, but only for batches at least a quarter of the index —
+small streaming batches deliberately fall back to append to avoid the quadratic
+cliff. Deciding what `VADDBATCH` should do for a genuine bulk load is the
+remaining question.
 
 ---
 
