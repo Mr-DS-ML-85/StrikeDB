@@ -206,6 +206,63 @@ mod tests {
     use super::*;
     use std::io::BufReader;
 
+    /// A VADDBATCH-sized frame (64 vectors × 384 dims ≈ 447 KB, 24642 bulk
+    /// args) delivered the way a real socket delivers it: in 32 KB chunks, the
+    /// same size as the server's `tmp` read buffer. Every prefix must parse as
+    /// `Ok(None)` (incomplete) and the whole thing must parse exactly once.
+    ///
+    /// This is the regression test for the s13 ingest failure: the bench got
+    /// `-ERR Protocol error: expected bulk string` on every VADDBATCH, i.e. the
+    /// parser mistook a truncated frame for a malformed one. VSEARCH never hit
+    /// it because a single query fits in one read.
+    #[test]
+    fn chunked_large_frame_parses_once() {
+        const DIM: usize = 384;
+        const NVEC: usize = 64;
+        let n_args = 2 + NVEC * (1 + DIM);
+        let mut frame: Vec<u8> = format!("*{n_args}\r\n").into_bytes();
+        let mut push_bulk = |f: &mut Vec<u8>, s: &str| {
+            f.extend_from_slice(format!("${}\r\n{s}\r\n", s.len()).as_bytes());
+        };
+        push_bulk(&mut frame, "VADDBATCH");
+        push_bulk(&mut frame, &DIM.to_string());
+        for i in 0..NVEC {
+            push_bulk(&mut frame, &i.to_string());
+            for j in 0..DIM {
+                // Vary the float text length (1..12 bytes) so bulk headers land
+                // at irregular offsets and chunk boundaries fall mid-header,
+                // mid-payload and mid-CRLF across the run.
+                let v = (i * DIM + j) as f32 * 0.000_123_45;
+                push_bulk(&mut frame, &format!("{v}"));
+            }
+        }
+        assert!(frame.len() > 300_000, "frame should be a few hundred KB, got {}", frame.len());
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut parsed = 0;
+        for chunk in frame.chunks(32 * 1024) {
+            buf.extend_from_slice(chunk);
+            loop {
+                match try_parse(&buf) {
+                    Ok(Some((cmd, consumed))) => {
+                        assert_eq!(cmd.len(), n_args);
+                        assert_eq!(cmd[0], b"VADDBATCH");
+                        buf.drain(..consumed);
+                        parsed += 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => panic!(
+                        "truncated frame misreported as malformed at {} / {} bytes: {e}",
+                        buf.len(),
+                        frame.len()
+                    ),
+                }
+            }
+        }
+        assert_eq!(parsed, 1, "expected exactly one complete command");
+        assert!(buf.is_empty(), "{} bytes left over", buf.len());
+    }
+
     #[test]
     fn encode_types() {
         assert_eq!(Resp::Simple("OK".into()).encode(), b"+OK\r\n");

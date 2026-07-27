@@ -1,0 +1,12 @@
+[package]
+name = "bench-modules"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmarks for VUGVA, OpusEdge, and APGC modules."
+publish = false
+
+[dependencies]
+vugva = { path = "../vugva" }
+opusedge = { path = "../opusedge" }
+apgc = { path = "../apgc" }
+engine = { path = "../engine" }

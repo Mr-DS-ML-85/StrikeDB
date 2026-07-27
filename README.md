@@ -335,6 +335,18 @@ real English Wikipedia sentences (1M rows), generated locally.
 | 100k × 384-d | 4,760 vec/s | 319 µs | **0.999** | 20,000 | 1.1 GB |
 | **1M × 384-d** | 2,142 vec/s | **505 µs** | **0.968** | **12,440** | 3.6 GB |
 
+> **Ingest is the weak column, and it is a known bottleneck rather than a
+> tuning artefact.** At 1M×768-d, 1,260 vec/s is ~13 minutes to load. Two
+> causes, both measured: graph construction is serialized by a single
+> `RwLock<Hnsw>` write lock, so 8 concurrent clients deliver only ~1.8× the
+> single-thread rate on 16 cores; and per-vector insert cost grows with the
+> graph (62 µs/vec at 1k, 210 µs/vec at 10k). It is *not* distance-bound —
+> forcing the scalar dot kernel instead of AVX-512 VNNI changes ingest by 6%
+> and search by ~0%, which is why no amount of SIMD work moves this number.
+> The fix is a sharded build with per-shard locks, then a bridge-merge; the
+> machinery exists (`build_parallel_ids`, `merge_segments`) but the wire ingest
+> path does not use it yet. Query performance is unaffected.
+
 **Peak QPS sweep (the "RPS case" — N client threads on the one node):**
 
 | Config | 8 clients | 16 clients | 32 clients |
@@ -379,57 +391,74 @@ scenario, where the headline metric is QPS, not per-request p99.
 - **RAM efficient**: 6.5 GB (1M×768-d) / 3.6 GB (1M×384-d) with the
   INT8-traversal + exact-f32-rerank design.
 
-### 🔥 GPU / Tiered Compute (CAGRA + VUGVA)
+### 🔥 GPU / Tiered Compute (APGC + VUGVA) — **experimental**
 
-Three compute modes with auto-detection. GPU kernels are lazy-loaded via NVRTC
-(zero dependencies). When no GPU is present, the system falls back to pure CPU.
+> **Status, stated plainly.** The GPU path is under active development and is
+> **not** the path the benchmarks above measure. Until recently the compute mode
+> defaulted to `CpuOnly` and no benchmark harness initialised the device, so any
+> "GPU" figure previously published here was produced by the CPU path. Those
+> numbers have been removed rather than restated, and no GPU performance table
+> appears below until one is measured end-to-end on a device. If you need
+> production numbers today, use the CPU figures above — they are reproducible.
 
-```
-┌─────────────────────────────────────────┐
-│         GPU AUTO-DETECTION              │
-│  cuInit + cuDeviceGet + cuMemGetInfo    │
-├─────────────────────────────────────────┤
-│  Data ≤ VRAM?                           │
-│    YES → TURBO  (full GPU, fastest)    │
-│    NO  → HYBRID (GPU + RAM + CPU)      │
-│         VUGVA unified memory:           │
-│         GPU reads vectors from RAM      │
-│         directly — no CPU copy.         │
-├─────────────────────────────────────────┤
-│  No GPU? → CPU_ONLY (pure CPU path)    │
-└─────────────────────────────────────────┘
-```
+Three compute modes. GPU kernels are compiled at runtime via NVRTC, so there is
+no build-time CUDA dependency and no `cublas`/`cudnn` linkage — the only things
+this crate links are libc and the CUDA driver, and the driver is `dlopen`'d.
 
-**VUGVA Unified Memory** — GPU kernels access host RAM directly via
-`cuMemAllocManaged`. The CUDA page migrator pulls hot data into VRAM on
-demand. No `cuMemcpyHtoD`, no CPU-mediated data shuttling. This is the
-"software RDMA at the virtual level" from the VUGVA paper.
+| Mode | What it means | State |
+|---|---|---|
+| `turbo` | **GPU only.** Corpus, graph and traversal all resident in VRAM. No host fallback inside a query. | works; build path still CPU-bound |
+| `hybrid` | **VUGVA.** Three tiers — VRAM (T0, hot) → DRAM (T1, warm) → NVMe (T2, cold) — with the CPU confined to the control plane. | memory layer complete and tested; **not yet wired to search** |
+| `cpu` | **CPU only.** No device work even when a GPU is present. | works; this is what the tables above measure |
 
-**GPU Kernels** (zero dependencies, compiled via NVRTC):
-- `cosine_dist` — single query × N vectors (INT8)
-- `batch_cosine_dist` — Q queries × N vectors (CAGRA distance kernel)
-- `cagra_search` — iterative graph traversal on GPU (CAGRA search)
+**Selecting a mode.** `DBSTRIKE_GPU=turbo|hybrid|cpu` at process start, or the
+`GPU.MODE` RESP command at runtime. The environment variable exists because the
+RESP command is unreachable from a harness that has not connected yet — which is
+precisely how the GPU path went unmeasured.
+
+**APGC** (Adaptive Precision Graph Construction) is this project's graph builder.
+It **replaces** CAGRA rather than extending it: mixed-precision construction
+(FP32 for seed/high-degree nodes, FP16 for the bulk, INT8 for outliers) against
+CAGRA's single-precision FP32, plus VUGVA tiering so the graph is not bounded by
+VRAM. See `research/agpc.md`.
+
+**VUGVA** is a real three-tier allocator, not CUDA managed memory. `TieredPool`
+reserves NVMe spill space at allocation, page-locks NUMA-local DRAM as the warm
+tier, and stages `SSD → DRAM → VRAM` on access, with the CPU writing DMA
+descriptors rather than copying data. Verified on an RTX 4060 by
+`paper_ssd_tier_promotes_cold_pages` (1 MiB cold page against a 4 MiB DRAM pool
+and a 64 MiB spill file — a two-tier cache fails that allocation outright).
+
+What this buys, and the honest caveat: the *memory* layer will serve a corpus
+larger than both VRAM and RAM without a capacity cliff, which neither Qdrant nor
+Milvus offers. The *search* path does not consume it yet, so today `hybrid`
+falls back to CPU when the corpus exceeds VRAM. Wiring that up is the next step.
+
+**GPU kernels** (compiled via NVRTC at runtime):
+- `cosine_dist` — one query × N vectors (INT8)
+- `batch_cosine_dist` — Q queries × N vectors
+- `apgc_search` — iterative graph traversal on device
 - `matmul` — INT8 matrix multiply
 
-**RESP Commands:**
+**RESP commands:**
 ```
 GPU.MODE              → show current mode
-GPU.MODE turbo        → full GPU (fastest, requires NVIDIA GPU)
-GPU.MODE hybrid       → GPU + RAM + CPU auto-offload
-GPU.MODE cpu          → pure CPU (fallback)
-GPU.MODE auto         → auto-detect optimal mode
-GPU.LOAD <kernel>     → load kernel on demand
-GPU.INFO              → VRAM, kernels, mode
+GPU.MODE turbo        → GPU only (requires NVIDIA GPU + corpus fits VRAM)
+GPU.MODE hybrid       → VUGVA three-tier
+GPU.MODE cpu          → CPU only
+GPU.MODE auto         → pick by corpus size vs free VRAM
+GPU.LOAD <kernel>     → compile + load a kernel on demand
+GPU.INFO              → VRAM, loaded kernels, mode
 GPU.UNLOAD            → release GPU resources
 ```
 
-**Benchmark (1M vectors, 16 cores, RTX 4060):**
-
-| Dataset | Mode | Build | QPS | p50 | Recall@10 |
-|---|---|---|---|---|---|
-| 1M × 384-d | CPU-only | 187s | 16,695 | 607µs | 0.992 |
-| 1M × 384-d | Hybrid | 170s | 17,071 | 501µs | 0.992 |
-| 1M × 768-d | CPU-only | 243s | 10,316 | 1175µs | 0.988 |
+**Known limitations** (measured, RTX 4060):
+- GPU utilization during graph build is **2–5%**: the seeding phase
+  synchronises and reads back per batch instead of keeping work on device.
+- `hybrid` does not yet serve search from `TieredPool`, so it behaves as
+  `turbo`-with-fallback rather than as a third tier.
+- Build time is CPU-bound regardless of mode — concurrent ingest is serialized
+  by a single graph write lock and scales ~1.8× across 16 cores.
 
 #### 🧪 TurboQuant / PQ head-to-head vs Qdrant (Module 6, 3000 × 768-d, in-process)
 
@@ -595,6 +624,10 @@ access path through optional trailing flags — no per-module command sprawl:
   the existing graph + batch and rebuilds the WHOLE graph via `build_parallel_ids`
   (shuffle + parallel segments + cheap O(K²) entry bridge) — a genuinely cores×
   build with correct recall. Use this for bulk loads / large batches.
+  **Misuse is now handled rather than pathological:** a batch smaller than a
+  quarter of the current index falls back to the append path, because rebuilding
+  the whole graph per small batch is quadratic overall (streaming 100k vectors
+  in 64-vector `PAR` batches measured 106 s against 17 s for plain append).
 - `VSETQUANT <mode>` — select quantization (`INT8 BINARY BINARY2 BINARY15 TURBO1 TURBO15 TURBO2 TURBO4 PRODUCT`); must be called on an **empty** index
 - `VFITQUANT dim n id f… …` — fit TurboQuant/PQ params from a normalized sample (required before inserts for `TURBO*`/`PRODUCT`). **The `dim` here pins the turbo rotation; inserting a different-dim vector returns a clean `ERR VADD dim N != turbo index dim M` instead of crashing the server.**
 - `VQUANT` — report the current quantization mode
@@ -904,6 +937,71 @@ See the
 - [ ] Cross-hardware validation (AWS c7g / Xeon / EPYC)
 - [ ] ann-benchmarks datasets (SIFT1M, GIST, GloVe) recall × latency curves
 - [ ] gRPC shim
+
+---
+
+## 🧬 GPU Compute Layer: APGC + OpusEdge + VUGVA
+
+Three new pure-Rust modules power the GPU compute layer:
+
+### APGC — Adaptive Precision Graph Construction
+
+Mixed-precision kNN graph construction with 5-tier precision hierarchy. GPU auto-detects capabilities and loads only compatible formats.
+
+| GPU Architecture | FP32 | BF16 | FP16 | FP8 | INT8 |
+|-----------------|------|------|------|-----|------|
+| Tesla V100 (Volta, sm_70) | ✅ | ❌ | ✅ | ❌ | ✅ |
+| A100 SXM (Ampere, sm_80) | ✅ | ✅ | ✅ | ⚠️ | ✅ |
+| RTX 4060 (Ada, sm_89) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| H100 SXM (Hopper, sm_90) | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+```rust
+use apgc::precision::{GpuCaps, MixedPrecisionBuilder, GraphConfig, PrecisionLevel};
+
+let caps = GpuCaps::detect();
+let config = GraphConfig { k: 32, n, dim, seed_ratio: 0.01, outlier_ratio: 0.10, gpu_caps: Some(caps) };
+let graph = MixedPrecisionBuilder::build(&vectors, config);
+```
+
+### OpusEdge — Δ-Signal Driven Compute Allocation
+
+30 inference primitives driven by a single per-token importance signal. Works on FP32, FP16, BF16, FP8. Zero retraining.
+
+| Primitive | Latency | Throughput | Benefit |
+|-----------|---------|------------|---------|
+| SelKV | 76 µs | 12.7K/s | 87.5% cache savings |
+| Delta-AR | 20 µs | 49.5K/s | O(S²)→O(S·K) |
+| HeadDeactivate | 10 µs | 97K/s | 87.5% heads off |
+| MPSR | 0.9 µs | 1.16M/s | KV→SSM recycle |
+| IPSS | 4.2 µs | 238K/s | O(S) linear fallback |
+
+```rust
+use opusedge::signal::DeltaSignal;
+use opusedge::primitives::{SelKV, DeltaAR, HeadDeactivate};
+
+let delta = DeltaSignal::from_proxy_delta(&hidden_states);
+let eviction = SelKV::evict(&delta, 0.875, seq_len);
+let routing = DeltaAR::route(&delta, 64);
+```
+
+### VUGVA — Virtual Unified GPU VRAM Architecture
+
+Chunk-based memory tiering: GPU VRAM → System RAM → NVMe.
+
+| Operation | Latency | Throughput |
+|-----------|---------|------------|
+| Chunk insert | 35.5 µs/batch | 28B chunks/s |
+| LRU eviction | 1.2 µs/chunk | 85K cycles/s |
+| Prefetch | 68.7 ns/predict | 14.5M predicts/s |
+
+### Benchmarks (RTX 4060)
+
+| Metric | Value |
+|--------|-------|
+| Proxy-Δ extraction | 60 ns/token (16.5M tokens/s) |
+| Full pipeline search | 59.3 µs (16.9K QPS) |
+| APGC memory savings | 50% vs FP32-only |
+| SelKV cache reduction | 87.5% at 76 µs/evict |
 
 ---
 

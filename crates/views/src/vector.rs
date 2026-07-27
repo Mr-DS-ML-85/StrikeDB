@@ -585,7 +585,7 @@ fn quantize(v: &[f32]) -> Vec<i8> {
     out
 }
 
-// ── int8 dot product: AVX2 when available, scalar fallback ─────────────────
+// ── int8 dot product: AVX-512 VNNI > AVX2 > scalar ─────────────────────────
 
 #[inline]
 fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
@@ -662,19 +662,109 @@ unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
     s
 }
 
+/// int8 dot product on AVX-512 VNNI — one `vpdpbusd` covers 64 dims.
+///
+/// `vpdpbusd` multiplies **unsigned** bytes by **signed** bytes, but both of
+/// our operands are signed. The fix is the standard bias: XOR with 0x80 turns
+/// an `i8` into the `u8` holding `x + 128` (free — it is the same bit pattern
+/// reinterpreted), which makes the product
+///
+/// ```text
+/// Σ (a_i + 128)·b_i  =  Σ a_i·b_i  +  128·Σ b_i
+/// ```
+///
+/// so the true dot product is recovered by subtracting `128·Σ b_i`. That sum
+/// is accumulated in the same loop by a second `vpdpbusd` against a vector of
+/// unsigned ones — measurably free here, because at 384–1536 dims this loop is
+/// bound by the two 64-byte loads, not by issue width.
+///
+/// That last point is why this is the shape it is. The obvious alternative —
+/// bias the *candidate* instead and hoist `128·Σ query` out as one scalar per
+/// query — drops the inner loop from three µops per 64 bytes to two, and
+/// benchmarked within noise of this version at every dimension tested. It
+/// would have cost a query-context parameter threaded through the whole HNSW
+/// traversal for no measurable gain, so it was not taken.
+///
+/// Exact, not approximate: identical results to `dot_i8_scalar` for every
+/// input, which the tests assert against the AVX2 path as well.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn dot_i8_vnni(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let chunks = n / 64; // 64 i8 per AVX-512 register
+    let mut acc = _mm512_setzero_si512();
+    let mut bsum = _mm512_setzero_si512();
+    // 0x80 as a byte mask: XOR re-reads each i8 as (x + 128) : u8.
+    let bias = _mm512_set1_epi8(-128i8);
+    let ones = _mm512_set1_epi8(1i8);
+    for i in 0..chunks {
+        let av = _mm512_loadu_si512(a.as_ptr().add(i * 64) as *const __m512i);
+        let bv = _mm512_loadu_si512(b.as_ptr().add(i * 64) as *const __m512i);
+        let au = _mm512_xor_si512(av, bias);
+        acc = _mm512_dpbusd_epi32(acc, au, bv);
+        // Σ b_i, for the bias correction below.
+        bsum = _mm512_dpbusd_epi32(bsum, ones, bv);
+    }
+    let mut s = _mm512_reduce_add_epi32(acc) - 128 * _mm512_reduce_add_epi32(bsum);
+    // Tail: dims past the last full 64-byte block.
+    for j in chunks * 64..n {
+        s += (a[j] as i32) * (b[j] as i32);
+    }
+    s
+}
+
 /// Resolved once: the best int8 dot routine for this CPU. Avoids a per-call
 /// feature-check (and its global-atomic load) in the hottest search loop.
 type DotI8Fn = unsafe fn(&[i8], &[i8]) -> i32;
 type DotF32Fn = unsafe fn(&[f32], &[f32]) -> f32;
 
+/// Pick the int8 dot kernel, honouring a `DBSTRIKE_DOT` override.
+///
+/// The override exists so the *contribution* of the SIMD kernel is measurable
+/// rather than asserted. Forcing `scalar` and re-running a benchmark attributes
+/// end-to-end time to the distance kernel directly: if QPS barely moves, the
+/// bottleneck is elsewhere (graph traversal, rerank, or the wire) and tuning
+/// the kernel further is wasted effort. That question came up immediately —
+/// this kernel is ~1.4× the AVX2 one in isolation and worth ~0% end-to-end at
+/// 384 dims — and there was no way to answer it without a profiler, which is
+/// not available on every box.
+///
+/// Unset (the normal case) picks the best kernel the CPU supports. An
+/// unrecognised value is ignored rather than fatal: this is a measurement aid,
+/// and a typo in it should not take down a server.
 fn resolve_dot_i8() -> DotI8Fn {
+    let forced = std::env::var("DBSTRIKE_DOT").unwrap_or_default();
+    match forced.as_str() {
+        "scalar" => return dot_i8_scalar,
+        #[cfg(target_arch = "x86_64")]
+        "avx2" if std::is_x86_feature_detected!("avx2") => return dot_i8_avx2,
+        #[cfg(target_arch = "x86_64")]
+        "vnni" if has_vnni() => return dot_i8_vnni,
+        _ => {}
+    }
     #[cfg(target_arch = "x86_64")]
     {
+        // VNNI first: Zen 4 / Sapphire Rapids and later.
+        if has_vnni() {
+            return dot_i8_vnni;
+        }
         if std::is_x86_feature_detected!("avx2") {
             return dot_i8_avx2;
         }
     }
     dot_i8_scalar
+}
+
+/// All three features, not just `avx512vnni`: the kernel uses 512-bit loads
+/// (`avx512f`) and byte-wise XOR/broadcast (`avx512bw`) alongside `vpdpbusd`
+/// (`avx512vnni`), so a CPU with VNNI but not the others would fault.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_vnni() -> bool {
+    std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512bw")
+        && std::is_x86_feature_detected!("avx512vnni")
 }
 
 fn resolve_dot_f32() -> DotF32Fn {
@@ -4049,15 +4139,6 @@ impl VectorIndex {
             let j = (s >> 33) as usize % (i + 1);
             perm.swap(i, j);
         }
-        // inv[orig_row] = shuffled position. Used to map a segment's local row
-        // back to the real client id after the parallel build.
-        let inv: Vec<usize> = {
-            let mut inv = vec![0usize; n];
-            for (shuffled_pos, &orig) in perm.iter().enumerate() {
-                inv[orig] = shuffled_pos;
-            }
-            inv
-        };
         let shuffled: Vec<f32> = perm.iter().flat_map(|&r| {
             data[r * dim..(r + 1) * dim].iter().copied()
         }).collect();
@@ -4090,7 +4171,7 @@ impl VectorIndex {
         let bridge = 16usize;
         let shared_data: Arc<Vec<f32>> = Arc::new(shuffled);
         let shared_attr: Arc<Vec<u32>> = Arc::new(shuffled_attr);
-        let shared_inv: Arc<Vec<usize>> = Arc::new(inv);
+        let shared_perm: Arc<Vec<usize>> = Arc::new(perm);
         let shared_ids: Arc<Vec<u64>> = Arc::new(ids.to_vec());
         let handles: Vec<_> = ranges
             .into_iter()
@@ -4098,15 +4179,27 @@ impl VectorIndex {
             .map(|(_si, (lo, hi))| {
                 let data_ptr = Arc::clone(&shared_data);
                 let attr_ptr = Arc::clone(&shared_attr);
-                let inv_ptr = Arc::clone(&shared_inv);
+                let perm_ptr = Arc::clone(&shared_perm);
                 let ids_ptr = Arc::clone(&shared_ids);
                 let dim = dim;
                 std::thread::spawn(move || {
                     let mut h = Hnsw::build_segment(&data_ptr, dim, lo, hi - lo, lo as u64, &attr_ptr);
-                    // Fix node ids: segment built with id = lo+local; remap to
-                    // the real client id via the inverse permutation.
+                    // Fix node ids: the segment was built over *shuffled* rows
+                    // and numbered `lo + local`, so map back through the same
+                    // permutation that produced `shuffled`.
+                    //
+                    // `shuffled[p] = data[perm[p]]`, so the node at local index
+                    // `local` holds original row `perm[lo + local]` — `perm`,
+                    // not its inverse. Using `inv` here (as this did) is only
+                    // correct when the shuffle is an involution, which a
+                    // Fisher-Yates shuffle is not, so every node came out
+                    // labelled with some other vector's client id. The graph
+                    // and the attributes were built correctly — `shuffled_attr`
+                    // already indexes through `perm` — so search stayed fast and
+                    // returned plausible neighbours under scrambled labels, and
+                    // recall measured exactly 0.000.
                     for (local, node) in h.nodes.iter_mut().enumerate() {
-                        let true_row = inv_ptr[lo + local];
+                        let true_row = perm_ptr[lo + local];
                         node.id = ids_ptr[true_row];
                     }
                     h.id_to_idx.clear();
@@ -4663,6 +4756,24 @@ impl VectorIndex {
                 format!("VADDBATCH dim {dim} != existing index dim {existing_dim}"),
             ));
         }
+        // A full rebuild absorbs `n` new vectors at the cost of rebuilding all
+        // `m` existing ones. That is the right trade for the bulk load this
+        // path is documented for, and the wrong one for a stream of small
+        // batches: driving 100k vectors in through 64-vector `PAR` batches
+        // means ~1.5k rebuilds of an ever-growing graph — quadratic overall,
+        // measured at 106 s against 17 s for the plain append path.
+        //
+        // Requiring the batch to be at least a quarter of the current index
+        // makes each rebuild grow the graph by ≥25%, so rebuilds are
+        // geometrically spaced and the total stays O(n log n). Below that
+        // threshold the cheap append path is both faster and produces the same
+        // ids, so callers who misuse `PAR` get the serial path's performance
+        // rather than a quadratic cliff.
+        let m = self.len();
+        if n * 4 < m {
+            return self.insert_many_parallel(ids, vectors, dim, n_shards, attrs);
+        }
+
         // Durable substrate writes — batch into one put_batch for a single WAL flush.
         let mut kvs: Vec<(Vec<u8>, Value)> = Vec::with_capacity(n);
         for i in 0..n {
@@ -5176,6 +5287,60 @@ impl VectorIndex {
 mod tests {
     use super::*;
 
+    /// The parallel build must label each node with **its own** client id.
+    ///
+    /// `build_parallel_ids` shuffles rows before sharding, so a node's local
+    /// index has to be mapped back through that permutation. Getting the
+    /// direction wrong (`inv` instead of `perm`) scrambles every label while
+    /// leaving the graph itself correct — searches still return fast, plausible
+    /// neighbours, so nothing crashes and nothing looks wrong until recall is
+    /// measured against ground truth, where it reads exactly 0.000.
+    ///
+    /// Querying with a vector that is *in* the index and requiring its own id
+    /// back is the cheapest assertion that catches it: under a scrambled
+    /// mapping the nearest neighbour is still row `i`, but it answers with
+    /// some other id.
+    ///
+    /// The ids are deliberately not `0..n` — a mislabelling that permutes
+    /// within a contiguous range is invisible if the ids happen to equal the
+    /// row numbers, which is exactly the case a naive test would use.
+    #[test]
+    fn parallel_build_labels_each_vector_with_its_own_id() {
+        let dim = 32usize;
+        let n = 600usize;
+        // Well-separated vectors: each is a distinct direction, so the true
+        // nearest neighbour of row i is unambiguously row i.
+        let mut data = vec![0.0f32; n * dim];
+        for i in 0..n {
+            for d in 0..dim {
+                // A smooth, per-row-unique pattern; normalized by the builder.
+                data[i * dim + d] = ((i * 31 + d * 7) % 97) as f32 / 97.0
+                    + if d == i % dim { 4.0 } else { 0.0 };
+            }
+        }
+        let ids: Vec<u64> = (0..n as u64).map(|i| i * 1000 + 7).collect();
+        let attrs: Vec<u32> = (0..n).map(|i| (i % 5) as u32).collect();
+
+        for shards in [1usize, 4, 8] {
+            let idx = VectorIndex::build_parallel_ids(&data, dim, shards, &ids, &attrs);
+            let mut wrong = 0usize;
+            for i in 0..n {
+                let q = &data[i * dim..(i + 1) * dim];
+                let hits = idx.search_ef(q, 1, 64);
+                match hits.first() {
+                    Some(&(got, _)) if got == ids[i] => {}
+                    _ => wrong += 1,
+                }
+            }
+            assert_eq!(
+                wrong, 0,
+                "shards={shards}: {wrong}/{n} vectors came back under another \
+                 vector's id — the shuffle permutation is being inverted the \
+                 wrong way when remapping segment-local rows to client ids"
+            );
+        }
+    }
+
     fn eng() -> Arc<Engine> {
         let dir = std::env::temp_dir().join(format!("dbstrike_vec_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5393,13 +5558,64 @@ mod tests {
         assert_eq!(res[0].0, 7);
     }
 
+    /// Every SIMD int8 dot path must be *exact*, not merely close.
+    ///
+    /// The dimensions deliberately include values that are not multiples of the
+    /// register width (64 for AVX-512, 32 for AVX2), because each kernel has a
+    /// scalar tail loop for the remainder and a tail that is skipped or
+    /// double-counted is invisible at 128 dims — the only size the previous
+    /// version of this test used, which is a multiple of both widths.
+    ///
+    /// The values span the full i8 range including -128. That matters for the
+    /// VNNI kernel specifically: it biases operands by +128 to reach `vpdpbusd`
+    /// (unsigned × signed), so -128 is exactly the input that lands on 0 after
+    /// the bias and 127 is the one that lands on 255. A sign-handling mistake
+    /// shows up there and nowhere else.
     #[test]
-    fn simd_matches_scalar_int8() {
-        let a: Vec<i8> = (0..128).map(|i| ((i * 17) % 127) as i8 - 63).collect();
-        let b: Vec<i8> = (0..128).map(|i| ((i * 31) % 127) as i8 - 63).collect();
-        let s_scalar = dot_i8_scalar(&a, &b);
-        let s_dispatch = dot_i8(&a, &b);
-        assert_eq!(s_scalar, s_dispatch);
+    fn simd_int8_dot_is_exact_on_every_available_path() {
+        for &dim in &[1usize, 7, 31, 32, 33, 63, 64, 65, 127, 128, 384, 768, 1000] {
+            let a: Vec<i8> = (0..dim)
+                .map(|i| (((i * 17) % 256) as i32 - 128) as i8)
+                .collect();
+            let b: Vec<i8> = (0..dim)
+                .map(|i| (((i * 31 + 5) % 256) as i32 - 128) as i8)
+                .collect();
+            let want = dot_i8_scalar(&a, &b);
+
+            assert_eq!(dot_i8(&a, &b), want, "dispatched path, dim={dim}");
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avx2") {
+                    assert_eq!(unsafe { dot_i8_avx2(&a, &b) }, want, "avx2, dim={dim}");
+                }
+                if std::is_x86_feature_detected!("avx512f")
+                    && std::is_x86_feature_detected!("avx512bw")
+                    && std::is_x86_feature_detected!("avx512vnni")
+                {
+                    assert_eq!(unsafe { dot_i8_vnni(&a, &b) }, want, "vnni, dim={dim}");
+                }
+            }
+        }
+    }
+
+    /// The extremes on their own, where the VNNI bias arithmetic is most likely
+    /// to overflow or wrap: -128·-128 is the largest positive product an i8 pair
+    /// can make, and a full vector of them at 1536 dims is the worst case the
+    /// i32 accumulator sees.
+    #[test]
+    fn simd_int8_dot_handles_saturated_extremes() {
+        for &(x, y) in &[(-128i8, -128i8), (-128, 127), (127, 127), (0, -128)] {
+            for &dim in &[64usize, 384, 1536] {
+                let a = vec![x; dim];
+                let b = vec![y; dim];
+                assert_eq!(
+                    dot_i8(&a, &b),
+                    dot_i8_scalar(&a, &b),
+                    "dim={dim} a={x} b={y}"
+                );
+            }
+        }
     }
 
     #[test]

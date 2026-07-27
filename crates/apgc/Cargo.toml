@@ -1,0 +1,6 @@
+[package]
+name = "apgc"
+version = "0.1.0"
+edition = "2021"
+description = "APGC — Adaptive Precision Graph Construction. Mixed-precision GPU kNN graph build with KV-aware search pruning."
+license = "Apache-2.0"

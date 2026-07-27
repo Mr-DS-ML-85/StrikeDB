@@ -3,4 +3,7 @@ name = "gpu"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+vugva-core = { path = "../vugva-core" }
+
 [build-dependencies]

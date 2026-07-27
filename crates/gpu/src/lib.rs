@@ -18,7 +18,30 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-pub mod vugva;
+/// VUGVA — Virtual Unified GPU VRAM Architecture, vendored as `crates/vugva-core`.
+/// This is the *only* VUGVA in the tree.
+///
+/// There used to be a second, cut-down `gpu::vugva` module here carrying its own
+/// `VugvaVmt`/`DmaRing`. It restated the paper's structures at lower fidelity and
+/// — worse — its one consumer (`views::VectorIndex`) only ever *wrote* the handle:
+/// it held a full duplicate RAM copy of `all_i8` (384 MB at 1M×384d) and logged a
+/// 6 GB VRAM budget for a table that served zero queries. Deleted. Use the real one:
+/// `vugva::{tiered::TieredPool, vmt::VirtualMemoryTable, dma::DmaEngine,
+/// prefetch::LookAheadPrefetcher}`.
+pub use vugva_core as vugva;
+
+/// Back-compat alias for the name this crate exported previously.
+pub use vugva_core as vugva_upstream;
+
+pub mod corpus_tier;
+pub use corpus_tier::CorpusTier;
+
+/// Result type for the GPU-side helpers that can fail for an explainable
+/// reason. The error is a `String` because every current failure originates in
+/// a `VugvaError` or a CUDA status that is only ever logged or surfaced to a
+/// RESP client — nothing matches on the variant, so a typed enum here would be
+/// ceremony without a consumer.
+pub type GpuResult<T> = std::result::Result<T, String>;
 
 type NvrtcProgram = *mut std::ffi::c_void;
 
@@ -59,7 +82,16 @@ extern "C" {
     fn cuGetErrorString(error: i32, str: *mut *const i8) -> i32;
     fn cuMemAllocManaged(dptr: *mut u64, bytesize: usize, flags: u32) -> i32;
     fn cuCtxSetCurrent(ctx: *mut std::ffi::c_void) -> i32;
+    // Streams: concurrent single-query searches (per-slot buffers, no global lock)
+    fn cuStreamCreate(phStream: *mut *mut std::ffi::c_void, flags: u32) -> i32;
+    fn cuStreamDestroy_v2(hStream: *mut std::ffi::c_void) -> i32;
+    fn cuStreamSynchronize(hStream: *mut std::ffi::c_void) -> i32;
+    fn cuMemcpyHtoDAsync_v2(dstDevice: u64, srcHost: *const std::ffi::c_void, byteCount: usize, hStream: *mut std::ffi::c_void) -> i32;
+    fn cuMemcpyDtoHAsync_v2(dstHost: *mut std::ffi::c_void, srcDevice: u64, byteCount: usize, hStream: *mut std::ffi::c_void) -> i32;
+    fn cuMemsetD32_v2(dstDevice: u64, ui: u32, n: usize) -> i32;
 }
+
+const CU_STREAM_NON_BLOCKING: u32 = 0x1;
 
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
 const CU_CTX_SCHED_BLOCKING_SYNC: u32 = 0x04;
@@ -177,7 +209,7 @@ impl GpuState {
                 return;
             }
             // Get ALL function handles from the loaded module.
-            for name in &["cosine_dist_kernel", "batch_cosine_dist_kernel", "cagra_search_kernel", "matmul_kernel"] {
+            for name in &["cosine_dist_kernel", "batch_cosine_dist_kernel", "batch_cosine_dist_f32_kernel", "apgc_search_kernel", "matmul_kernel", "topk_select_kernel", "fused_cosine_topk_kernel", "preprocess_i8_to_f32_kernel", "apgc_optimize_kernel", "apgc_reverse_kernel", "apgc_merge_kernel", "nn_rev_kernel", "nn_descent_kernel", "opusedge_selkv_prune", "opusedge_delta_ar_route", "opusedge_head_gate", "opusedge_state_compress", "opusedge_proxy_delta"] {
                 let cname = CString::new(*name).unwrap();
                 let mut func = std::ptr::null_mut();
                 if cuModuleGetFunction(&mut func, self.module, cname.as_ptr()) == 0 {
@@ -228,7 +260,29 @@ pub fn gpu_init() -> bool {
 
 /// Check if GPU is available.
 pub fn gpu_available() -> bool {
-    GPU_ENABLED.load(Ordering::Relaxed)
+    if GPU_ENABLED.load(Ordering::Relaxed) {
+        return true;
+    }
+    // Bring the device up on first ask, when a GPU mode was actually selected.
+    //
+    // This flag is only ever set by `gpu_init`, and nothing calls `gpu_init`
+    // except the `GPU.LOAD` / `GPU.MODE` RESP handlers. So every caller that
+    // gates on `gpu_available()` — including the APGC build's `use_gpu_build`
+    // — saw `false` in any process that had not received one of those commands
+    // first. Setting `DBSTRIKE_GPU=turbo` selected the mode but left the driver
+    // uninitialised, which is why a build could report "turbo" and still run
+    // entirely on the CPU at zero GPU utilization.
+    //
+    // Gated on the mode so `CpuOnly` still never touches the device, and
+    // attempted once so a machine with no driver does not pay a failed
+    // `cuInit` on every call.
+    if gpu_get_mode() != ComputeMode::CpuOnly {
+        static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !TRIED.swap(true, Ordering::Relaxed) {
+            return gpu_init();
+        }
+    }
+    false
 }
 
 /// Load a kernel category (RESP: GPU.LOAD <name>).
@@ -273,6 +327,8 @@ fn gpu_ensure_kernel(name: &str) -> bool {
 /// gpu_ensure_kernel + GPU_ACCESS.lock() separately (avoids deadlock).
 fn gpu_lock_and_ensure() -> Option<std::sync::MutexGuard<'static, ()>> {
     let guard = GPU_ACCESS.lock().ok()?;
+    // Always ensure CUDA context is set for this thread (fixes error 201 after long builds)
+    ensure_ctx();
     // Kernels already compiled? Just return the lock.
     if KERNELS_COMPILED.load(Ordering::Acquire) { return Some(guard); }
     // First time: compile kernels while holding the lock.
@@ -335,27 +391,67 @@ pub fn gpu_tier_strategy(n: usize, dim: usize) -> ComputeMode {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeMode {
-    /// Full GPU — all distance computation + graph traversal on GPU.
-    /// Fastest. Requires NVIDIA GPU and data fits in VRAM.
+    /// **GPU only.** Vectors, graph and traversal are all resident in VRAM;
+    /// nothing is served from host memory. Requires an NVIDIA GPU and a corpus
+    /// that fits in VRAM. This is the fast path, and it is only selectable when
+    /// the whole working set fits — there is no host fallback within a query.
     Turbo,
-    /// GPU + RAM + CPU — auto-offload when VRAM insufficient.
-    /// Hot data on GPU, warm in RAM, cold on CPU/disk.
-    /// Same pattern as StrikeDB's tiered memory (RAM → NVMe → object store).
+    /// **VUGVA.** The three-tier hybrid from the VUGVA paper: VRAM (T0, hot) →
+    /// system DRAM (T1, warm) → NVMe (T2, cold), with the CPU confined to the
+    /// control plane. Promotion and demotion move through the DMA engine, so
+    /// the CPU writes descriptors rather than copying tensor data.
+    ///
+    /// This is what makes a larger-than-VRAM corpus work without a performance
+    /// cliff, which is the property neither Qdrant nor Milvus has. It is *not*
+    /// "GPU plus some CPU offload" — the CPU never touches data-plane traffic.
     Hybrid,
-    /// Pure CPU — no GPU available or user explicitly disabled GPU.
+    /// **CPU only.** No GPU work at all, even when a GPU is present and
+    /// initialised. Selected when there is no device, or set explicitly to get
+    /// a clean CPU baseline.
     CpuOnly,
 }
 
-static COMPUTE_MODE: Mutex<ComputeMode> = Mutex::new(ComputeMode::CpuOnly);
+/// `None` until the first read or an explicit `gpu_set_mode`, so the default
+/// can be resolved from the environment exactly once.
+static COMPUTE_MODE: Mutex<Option<ComputeMode>> = Mutex::new(None);
+
+/// The compute mode named by `DBSTRIKE_GPU`, if it names a valid one.
+///
+/// Without this the default is `CpuOnly` and the only way to reach the GPU is
+/// the `GPU.MODE` RESP command — so every harness that does not speak RESP
+/// first (the benchmarks, the in-process ingest profilers) measured the CPU
+/// path while appearing to exercise the GPU one. That is why the GPU build
+/// below had no benchmark covering it. Taking the default from the environment
+/// makes the GPU path reachable by anything that can set a variable.
+fn mode_from_env() -> Option<ComputeMode> {
+    match std::env::var("DBSTRIKE_GPU")
+        .ok()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "turbo" => Some(ComputeMode::Turbo),
+        "hybrid" => Some(ComputeMode::Hybrid),
+        "cpu" | "cpuonly" | "cpu_only" => Some(ComputeMode::CpuOnly),
+        // Unrecognised values fall through to the built-in default rather than
+        // failing: this selects a performance path, not a correctness one.
+        _ => None,
+    }
+}
 
 /// Get current compute mode.
 pub fn gpu_get_mode() -> ComputeMode {
-    *COMPUTE_MODE.lock().unwrap()
+    let mut slot = COMPUTE_MODE.lock().unwrap();
+    if let Some(m) = *slot {
+        return m;
+    }
+    let initial = mode_from_env().unwrap_or(ComputeMode::CpuOnly);
+    *slot = Some(initial);
+    initial
 }
 
 /// Set compute mode explicitly (RESP: GPU.MODE turbo|hybrid|cpu).
 pub fn gpu_set_mode(mode: ComputeMode) {
-    *COMPUTE_MODE.lock().unwrap() = mode;
+    *COMPUTE_MODE.lock().unwrap() = Some(mode);
     eprintln!("[GPU] Compute mode set to {:?}", mode);
 }
 
@@ -442,14 +538,15 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
         let blocks = (n as u32 + threads - 1) / threads;
         let n_val = n as i32;
         let dim_val = dim as i32;
-        let mut arg0 = d_q as *mut std::ffi::c_void;
-        let mut arg1 = d_v as *mut std::ffi::c_void;
-        let mut arg2 = d_d as *mut std::ffi::c_void;
-        let mut arg3 = n_val as *mut std::ffi::c_void;
-        let mut arg4 = dim_val as *mut std::ffi::c_void;
-        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4];
+        let cosine_params: [*mut std::ffi::c_void; 5] = [
+            &d_q as *const u64 as *mut std::ffi::c_void,
+            &d_v as *const u64 as *mut std::ffi::c_void,
+            &d_d as *const u64 as *mut std::ffi::c_void,
+            &n_val as *const i32 as *mut std::ffi::c_void,
+            &dim_val as *const i32 as *mut std::ffi::c_void,
+        ];
         let r = cuLaunchKernel(func, blocks, 1, 1, threads, 1, 1, 0,
-                      std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+                      std::ptr::null_mut(), cosine_params.as_ptr() as *mut *mut std::ffi::c_void,
                       std::ptr::null_mut());
         if r != 0 {
             let mut err_str: *const i8 = std::ptr::null();
@@ -471,7 +568,7 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
 }
 
 /// Batch INT8 cosine distance: Q queries × N vectors → Q×N distances.
-/// This is the CAGRA distance kernel — Q blocks, one per query.
+/// This is the APGC distance kernel — Q blocks, one per query.
 /// Returns None if GPU unavailable.
 pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize, dim: usize) -> Option<Vec<f32>> {
     let _guard = gpu_lock_and_ensure()?;
@@ -490,23 +587,24 @@ pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize,
         let q_val = q as i32;
         let n_val = n as i32;
         let dim_val = dim as i32;
-        let mut arg0 = d_q as *mut std::ffi::c_void;
-        let mut arg1 = d_v as *mut std::ffi::c_void;
-        let mut arg2 = d_d as *mut std::ffi::c_void;
-        let mut arg3 = q_val as *mut std::ffi::c_void;
-        let mut arg4 = n_val as *mut std::ffi::c_void;
-        let mut arg5 = dim_val as *mut std::ffi::c_void;
-        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
+        let batch_params: [*mut std::ffi::c_void; 6] = [
+            &d_q as *const u64 as *mut std::ffi::c_void,
+            &d_v as *const u64 as *mut std::ffi::c_void,
+            &d_d as *const u64 as *mut std::ffi::c_void,
+            &q_val as *const i32 as *mut std::ffi::c_void,
+            &n_val as *const i32 as *mut std::ffi::c_void,
+            &dim_val as *const i32 as *mut std::ffi::c_void,
+        ];
         // Grid: Q blocks (one per query), Block: 256 threads
         let r = cuLaunchKernel(func, q as u32, 1, 1, threads, 1, 1, 0,
-            std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+            std::ptr::null_mut(), batch_params.as_ptr() as *mut *mut std::ffi::c_void,
             std::ptr::null_mut());
         if r != 0 {
             let mut err_str: *const i8 = std::ptr::null();
             cuGetErrorString(r, &mut err_str);
             let msg = if err_str.is_null() { "unknown".to_string() }
                       else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
-            eprintln!("[GPU] batch_cosine_dist error {}: {}", r, msg);
+            eprintln!("[GPU] cuLaunchKernel error {}: {}", r, msg);
             cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
             return None;
         }
@@ -518,96 +616,553 @@ pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize,
     }
 }
 
-
-/// GPU-accelerated kNN graph construction (CAGRA build kernel).
-/// Uploads all vectors to GPU, then computes batch distances for each
-/// query against the full dataset. Processes Q queries at a time to
-/// stay within VRAM. Returns a flat kNN graph: n × k_init indices.
+/// Batch INT8 cosine distance + GPU-side top-k selection in one call.
+/// Computes Q×N distances on GPU, selects top-k on GPU, and reads back
+/// only Q×k results (no Q×N PCIe readback).
 ///
-/// This is the CAGRA Phase 1 build — 2.2-27x faster than CPU HNSW.
-pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usize) -> Option<Vec<usize>> {
-    let _guard = gpu_lock_and_ensure()?;
-    unsafe { _gpu_build_knn_graph_impl(vectors_i8, n, dim, k_init) }
+/// Returns (indices, distances) each length Q×k.
+/// Uses the fused kernel when available, falls back to two-kernel approach.
+/// Thread count for the top-k kernels. Two hard constraints:
+/// - dynamic smem = threads × k × 8 bytes must fit the 48 KB default limit
+/// - threads × k ≤ 4096 (thread-0 merge buffer inside the kernels)
+/// k ≤ 32 → 128 threads (32 KB smem); k ≤ 64 → 64 threads (32 KB smem).
+fn topk_threads(k: usize) -> u32 {
+    if k <= 32 { 128 } else { 64 }
 }
 
-unsafe fn _gpu_build_knn_graph_impl(vectors_i8: &[i8], n: usize, dim: usize, k_init: usize) -> Option<Vec<usize>> {
-    // Upload all vectors to GPU once
-    let v_bytes = n * dim;
-    let mut d_v = 0u64;
-    if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
-    cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
+/// Hard upper bound for k in the top-k kernels (register array size).
+pub const GPU_TOPK_MAX: usize = 64;
 
-    // Use batch_cosine_dist: Q queries × N vectors per kernel launch.
-    // batch_cosine_dist: Q queries × N vectors, output = Q×N×4 bytes.
-    // Q=32 → output = 128MB. Safe VRAM, fast readback.
-    let func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
-    let batch_q = 32.min(n);
-    let mut knn_flat: Vec<usize> = vec![0usize; n * k_init];
-    let mut d_d = 0u64;
-    if cuMemAlloc_v2(&mut d_d, batch_q * n * 4) != 0 {
-        cuMemFree_v2(d_v); return None;
-    }
-    let mut d_q = 0u64;
-    if cuMemAlloc_v2(&mut d_q, batch_q * dim) != 0 {
-        cuMemFree_v2(d_v); cuMemFree_v2(d_d); return None;
-    }
-    let threads = 256u32;
+pub fn gpu_batch_cosine_dist_topk(
+    queries: &[i8], vectors: &[i8], q: usize, n: usize, dim: usize, k: usize,
+) -> Option<(Vec<i32>, Vec<f32>)> {
+    if k > GPU_TOPK_MAX { return None; }
+    let _guard = gpu_lock_and_ensure()?;
+    unsafe {
+        let q_bytes = q * dim;
+        let v_bytes = vectors.len();
+        let out_bytes = q * k * 4; // indices + distances
 
-    eprintln!("[GPU] Building kNN graph: {n} vecs, dim={dim}, k={k_init}, batch={batch_q}");
-    let t_total = std::time::Instant::now();
-    let mut t_kernel = std::time::Duration::ZERO;
-    let mut t_cpu = std::time::Duration::ZERO;
+        let mut d_q = 0u64;
+        let mut d_v = 0u64;
+        if cuMemAlloc_v2(&mut d_q, q_bytes) != 0 { return None; }
+        if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { cuMemFree_v2(d_q); return None; }
+        cuMemcpyHtoD_v2(d_q, queries.as_ptr() as *const std::ffi::c_void, q_bytes);
+        cuMemcpyHtoD_v2(d_v, vectors.as_ptr() as *const std::ffi::c_void, v_bytes);
 
-    for batch_start in (0..n).step_by(batch_q) {
-        let batch_end = (batch_start + batch_q).min(n);
-        let q_count = batch_end - batch_start;
+        // smem = threads × k × 8 bytes must fit 48 KB → 128 threads for k≤32,
+        // 64 threads for k≤64 (32 KB either way).
+        let threads = topk_threads(k);
 
-        // CPU: upload query batch (continuous slice, no per-query copy)
-        let t0 = std::time::Instant::now();
-        cuMemcpyHtoD_v2(d_q, vectors_i8[batch_start * dim..batch_end * dim].as_ptr() as *const std::ffi::c_void, q_count * dim);
-        t_cpu += t0.elapsed();
+        // Try fused kernel first (one pass, no Q×N buffer)
+        let fused_func = GPU_STATE.get()?.get_kernel("fused_cosine_topk");
+        if let Some(func) = fused_func {
+            let mut d_out_idx = 0u64;
+            let mut d_out_dist = 0u64;
+            if cuMemAlloc_v2(&mut d_out_idx, out_bytes) != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); return None; }
+            if cuMemAlloc_v2(&mut d_out_dist, out_bytes) != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_out_idx); return None; }
 
-        // GPU: batch_cosine_dist kernel
-        let t1 = std::time::Instant::now();
-        let mut arg0 = d_q as *mut std::ffi::c_void;
-        let mut arg1 = d_v as *mut std::ffi::c_void;
-        let mut arg2 = d_d as *mut std::ffi::c_void;
-        let mut arg3 = q_count as *mut std::ffi::c_void;
-        let mut arg4 = n as *mut std::ffi::c_void;
-        let mut arg5 = dim as *mut std::ffi::c_void;
-        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
-        let r = cuLaunchKernel(func, q_count as u32, 1, 1, threads, 1, 1, 0,
-            std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+            let q_val = q as i32;
+            let n_val = n as i32;
+            let dim_val = dim as i32;
+            let k_val = k as i32;
+            let fused_params: [*mut std::ffi::c_void; 8] = [
+                &d_q as *const u64 as *mut std::ffi::c_void,
+                &d_v as *const u64 as *mut std::ffi::c_void,
+                &d_out_idx as *const u64 as *mut std::ffi::c_void,
+                &d_out_dist as *const u64 as *mut std::ffi::c_void,
+                &q_val as *const i32 as *mut std::ffi::c_void,
+                &n_val as *const i32 as *mut std::ffi::c_void,
+                &dim_val as *const i32 as *mut std::ffi::c_void,
+                &k_val as *const i32 as *mut std::ffi::c_void,
+            ];
+
+            // Shared memory: threads × k × (4 bytes float + 4 bytes int)
+            let smem = (threads as usize * k * 8) as u32;
+
+            let r = cuLaunchKernel(func, q as u32, 1, 1, threads, 1, 1, smem,
+                std::ptr::null_mut(), fused_params.as_ptr() as *mut *mut std::ffi::c_void,
+                std::ptr::null_mut());
+            if r != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_out_idx); cuMemFree_v2(d_out_dist); return None; }
+            cuCtxSynchronize();
+
+            let mut indices = vec![0i32; q * k];
+            let mut distances = vec![0.0f32; q * k];
+            cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, d_out_idx, out_bytes);
+            cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, d_out_dist, out_bytes);
+            cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_out_idx); cuMemFree_v2(d_out_dist);
+            return Some((indices, distances));
+        }
+
+        // Fallback: batch_cosine_dist + topk_select (two-kernel approach)
+        let dist_func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
+        let topk_func = GPU_STATE.get()?.get_kernel("topk_select")?;
+
+        let dist_bytes = q * n * 4;
+        let mut d_d = 0u64;
+        let mut d_out_idx = 0u64;
+        let mut d_out_dist = 0u64;
+        if cuMemAlloc_v2(&mut d_d, dist_bytes) != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); return None; }
+        if cuMemAlloc_v2(&mut d_out_idx, out_bytes) != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d); return None; }
+        if cuMemAlloc_v2(&mut d_out_dist, out_bytes) != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d); cuMemFree_v2(d_out_idx); return None; }
+
+        // Step 1: batch_cosine_dist
+        let q_val = q as i32;
+        let n_val = n as i32;
+        let dim_val = dim as i32;
+        let dist_params: [*mut std::ffi::c_void; 6] = [
+            &d_q as *const u64 as *mut std::ffi::c_void,
+            &d_v as *const u64 as *mut std::ffi::c_void,
+            &d_d as *const u64 as *mut std::ffi::c_void,
+            &q_val as *const i32 as *mut std::ffi::c_void,
+            &n_val as *const i32 as *mut std::ffi::c_void,
+            &dim_val as *const i32 as *mut std::ffi::c_void,
+        ];
+        let r = cuLaunchKernel(dist_func, q as u32, 1, 1, threads, 1, 1, 0,
+            std::ptr::null_mut(), dist_params.as_ptr() as *mut *mut std::ffi::c_void,
             std::ptr::null_mut());
-        if r != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d); return None; }
-        cuCtxSynchronize();
-        t_kernel += t1.elapsed();
+        if r != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d); cuMemFree_v2(d_out_idx); cuMemFree_v2(d_out_dist); return None; }
 
-        // CPU: read Q×N distances, find top-k per query
-        let mut dists = vec![0.0f32; q_count * n];
-        cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, q_count * n * 4);
-        for qi in 0..q_count {
-            let global_q = batch_start + qi;
-            let row = &dists[qi * n..(qi + 1) * n];
-            let mut candidates: Vec<(f32, usize)> = row.iter().enumerate()
-                .filter(|&(i, _)| i != global_q)
-                .map(|(i, &d)| (d, i)).collect();
-            candidates.select_nth_unstable_by(k_init, |a, b| a.0.partial_cmp(&b.0).unwrap());
-            candidates.truncate(k_init);
-            let base = global_q * k_init;
-            for (j, (_, idx)) in candidates.into_iter().enumerate().take(k_init) {
-                knn_flat[base + j] = idx;
+        // Step 2: topk_select (reads d_d, writes d_out_idx + d_out_dist)
+        let k_val = k as i32;
+        let topk_params: [*mut std::ffi::c_void; 6] = [
+            &d_d as *const u64 as *mut std::ffi::c_void,
+            &d_out_idx as *const u64 as *mut std::ffi::c_void,
+            &d_out_dist as *const u64 as *mut std::ffi::c_void,
+            &q_val as *const i32 as *mut std::ffi::c_void,
+            &n_val as *const i32 as *mut std::ffi::c_void,
+            &k_val as *const i32 as *mut std::ffi::c_void,
+        ];
+        let smem = (threads as usize * k * 8) as u32;
+        cuLaunchKernel(topk_func, q as u32, 1, 1, threads, 1, 1, smem,
+            std::ptr::null_mut(), topk_params.as_ptr() as *mut *mut std::ffi::c_void,
+            std::ptr::null_mut());
+        cuCtxSynchronize();
+
+        // Read back only Q×k results (tiny: 8 KB vs 128 MB for Q×N)
+        let mut indices = vec![0i32; q * k];
+        let mut distances = vec![0.0f32; q * k];
+        cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, d_out_idx, out_bytes);
+        cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, d_out_dist, out_bytes);
+        cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d); cuMemFree_v2(d_out_idx); cuMemFree_v2(d_out_dist);
+        Some((indices, distances))
+    }
+}
+
+
+// ── Persistent GPU build buffers (eliminate per-call alloc/free) ────────
+
+/// Pre-allocated GPU buffers for the APGC build pipeline.
+/// Created once, reused across ALL seed + non-seed batches.
+/// This eliminates the O(batches) alloc/copy/launch/sync/free overhead.
+struct GpuBuildBuffers {
+    d_queries: u64,
+    d_vectors: u64,
+    d_out_idx: u64,
+    d_out_dist: u64,
+    max_q: usize,
+    max_n: usize,
+    dim: usize,
+    k: usize,
+    fused_func: *mut std::ffi::c_void,
+}
+
+impl GpuBuildBuffers {
+    unsafe fn new(max_q: usize, max_n: usize, dim: usize, k: usize) -> Option<Self> {
+        let q_cap = max_q * dim;
+        let v_cap = max_n * dim;
+        let out_cap = max_q * k * 4;
+        let mut d_q = 0u64; let mut d_v = 0u64;
+        let mut d_oi = 0u64; let mut d_od = 0u64;
+        if cuMemAlloc_v2(&mut d_q, q_cap) != 0 { return None; }
+        if cuMemAlloc_v2(&mut d_v, v_cap) != 0 { cuMemFree_v2(d_q); return None; }
+        if cuMemAlloc_v2(&mut d_oi, out_cap) != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); return None; }
+        if cuMemAlloc_v2(&mut d_od, out_cap) != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_oi); return None; }
+        let fused = GPU_STATE.get().and_then(|s| s.get_kernel("fused_cosine_topk")).unwrap_or(std::ptr::null_mut());
+        Some(Self { d_queries: d_q, d_vectors: d_v, d_out_idx: d_oi, d_out_dist: d_od, max_q, max_n, dim, k, fused_func: fused })
+    }
+
+    /// Run fused top-k with pre-allocated buffers. NO alloc/free per call.
+    /// Only upload queries (vectors cached), launch, readback.
+    unsafe fn run(&self, queries: &[i8], q: usize, n: usize) -> Option<(Vec<i32>, Vec<f32>)> {
+        if q > self.max_q || n > self.max_n { return None; }
+        let q_bytes = q * self.dim;
+        let out_bytes = q * self.k * 4;
+        cuMemcpyHtoD_v2(self.d_queries, queries.as_ptr() as *const std::ffi::c_void, q_bytes);
+        // Vectors already in d_vectors (pre-loaded once)
+        let q_val = q as i32; let n_val = n as i32; let dim_val = self.dim as i32; let k_val = self.k as i32;
+        let build_params: [*mut std::ffi::c_void; 8] = [
+            &self.d_queries as *const u64 as *mut std::ffi::c_void,
+            &self.d_vectors as *const u64 as *mut std::ffi::c_void,
+            &self.d_out_idx as *const u64 as *mut std::ffi::c_void,
+            &self.d_out_dist as *const u64 as *mut std::ffi::c_void,
+            &q_val as *const i32 as *mut std::ffi::c_void,
+            &n_val as *const i32 as *mut std::ffi::c_void,
+            &dim_val as *const i32 as *mut std::ffi::c_void,
+            &k_val as *const i32 as *mut std::ffi::c_void,
+        ];
+        let threads = topk_threads(self.k);
+        let smem = (threads as usize * self.k * 8) as u32;
+        let r = cuLaunchKernel(self.fused_func, q as u32, 1, 1, threads, 1, 1, smem,
+            std::ptr::null_mut(), build_params.as_ptr() as *mut *mut std::ffi::c_void,
+            std::ptr::null_mut());
+        if r != 0 { return None; }
+        cuCtxSynchronize();
+        let mut indices = vec![0i32; q * self.k];
+        let mut distances = vec![0.0f32; q * self.k];
+        cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, self.d_out_idx, out_bytes);
+        cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, self.d_out_dist, out_bytes);
+        Some((indices, distances))
+    }
+
+    unsafe fn free(&self) {
+        cuMemFree_v2(self.d_queries);
+        cuMemFree_v2(self.d_vectors);
+        cuMemFree_v2(self.d_out_idx);
+        cuMemFree_v2(self.d_out_dist);
+    }
+}
+
+/// APGC Paper Algorithm 1: GPU-side kNN construction with persistent buffers.
+/// Allocates GPU buffers ONCE, reuses for all batches.
+pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usize) -> Option<Vec<usize>> {
+    let _guard = gpu_lock_and_ensure()?;
+    unsafe {
+        let t_total = std::time::Instant::now();
+        let k = k_init;
+        // Pivot count is CAPPED. The old code used n/50 pivots and scanned the
+        // FULL corpus once per pivot — O(n²/50) work that took 160s at 1M.
+        // A capped pivot set makes the seeding phase O(n·s) with a tiny,
+        // L2-resident corpus, and NN-descent (below) recovers graph quality.
+        let seed_count = (n / 50).max(64).min(n).min(2048);
+        let seed_step = n / seed_count.max(1);
+        eprintln!("[GPU] APGC: n={n}, dim={dim}, k={k}, pivots={seed_count}");
+
+        // Allocate persistent GPU buffers once
+        // Prefer ONE launch covering the whole corpus over a batched loop.
+        //
+        // Each batch costs a `cuCtxSynchronize` plus two `cuMemcpyDtoH`
+        // (`GpuBuildBuffers::run`), and the CPU then sorts that batch's
+        // candidates before the next launch is issued. That drains the device
+        // and refills it once per batch, with the GPU idle across the whole
+        // host-side stretch — which is what shows up as 2-5% utilization during
+        // a build.
+        //
+        // Nothing forces the split: the kernel's grid is one block per query,
+        // so a single launch with `q = n` does the same work with one sync and
+        // one readback. The only real constraint is VRAM for the query and
+        // output buffers, so try the whole corpus and fall back to the batched
+        // path when it does not fit (which keeps large-corpus builds working on
+        // small cards rather than failing outright).
+        //
+        // Cost of the full-size buffers: n·dim for queries plus 8·n·k for the
+        // two output arrays — at 1M×384d with k=32 that is 384 MB + 256 MB.
+        let full_bytes = n * dim + n * k * 8 + n.max(seed_count) * dim;
+        let (_, _, vram_free) = gpu_check_capacity(0, 0);
+        // Two thirds, not all: the refine phase below allocates its own graph
+        // buffers, and a build that fits by a hair here would fail there.
+        let one_shot = full_bytes.saturating_mul(3) / 2 < vram_free;
+
+        let (max_batch_q, bufs) = match one_shot
+            .then(|| GpuBuildBuffers::new(n, n.max(seed_count), dim, k))
+            .flatten()
+        {
+            Some(b) => {
+                eprintln!("[GPU] APGC: single-launch seeding ({n} queries, {} MB buffers)",
+                          full_bytes >> 20);
+                (n, b)
+            }
+            None => {
+                let batch = 8192usize.min(n);
+                eprintln!("[GPU] APGC: batched seeding ({batch}/launch) — \
+                           {} MB single-launch buffers exceed {} MB free VRAM",
+                          full_bytes >> 20, vram_free >> 20);
+                (batch, GpuBuildBuffers::new(batch, n.max(seed_count), dim, k)?)
+            }
+        };
+
+        let mut graph: Vec<Vec<i32>> = vec![Vec::new(); n];
+
+        // ═══ Phase 1: every node finds its nearest pivots ═══
+        // Corpus = the pivot set only (seed_count × dim bytes — a few MB, so it
+        // stays resident in L2 and the kernel runs compute-bound instead of
+        // streaming 384 MB per query block like the old full-corpus scan did).
+        let mut seed_buf = vec![0i8; seed_count * dim];
+        for si in 0..seed_count {
+            let sid = (si * seed_step).min(n - 1);
+            seed_buf[si * dim..(si + 1) * dim].copy_from_slice(&vectors_i8[sid * dim..(sid + 1) * dim]);
+        }
+        cuMemcpyHtoD_v2(bufs.d_vectors, seed_buf.as_ptr() as *const std::ffi::c_void, seed_count * dim);
+
+        // Cluster assignment per node: (nearest pivot, 2nd nearest, distance).
+        // The 2nd pivot subdivides each Voronoi cell for free — see Phase 2.
+        let mut assign: Vec<(i32, i32, f32)> = vec![(0, 0, 0.0); n];
+
+        let t_add = std::time::Instant::now();
+        for as_start in (0..n).step_by(max_batch_q) {
+            let as_end = (as_start + max_batch_q).min(n);
+            let q_count = as_end - as_start;
+            // The query block *is* a contiguous slice of the corpus: `vid` runs
+            // `as_start..as_end` consecutively, so the old per-batch `q_buf`
+            // copied `vectors_i8` onto itself — a fresh allocation plus a
+            // ~3 MB memcpy per batch (8192 × 384 B), sitting on the critical
+            // path between two kernel launches where it keeps the device idle.
+            let q_buf = &vectors_i8[as_start * dim..as_end * dim];
+            if let Some((indices, distances)) = bufs.run(q_buf, q_count, seed_count) {
+                for qi in 0..q_count {
+                    let vid = as_start + qi;
+                    let mut cands: Vec<(f32, i32, i32)> = (0..k).filter_map(|j| {
+                        let li = indices[qi * k + j];
+                        if li < 0 { return None; }
+                        let gid = (li as usize * seed_step).min(n - 1) as i32;
+                        if gid as usize == vid { return None; }
+                        Some((distances[qi * k + j], gid, li))
+                    }).collect();
+                    cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    if let Some(&(d0, _, li0)) = cands.first() {
+                        let li1 = cands.get(1).map(|&(_, _, l)| l).unwrap_or(li0);
+                        assign[vid] = (li0, li1, d0);
+                    }
+                    graph[vid] = cands.into_iter().take(k).map(|(_, g, _)| g).collect();
+                }
             }
         }
-    }
+        eprintln!("[GPU] APGC pivot assign: {n} nodes vs {seed_count} pivots in {:.1}s", t_add.elapsed().as_secs_f64());
 
-    let total = t_total.elapsed();
-    eprintln!("[GPU] kNN done: {n}×{dim}, k={k_init} in {:.1}s (kernel={:.1}s cpu={:.1}s)",
-        total.as_secs_f64(), t_kernel.as_secs_f64(), t_cpu.as_secs_f64());
-    cuMemFree_v2(d_v);
-    cuMemFree_v2(d_q);
-    cuMemFree_v2(d_d);
-    Some(knn_flat)
+        // ═══ Phase 2: locality ordering → non-degenerate init graph ═══
+        // Pointing every node at its nearest pivots makes a hub-spoke star:
+        // pivots have enormous in-degree (capped away by rev_cap) and ordinary
+        // nodes have ZERO in-degree, so NN-descent's reverse join has nothing
+        // to work with and convergence stalls (0.918 recall at 1M).
+        //
+        // Instead sort nodes by (cluster, sub-cluster, distance-to-pivot) and
+        // wire each node to its neighbours in that order. Every node then has
+        // in-degree ≈ k, all edges stay inside a small cell, and the graph is
+        // symmetric — exactly the regime NN-descent converges from. Costs one
+        // sort, zero distance computations.
+        //
+        // The second-nearest pivot is the sub-cluster key: it splits each
+        // Voronoi cell along its boundaries with neighbouring cells, for free.
+        // Without it a 1M corpus with 2048 pivots gives 488-node cells — far
+        // too loose to seed from (recall stalls at 0.962). With it the cells
+        // fall to a few dozen nodes, matching the density that yields 0.998 at
+        // 100k.
+        let t_tr = std::time::Instant::now();
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_unstable_by(|&a, &b| {
+            let (pa, qa, da) = assign[a as usize];
+            let (pb, qb, db) = assign[b as usize];
+            pa.cmp(&pb).then(qa.cmp(&qb))
+                .then(da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let mut pos = vec![0u32; n];
+        for (i, &v) in order.iter().enumerate() { pos[v as usize] = i as u32; }
+
+        // Keep a few pivot edges for long-range connectivity, fill the rest
+        // from the ordering. Duplicates are harmless: the NN-descent kernel
+        // deduplicates candidates through its shared-memory hash set.
+        const KEEP_PIVOTS: usize = 4;
+        let half = ((k - KEEP_PIVOTS) / 2).max(1) as isize;
+        let order_ref: &Vec<u32> = &order;
+        let pos_ref: &Vec<u32> = &pos;
+        let nthreads0 = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(8);
+        let chunk0 = (n + nthreads0 - 1) / nthreads0.max(1);
+        let all_ids: Vec<usize> = (0..n).collect();
+        let init_lists: Vec<(usize, Vec<i32>)> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for c in all_ids.chunks(chunk0.max(1)) {
+                let graph_ref = &graph;
+                handles.push(scope.spawn(move || {
+                    let mut out = Vec::with_capacity(c.len());
+                    for &v in c {
+                        let mut list: Vec<i32> = Vec::with_capacity(k);
+                        for &g in graph_ref[v].iter().take(KEEP_PIVOTS) { list.push(g); }
+                        let p = pos_ref[v] as isize;
+                        for off in 1..=half {
+                            for s in [-1isize, 1isize] {
+                                if list.len() >= k { break; }
+                                let q = p + s * off;
+                                if q >= 0 && (q as usize) < n {
+                                    let u = order_ref[q as usize] as i32;
+                                    if u != v as i32 { list.push(u); }
+                                }
+                            }
+                        }
+                        list.truncate(k);
+                        out.push((v, list));
+                    }
+                    out
+                }));
+            }
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        for (v, list) in init_lists { graph[v] = list; }
+        drop(order); drop(pos); drop(assign);
+        eprintln!("[GPU] APGC locality order: {n} nodes in {:.2}s", t_tr.elapsed().as_secs_f64());
+
+        // ═══ Phase 3: NN-descent refinement (fixes hub-spoke topology) ═══
+        // After Phase 2 every non-seed is connected ONLY to seeds, so the
+        // level-0 graph is a hub-spoke star — HNSW search over it collapses
+        // (~0.67 recall@10). Refine: each node expands candidates through its
+        // current neighbors' adjacency lists and keeps the exact int8 top-k.
+        // Two passes: pass 1 pulls in seeds' true kNN (Phase 1 edges), pass 2
+        // propagates neighbor-of-neighbor edges → a proper local kNN graph.
+        let t_ref = std::time::Instant::now();
+        let nthreads = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(8);
+        // True NN-Descent (APGC paper §3.2): candidates come from BOTH forward
+        // neighbors' lists AND reverse neighbors' lists. Forward-only expansion
+        // converges too slowly at 100k+ (recall stalls ~0.82); reverse edges
+        // let true neighbors "find each other" from either side.
+        // Pivot init is intentionally weak (it is nearly free); convergence is
+        // NN-descent's job. On GPU each pass costs milliseconds, so run enough
+        // of them to actually converge. Override with GPU_ND_PASSES.
+        let passes: usize = std::env::var("GPU_ND_PASSES").ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if n <= 50_000 { 8 } else { 12 });
+
+        // ── GPU NN-descent: whole refinement on-device (nn_rev + nn_descent
+        // kernels, double-buffered graph). Falls back to the CPU loop below
+        // on any allocation/launch failure.
+        let gpu_refined = (|| {
+            let rev_cap = 16usize;
+            let state = GPU_STATE.get()?;
+            let rev_func = state.get_kernel("nn_rev")?;
+            let nd_func = state.get_kernel("nn_descent")?;
+            // d_vectors currently holds the Phase-2 seed buffer — restore corpus.
+            if cuMemcpyHtoD_v2(bufs.d_vectors, vectors_i8.as_ptr() as *const std::ffi::c_void, n * dim) != 0 { return None; }
+            let g_bytes = n * k * 4;
+            let mut d_g_in = 0u64; let mut d_g_out = 0u64; let mut d_rev = 0u64; let mut d_rev_cnt = 0u64;
+            if cuMemAlloc_v2(&mut d_g_in, g_bytes) != 0 { return None; }
+            if cuMemAlloc_v2(&mut d_g_out, g_bytes) != 0 { cuMemFree_v2(d_g_in); return None; }
+            if cuMemAlloc_v2(&mut d_rev, n * rev_cap * 4) != 0 { cuMemFree_v2(d_g_in); cuMemFree_v2(d_g_out); return None; }
+            if cuMemAlloc_v2(&mut d_rev_cnt, n * 4) != 0 { cuMemFree_v2(d_g_in); cuMemFree_v2(d_g_out); cuMemFree_v2(d_rev); return None; }
+            let mut flat = vec![-1i32; n * k];
+            for v in 0..n { for (j, &e) in graph[v].iter().take(k).enumerate() { flat[v * k + j] = e; } }
+            cuMemcpyHtoD_v2(d_g_in, flat.as_ptr() as *const std::ffi::c_void, g_bytes);
+            let n_i = n as i32; let d_i = dim as i32; let k_i = k as i32; let rc_i = rev_cap as i32;
+            let mut cur_in = d_g_in; let mut cur_out = d_g_out;
+            let mut ok = true;
+            for _pass in 0..passes {
+                // 32 own + 16 reverse + 10×32 forward-join + 10×32 reverse-join
+                // = 688 candidates, under the kernel's 1024 cap.
+                let expand: i32 = 10;
+                cuMemsetD32_v2(d_rev_cnt, 0, n);
+                let rev_params: [*mut std::ffi::c_void; 6] = [
+                    &cur_in as *const u64 as *mut std::ffi::c_void,
+                    &d_rev as *const u64 as *mut std::ffi::c_void,
+                    &d_rev_cnt as *const u64 as *mut std::ffi::c_void,
+                    &n_i as *const i32 as *mut std::ffi::c_void,
+                    &k_i as *const i32 as *mut std::ffi::c_void,
+                    &rc_i as *const i32 as *mut std::ffi::c_void,
+                ];
+                let grid_rev = ((n + 255) / 256) as u32;
+                if cuLaunchKernel(rev_func, grid_rev, 1, 1, 256, 1, 1, 0,
+                    std::ptr::null_mut(), rev_params.as_ptr() as *mut *mut std::ffi::c_void,
+                    std::ptr::null_mut()) != 0 { ok = false; break; }
+                let nd_params: [*mut std::ffi::c_void; 10] = [
+                    &bufs.d_vectors as *const u64 as *mut std::ffi::c_void,
+                    &cur_in as *const u64 as *mut std::ffi::c_void,
+                    &d_rev as *const u64 as *mut std::ffi::c_void,
+                    &d_rev_cnt as *const u64 as *mut std::ffi::c_void,
+                    &cur_out as *const u64 as *mut std::ffi::c_void,
+                    &n_i as *const i32 as *mut std::ffi::c_void,
+                    &d_i as *const i32 as *mut std::ffi::c_void,
+                    &k_i as *const i32 as *mut std::ffi::c_void,
+                    &expand as *const i32 as *mut std::ffi::c_void,
+                    &rc_i as *const i32 as *mut std::ffi::c_void,
+                ];
+                if cuLaunchKernel(nd_func, n as u32, 1, 1, 128, 1, 1, 0,
+                    std::ptr::null_mut(), nd_params.as_ptr() as *mut *mut std::ffi::c_void,
+                    std::ptr::null_mut()) != 0 { ok = false; break; }
+                std::mem::swap(&mut cur_in, &mut cur_out);
+            }
+            if cuCtxSynchronize() != 0 { ok = false; }
+            if ok {
+                cuMemcpyDtoH_v2(flat.as_mut_ptr() as *mut std::ffi::c_void, cur_in, g_bytes);
+            }
+            cuMemFree_v2(d_g_in); cuMemFree_v2(d_g_out); cuMemFree_v2(d_rev); cuMemFree_v2(d_rev_cnt);
+            if !ok { return None; }
+            for v in 0..n {
+                graph[v] = flat[v * k..(v + 1) * k].iter().copied().filter(|&e| e >= 0).collect();
+            }
+            Some(())
+        })().is_some();
+        if gpu_refined {
+            eprintln!("[GPU] APGC refine: {passes} NN-descent passes ON GPU over {n} nodes in {:.1}s", t_ref.elapsed().as_secs_f64());
+        } else {
+        for pass in 0..passes {
+            // Expand through the closest `expand` neighbors' edge lists.
+            let expand = if pass == 0 { 4 } else { 10 };
+            // Reverse adjacency (capped per node): who points at v?
+            let rev_cap = 16usize;
+            let mut rev: Vec<Vec<i32>> = vec![Vec::new(); n];
+            for v in 0..n {
+                for &nb in &graph[v] {
+                    let nu = nb as usize;
+                    if nu < n && rev[nu].len() < rev_cap { rev[nu].push(v as i32); }
+                }
+            }
+            let rev_ref: &Vec<Vec<i32>> = &rev;
+            let prev: &Vec<Vec<i32>> = &graph;
+            let _ = pass;
+            let ids: Vec<usize> = (0..n).collect();
+            let chunk = (ids.len() + nthreads - 1) / nthreads.max(1);
+            let refined: Vec<(usize, Vec<i32>)> = std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for c in ids.chunks(chunk.max(1)) {
+                    handles.push(scope.spawn(move || {
+                        let mut out = Vec::with_capacity(c.len());
+                        let mut cand: Vec<i32> = Vec::with_capacity(k * (expand + 2));
+                        for &v in c {
+                            cand.clear();
+                            cand.extend_from_slice(&prev[v]);
+                            cand.extend_from_slice(&rev_ref[v]);
+                            for &nb in prev[v].iter().take(expand) {
+                                let nu = nb as usize;
+                                if nu < n { cand.extend_from_slice(&prev[nu]); }
+                            }
+                            // Reverse neighbors' forward lists — the NN-descent
+                            // "general join": v and its reverse neighbor share
+                            // candidates in both directions.
+                            for &rb in rev_ref[v].iter().take(expand) {
+                                let ru = rb as usize;
+                                if ru < n { cand.extend_from_slice(&prev[ru]); }
+                            }
+                            cand.sort_unstable();
+                            cand.dedup();
+                            let vb = &vectors_i8[v * dim..(v + 1) * dim];
+                            let mut scored: Vec<(i64, i32)> = Vec::with_capacity(cand.len());
+                            for &cid in &cand {
+                                let cu = cid as usize;
+                                if cu >= n || cu == v { continue; }
+                                let cb = &vectors_i8[cu * dim..(cu + 1) * dim];
+                                let mut dot: i32 = 0;
+                                for d in 0..dim { dot += vb[d] as i32 * cb[d] as i32; }
+                                scored.push((-(dot as i64), cid)); // ascending = best first
+                            }
+                            scored.sort_unstable();
+                            scored.dedup_by_key(|s| s.1);
+                            scored.truncate(k);
+                            out.push((v, scored.into_iter().map(|(_, id)| id).collect()));
+                        }
+                        out
+                    }));
+                }
+                handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            });
+            for (v, edges) in refined { graph[v] = edges; }
+        }
+        eprintln!("[GPU] APGC refine: {passes} NN-descent passes over {n} nodes in {:.1}s", t_ref.elapsed().as_secs_f64());
+        }
+
+        // Output flat CSR
+        let mut result = vec![0usize; n * k];
+        for i in 0..n { for j in 0..k.min(graph[i].len()) { result[i * k + j] = graph[i][j] as usize; } }
+
+        bufs.free();
+        eprintln!("[GPU] APGC build: {n}×{dim}, k={k} in {:.1}s", t_total.elapsed().as_secs_f64());
+        Some(result)
+    }
 }
 
 /// INT8 matmul on GPU. Auto-loads kernel if needed.
@@ -626,15 +1181,16 @@ pub fn gpu_matmul(a: &[i8], b: &[i8], m: usize, k: usize, n: usize) -> Option<Ve
         let m_val = m as i32;
         let n_val = n as i32;
         let k_val = k as i32;
-        let mut arg0 = d_a as *mut std::ffi::c_void;
-        let mut arg1 = d_b as *mut std::ffi::c_void;
-        let mut arg2 = d_c as *mut std::ffi::c_void;
-        let mut arg3 = m_val as *mut std::ffi::c_void;
-        let mut arg4 = n_val as *mut std::ffi::c_void;
-        let mut arg5 = k_val as *mut std::ffi::c_void;
-        let mut args = [&mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4, &mut arg5];
+        let matmul_params: [*mut std::ffi::c_void; 6] = [
+            &d_a as *const u64 as *mut std::ffi::c_void,
+            &d_b as *const u64 as *mut std::ffi::c_void,
+            &d_c as *const u64 as *mut std::ffi::c_void,
+            &m_val as *const i32 as *mut std::ffi::c_void,
+            &n_val as *const i32 as *mut std::ffi::c_void,
+            &k_val as *const i32 as *mut std::ffi::c_void,
+        ];
         cuLaunchKernel(func, bx, by, 1, threads, threads, 1, 0,
-                      std::ptr::null_mut(), args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+                      std::ptr::null_mut(), matmul_params.as_ptr() as *mut *mut std::ffi::c_void,
                       std::ptr::null_mut());
         cuCtxSynchronize();
         let mut c = vec![0i32; m * n];
@@ -656,7 +1212,7 @@ pub fn gpu_unload() {
     }
 }
 
-// ── GPU-resident index for CAGRA-style search ────────────────────────────
+// ── GPU-resident index for APGC-style search ────────────────────────────
 // Vectors + graph live on GPU. Repeated searches avoid re-upload.
 
 /// GPU-resident index. Holds device pointers for vectors and graph.
@@ -664,6 +1220,7 @@ pub fn gpu_unload() {
 pub struct GpuIndex {
     pub d_vectors: u64,
     pub d_graph: u64,
+    pub d_delta: u64,
     pub n: usize,
     pub dim: usize,
     pub degree: usize,
@@ -672,6 +1229,273 @@ pub struct GpuIndex {
     pub d_query_buf: u64,
     pub d_idx_buf: u64,
     pub d_dist_buf: u64,
+    /// Dedicated Q×k top-k *output* distances. MUST be distinct from
+    /// d_dist_buf: the two-kernel path reads the full Q×N matrix from
+    /// d_dist_buf while writing top-k results — aliasing them corrupts
+    /// row 0 of the matrix across blocks (was a zero-recall source).
+    pub d_odist_buf: u64,
+    /// Exact f32 corpus (n × dim × 4 B) for the kernel's fused rerank phase.
+    /// 0 = absent, in which case the kernel emits the int8 ranking and the
+    /// host reranks. Only populated when it fits free VRAM with headroom —
+    /// 1.5 GB at 1M×384d, 3 GB at 768d, 6 GB at 1536d.
+    pub d_vec_f32: u64,
+    /// f32 query staging for the batched (locked) path, max_q × dim × 4 B.
+    pub d_qf_buf: u64,
+    /// Max queries per gpu_search call (persistent buffer capacity).
+    pub max_q: usize,
+    /// Max k per gpu_search call (persistent buffer capacity).
+    pub max_k: usize,
+    /// Concurrent single-query search slots: per-slot buffers + CUDA stream.
+    /// Lets N threads run graph searches simultaneously WITHOUT the global
+    /// GPU mutex — kernels overlap on the GPU via independent streams.
+    pub slots: Vec<SearchSlot>,
+    /// Bitmask of busy slots (bit i = slot i claimed).
+    pub slot_mask: std::sync::atomic::AtomicU32,
+    /// Group-commit batcher that fuses concurrent single-query searches into
+    /// one wide launch. See [`QueryCoalescer`] — this is what keeps the SMs
+    /// and the clock governor busy.
+    pub coalescer: QueryCoalescer,
+}
+
+// ── Query coalescing (group commit for the GPU) ──────────────────────────────
+//
+// WHY THIS EXISTS — measured on an RTX 4060 (24 SMs, 3135 MHz max SM clock),
+// 100k×384d, 16 host threads each issuing single-vector searches:
+//
+//     GPU utilization   12–21 %
+//     SM clock          210 MHz   (6.7 % of max)
+//     QPS               ~27,000
+//
+// Two compounding faults, both from launching one query at a time:
+//
+//   1. `cuLaunchKernel(func, 1, 1, 1, ...)` — gridDim of ONE. The APGC search
+//      kernel is one block per query, so a single query lights up 1 of 24 SMs
+//      and leaves 23 idle. No amount of host threading fixes this, because
+//      each thread still submits its own 1-block grid.
+//
+//   2. Six driver calls per query (2×HtoD, launch, 2×DtoH, sync) and then a
+//      *blocking* `cuStreamSynchronize` under CU_CTX_SCHED_BLOCKING_SYNC — the
+//      thread sleeps and is woken by an interrupt. That is a syscall-class
+//      round trip and a context switch for every single query. This is the
+//      "CPU usage in Turbo mode" that kept showing up in btop: it is not
+//      distance math, it is the host babysitting the driver.
+//
+//   And a third effect that falls out of the first two: with the device idle
+//   between micro-launches, the driver's power governor never leaves its
+//   lowest P-state, so the whole search runs at 210 MHz instead of 3135 MHz.
+//   Between the dead SMs and the parked clock, Turbo was using well under 1 %
+//   of the GPU's real throughput.
+//
+// THE FIX — group commit, the same pattern a WAL uses to amortize fsync.
+// Concurrent callers queue their query and race for a leader role. The winner
+// drains every compatible request into one buffer and issues a SINGLE launch
+// with `gridDim = batch_len`, then hands results back and wakes the followers.
+// One batch of B queries costs 6 driver calls and one sync instead of 6B and
+// B, and it fills B SMs instead of 1.
+//
+// Batching is opportunistic: the leader takes whatever is queued right now and
+// never waits to fill a batch, so a lone query still goes straight through at
+// its original latency. Under load the queue naturally holds ~thread-count
+// requests, which is exactly when the amortization is wanted.
+
+/// One queued single-query request.
+struct CoReq {
+    ticket: u64,
+    q_i8: Vec<i8>,
+    q_f32: Vec<f32>,
+    /// Launch geometry. Only requests agreeing on all four can share a launch,
+    /// since they become one kernel invocation with shared scalar params.
+    k: usize,
+    itopk: usize,
+    iters: usize,
+    entry: usize,
+}
+
+#[derive(Default)]
+struct CoState {
+    pending: Vec<CoReq>,
+    ready: std::collections::HashMap<u64, (Vec<i32>, Vec<f32>)>,
+    next_ticket: u64,
+    /// How many leaders are launching right now. Capped at the slot count,
+    /// NOT at one.
+    ///
+    /// A single-leader design was measured and it LOST: 17,955 QPS against
+    /// 27,330 for the un-batched path. Batching amortized the driver calls but
+    /// serialized every launch behind one leader, throwing away the 32-way
+    /// stream overlap that was the only reason the old path kept any SMs busy
+    /// at all. Concurrency and batch width multiply — you need both.
+    leaders: usize,
+}
+
+/// Group-commit batcher for single-query GPU searches.
+pub struct QueryCoalescer {
+    state: Mutex<CoState>,
+    cv: std::sync::Condvar,
+}
+
+impl Default for QueryCoalescer {
+    fn default() -> Self { Self::new() }
+}
+
+impl QueryCoalescer {
+    pub fn new() -> Self {
+        QueryCoalescer { state: Mutex::new(CoState::default()), cv: std::sync::Condvar::new() }
+    }
+}
+
+/// Is coalescing on? Default yes. `GPU_COALESCE=0` restores the old
+/// one-launch-per-query path so the two can be A/B'd in a single binary.
+fn coalesce_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("GPU_COALESCE").map(|v| v == "0").unwrap_or(false))
+}
+
+/// Max queries fused into one slot launch. Sizes the per-slot device buffers,
+/// so it is fixed at index-upload time.
+///
+/// Total concurrent blocks ≈ `slots × slot_batch`. At the 32/16 defaults that
+/// is up to 512 blocks in flight against 24 SMs — enough to keep every SM fed
+/// and hold the clock governor out of its idle P-state.
+fn slot_batch() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_SLOT_BATCH").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(16).clamp(1, 64)
+    })
+}
+
+/// Submit one query through the coalescer and block until its results land.
+///
+/// Returns `None` only if the underlying batched launch failed, in which case
+/// the caller falls back exactly as it did before.
+fn gpu_search_coalesced(
+    index: &GpuIndex,
+    query_i8: &[i8],
+    query_f32: &[f32],
+    k: usize,
+    itopk: usize,
+    max_iters: usize,
+    entry: usize,
+) -> Option<(Vec<i32>, Vec<f32>)> {
+    let co = &index.coalescer;
+    let mut st = co.state.lock().ok()?;
+    let ticket = st.next_ticket;
+    st.next_ticket = st.next_ticket.wrapping_add(1);
+    st.pending.push(CoReq {
+        ticket,
+        q_i8: query_i8.to_vec(),
+        q_f32: query_f32.to_vec(),
+        k, itopk, iters: max_iters, entry,
+    });
+
+    loop {
+        // Someone else's batch may already have carried my query.
+        if let Some(r) = st.ready.remove(&ticket) { return Some(r); }
+
+        // Wait only when every stream is already launching, or when there is
+        // nothing left to lead (my query is riding in someone's in-flight
+        // batch). Otherwise take a slot and lead one myself.
+        let max_leaders = index.slots.len().max(1);
+        if st.leaders >= max_leaders || st.pending.is_empty() {
+            st = co.cv.wait(st).ok()?;
+            continue;
+        }
+
+        // ── I am a leader. Drain a compatible batch. ──
+        // Geometry is taken from the OLDEST pending request, not from mine, so
+        // that a steady stream of one shape cannot starve an odd one out
+        // forever — the odd request becomes the head once the others drain.
+        let head = st.pending.first()?;
+        let (bk, bitopk, biters, bentry) = (head.k, head.itopk, head.iters, head.entry);
+        let cap = slot_batch().min(index.max_q.max(1));
+
+        let mut batch: Vec<CoReq> = Vec::new();
+        let mut keep: Vec<CoReq> = Vec::new();
+        for r in st.pending.drain(..) {
+            if batch.len() < cap && r.k == bk && r.itopk == bitopk
+                && r.iters == biters && r.entry == bentry
+            {
+                batch.push(r);
+            } else {
+                keep.push(r);
+            }
+        }
+        st.pending = keep;
+
+        // My query is compatible or it isn't. If it isn't, it stayed in
+        // `pending` and I still have to run this batch for the others — then
+        // loop around and lead again for my own shape.
+        let mine_here = batch.iter().any(|r| r.ticket == ticket);
+        if batch.is_empty() {
+            // Cannot happen (I pushed before draining), but never spin on it.
+            return None;
+        }
+
+        let dim = index.dim;
+        let nq = batch.len();
+        let mut qi8: Vec<i8> = Vec::with_capacity(nq * dim);
+        let mut qf32: Vec<f32> = Vec::with_capacity(nq * dim);
+        // The fused rerank is all-or-nothing for a launch: the kernel takes a
+        // single query_f32 base pointer. If any member lacks an exact query,
+        // drop f32 for the whole batch and let the host rerank those results.
+        let all_f32 = batch.iter().all(|r| r.q_f32.len() >= dim);
+        for (i, r) in batch.iter().enumerate() {
+            // Each row must be exactly `dim` wide or every later row shifts.
+            let take = dim.min(r.q_i8.len());
+            qi8.extend_from_slice(&r.q_i8[..take]);
+            qi8.resize((i + 1) * dim, 0);
+            if all_f32 { qf32.extend_from_slice(&r.q_f32[..dim]); }
+        }
+
+        st.leaders += 1;
+        drop(st);
+
+        // GPU work happens with the coalescer lock RELEASED, so other threads
+        // keep queueing — and keep becoming leaders on other streams — while
+        // this batch is in flight.
+        //
+        // Prefer the per-slot stream path: it takes no global GPU mutex, so
+        // several batches overlap on the device. Only if every slot is busy do
+        // we fall back to the globally-locked launch.
+        let res = gpu_search_slot_batch(index, &qi8, &qf32, nq, bk, bitopk, biters, bentry)
+            .or_else(|| gpu_search_batched(index, &qi8, &qf32, nq, bk, bitopk, biters, bentry));
+
+        let mut st2 = co.state.lock().ok()?;
+        st2.leaders -= 1;
+        let mut mine: Option<(Vec<i32>, Vec<f32>)> = None;
+        if let Some((idx_all, dist_all)) = res {
+            for (i, r) in batch.iter().enumerate() {
+                let lo = i * bk;
+                let hi = lo + bk;
+                if hi > idx_all.len() || hi > dist_all.len() { break; }
+                let pair = (idx_all[lo..hi].to_vec(), dist_all[lo..hi].to_vec());
+                if r.ticket == ticket { mine = Some(pair); }
+                else { st2.ready.insert(r.ticket, pair); }
+            }
+        }
+        // On launch failure `ready` gets nothing; every follower wakes, finds
+        // no entry, and re-leads. Their queries were consumed by this batch,
+        // so re-queue them rather than lose them.
+        else {
+            for r in batch { if r.ticket != ticket { st2.pending.push(r); } }
+        }
+        co.cv.notify_all();
+
+        if mine.is_some() { return mine; }
+        if mine_here { return None; } // my query ran but the launch failed
+        st = st2;                     // my shape did not fit; lead again
+    }
+}
+
+/// One concurrent-search slot: private query/output buffers + CUDA stream.
+pub struct SearchSlot {
+    pub d_q: u64,
+    /// f32 copy of the same query, for the kernel's fused rerank phase.
+    pub d_qf: u64,
+    pub d_idx: u64,
+    pub d_odist: u64,
+    pub stream: usize, // CUstream handle (raw pointer as usize)
 }
 
 impl GpuIndex {
@@ -679,142 +1503,661 @@ impl GpuIndex {
         unsafe {
             cuMemFree_v2(self.d_vectors);
             cuMemFree_v2(self.d_graph);
+            if self.d_delta != 0 { cuMemFree_v2(self.d_delta); }
             if self.d_query_buf != 0 { cuMemFree_v2(self.d_query_buf); }
             if self.d_idx_buf != 0 { cuMemFree_v2(self.d_idx_buf); }
             if self.d_dist_buf != 0 { cuMemFree_v2(self.d_dist_buf); }
+            if self.d_odist_buf != 0 { cuMemFree_v2(self.d_odist_buf); }
+            if self.d_vec_f32 != 0 { cuMemFree_v2(self.d_vec_f32); }
+            if self.d_qf_buf != 0 { cuMemFree_v2(self.d_qf_buf); }
+            for s in &self.slots {
+                if s.d_q != 0 { cuMemFree_v2(s.d_q); }
+                if s.d_qf != 0 { cuMemFree_v2(s.d_qf); }
+                if s.d_idx != 0 { cuMemFree_v2(s.d_idx); }
+                if s.d_odist != 0 { cuMemFree_v2(s.d_odist); }
+                if s.stream != 0 { cuStreamDestroy_v2(s.stream as *mut std::ffi::c_void); }
+            }
         }
     }
 }
 
-/// Upload INT8 vectors + flat CSR graph to GPU. Returns a GpuIndex handle.
+/// Upload INT8 vectors + flat CSR graph + OpusEdge delta scores to GPU.
 /// Call once after building the graph. All subsequent searches use the cached GPU data.
-/// Build GPU index. Mode-aware memory allocation:
+/// Mode-aware memory allocation:
 /// - Turbo: vectors in VRAM (fast access, cuMemAlloc + copy)
 /// - Hybrid: vectors in unified memory (GPU reads from RAM via page faults)
-pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], n: usize, dim: usize, degree: usize) -> Option<GpuIndex> {
+/// delta_scores: per-node importance for OpusEdge SelKV pruning (all 1.0 if no LLM signal)
+pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], delta_scores: &[f32],
+                        n: usize, dim: usize, degree: usize) -> Option<GpuIndex> {
     let _guard = gpu_lock_and_ensure()?;
     let mode = gpu_get_mode();
     unsafe {
         let v_bytes = n * dim;
         let g_bytes = n * degree * 4;
+        let d_bytes = n * 4;
         let mut d_v = 0u64;
         let mut d_g = 0u64;
+        let mut d_d = 0u64;
         match mode {
             ComputeMode::Turbo => {
-                // Turbo: vectors IN VRAM for fast kernel access.
-                // Full copy once, then kernel reads at VRAM speed (~1TB/s).
                 if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
                 cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
-                eprintln!("[GPU] Turbo: vectors in VRAM ({:.0} MB)", v_bytes as f64 / 1024.0 / 1024.0);
             }
             _ => {
-                // Hybrid/CPU: unified memory — GPU reads from RAM.
-                // VUGVA-style: CUDA page migrator pulls hot pages on demand.
-                if cuMemAllocManaged(&mut d_v, v_bytes, CU_MEM_ATTACH_GLOBAL) != 0 {
-                    // Fallback: regular alloc + copy
-                    if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
+                // VUGVA (paper §4, Algorithm 2): hot pages are VRAM-Resident;
+                // DRAM is the *fallback* tier, not the primary residence.
+                // If the dataset fits the free-VRAM budget, promote everything
+                // to Resident up front — managed memory (page-fault migration)
+                // is only for the > VRAM case. The old code used managed
+                // memory unconditionally, so every search page-faulted over
+                // PCIe (~20 ms/query at 1M×384d).
+                let (mut free_b, mut total_b) = (0usize, 0usize);
+                cuMemGetInfo_v2(&mut free_b, &mut total_b);
+                let vram_fits = v_bytes + 512 * 1024 * 1024 <= free_b; // keep 512MB headroom
+                if vram_fits && cuMemAlloc_v2(&mut d_v, v_bytes) == 0 {
                     cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
-                    eprintln!("[GPU] Hybrid: vectors in VRAM (fallback, unified alloc failed)");
-                } else {
+                    eprintln!("[VUGVA] {} MB promoted VRAM-Resident (fits budget)", v_bytes / 1024 / 1024);
+                } else if cuMemAllocManaged(&mut d_v, v_bytes, CU_MEM_ATTACH_GLOBAL) == 0 {
                     std::ptr::copy_nonoverlapping(vectors_i8.as_ptr(), d_v as *mut i8, v_bytes);
-                    eprintln!("[GPU] Hybrid: vectors in unified memory ({:.0} MB, GPU reads from RAM)", v_bytes as f64 / 1024.0 / 1024.0);
+                    eprintln!("[VUGVA] {} MB in unified memory (exceeds VRAM budget, Warm tier)", v_bytes / 1024 / 1024);
+                } else {
+                    return None;
                 }
             }
         }
         // Graph always in VRAM
-        if cuMemAlloc_v2(&mut d_g, g_bytes) != 0 { return None; }
+        if cuMemAlloc_v2(&mut d_g, g_bytes) != 0 { cuMemFree_v2(d_v); return None; }
         cuMemcpyHtoD_v2(d_g, graph_flat.as_ptr() as *const std::ffi::c_void, g_bytes);
 
+        // OpusEdge SelKV: per-node delta scores in VRAM
+        if cuMemAlloc_v2(&mut d_d, d_bytes) != 0 { cuMemFree_v2(d_v); cuMemFree_v2(d_g); return None; }
+        cuMemcpyHtoD_v2(d_d, delta_scores.as_ptr() as *const std::ffi::c_void, d_bytes);
+
         // VUGVA: Pre-allocate persistent search buffers (reused per query).
-        let max_q = 16;  // max batch size for multi-query search
-        let max_k = 64;  // max topk
+        // d_dist_buf is sized for the full distance matrix (Q × n × f32) for two-kernel search.
+        let max_q = 16;
+        let max_k = GPU_TOPK_MAX;
+        let dist_mat_bytes = max_q * n * 4; // full Q × n distance matrix
         let mut d_qb = 0u64;
         let mut d_ib = 0u64;
         let mut d_db = 0u64;
-        let _ = cuMemAlloc_v2(&mut d_qb, max_q * dim);
-        let _ = cuMemAlloc_v2(&mut d_ib, max_q * max_k * 4);
-        let _ = cuMemAlloc_v2(&mut d_db, max_q * max_k * 4);
-        eprintln!("[GPU] Index: {} vecs × {}d, degree={}, persistent search buffers allocated", n, dim, degree);
-        Some(GpuIndex { d_vectors: d_v, d_graph: d_g, n, dim, degree,
-                        d_query_buf: d_qb, d_idx_buf: d_ib, d_dist_buf: d_db })
+        let mut d_ob = 0u64;
+        // All-or-nothing: a search with a missing buffer would corrupt memory.
+        let ok = cuMemAlloc_v2(&mut d_qb, max_q * dim) == 0
+            && cuMemAlloc_v2(&mut d_ib, max_q * max_k * 4) == 0
+            && cuMemAlloc_v2(&mut d_ob, max_q * max_k * 4) == 0
+            && cuMemAlloc_v2(&mut d_db, dist_mat_bytes) == 0;
+        if !ok {
+            for p in [d_qb, d_ib, d_ob, d_db, d_v, d_g, d_d] {
+                if p != 0 { cuMemFree_v2(p); }
+            }
+            eprintln!("[GPU] Index upload failed: search buffer alloc ({} MB dist matrix)",
+                dist_mat_bytes / 1024 / 1024);
+            return None;
+        }
+        eprintln!("[GPU] Index: {} vecs × {}d, degree={}, dist_buf={:.0}MB, OpusEdge delta uploaded",
+            n, dim, degree, dist_mat_bytes as f64 / 1024.0 / 1024.0);
+
+        // Concurrent single-query slots: N × (query + k idx + k dist) buffers,
+        // each with its own CUDA stream. Best-effort: on any failure keep the
+        // slots allocated so far (searches fall back to the mutex path).
+        //
+        // One query = one block, so the slot count caps how many SMs can be
+        // busy at once. With 8 slots a 16-thread client had half its threads
+        // queueing on the global-mutex path while 2/3 of the GPU idled. The
+        // bitmask is a u32, so 32 is the hard ceiling.
+        let n_slots: usize = std::env::var("GPU_SEARCH_SLOTS").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32).clamp(1, 32);
+        let mut slots: Vec<SearchSlot> = Vec::with_capacity(n_slots);
+        for _ in 0..n_slots {
+            let mut s_q = 0u64;
+            let mut s_i = 0u64;
+            let mut s_o = 0u64;
+            let mut stream: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut s_qf = 0u64;
+            // Sized for a whole coalesced batch, not one query: a slot now
+            // launches `gridDim = batch_len` blocks on its own stream.
+            let sb = slot_batch();
+            let ok = cuMemAlloc_v2(&mut s_q, dim * sb) == 0
+                && cuMemAlloc_v2(&mut s_qf, dim * 4 * sb) == 0
+                && cuMemAlloc_v2(&mut s_i, max_k * 4 * sb) == 0
+                && cuMemAlloc_v2(&mut s_o, max_k * 4 * sb) == 0
+                && cuStreamCreate(&mut stream, CU_STREAM_NON_BLOCKING) == 0;
+            if !ok {
+                for p in [s_q, s_qf, s_i, s_o] { if p != 0 { cuMemFree_v2(p); } }
+                break;
+            }
+            slots.push(SearchSlot { d_q: s_q, d_qf: s_qf, d_idx: s_i, d_odist: s_o, stream: stream as usize });
+        }
+        if !slots.is_empty() {
+            eprintln!("[GPU] {} concurrent search slots (streams) ready", slots.len());
+        }
+        Some(GpuIndex {
+            d_vectors: d_v, d_graph: d_g, d_delta: d_d, n, dim, degree,
+            d_query_buf: d_qb, d_idx_buf: d_ib, d_dist_buf: d_db,
+            d_odist_buf: d_ob, d_vec_f32: 0, d_qf_buf: 0, max_q, max_k,
+            slots, slot_mask: std::sync::atomic::AtomicU32::new(0),
+            coalescer: QueryCoalescer::new(),
+        })
     }
 }
 
-/// CAGRA GPU search using pre-allocated buffers.
-/// NO per-query cuMemAlloc/cuMemFree — uses persistent buffers from GpuIndex.
-/// This eliminates ~20ms overhead per query.
+impl GpuIndex {
+    /// True when the exact corpus is VRAM-resident, i.e. `gpu_search` returns
+    /// exact distances and the caller must not rescore them on the host.
+    #[inline]
+    pub fn gpu_rerank_on_device(&self) -> bool { self.d_vec_f32 != 0 }
+
+    /// Upload the exact f32 corpus so `apgc_search_kernel` can rerank on-device.
+    ///
+    /// Without this the kernel returns the int8 ranking and the host pays a
+    /// `k × dim` f32 dot per query. With it, the rerank is a phase inside the
+    /// same block and the returned distances are already exact.
+    ///
+    /// Off by default — see the measurements below. Best-effort and explicitly
+    /// guarded even when enabled: the corpus is `n · dim · 4` bytes (1.5 GB at
+    /// 1M×384d, 3 GB at 768d, 6 GB at 1536d). If it does not fit free VRAM with
+    /// 768 MB of headroom we leave `d_vec_f32 = 0` and the host keeps
+    /// reranking. Returns whether the GPU rerank is now live.
+    pub fn upload_f32_corpus(&mut self, vectors_f32: &[f32]) -> bool {
+        if self.d_vec_f32 != 0 { return true; }
+        // OPT-IN, and it stays that way until a workload is found where it wins.
+        //
+        // The fused rerank is correct — recall is identical to the host path at
+        // both 384d (0.995) and 768d (0.986) — but it is measurably SLOWER on
+        // this hardware. A/B on 100k, same binary, same graph build:
+        //
+        //   384d:  ON 27,314 QPS / p50 463us   OFF 28,005 QPS / p50 452us
+        //   768d:  ON 17,816 QPS / 12.90s CPU  OFF 18,726 QPS / 12.12s CPU
+        //
+        // At 768d OFF wins on both throughput AND CPU. The reason is that Turbo
+        // is GPU-bound, not CPU-bound: the fused phase adds a per-query H2D copy
+        // of the f32 query (a driver call on the critical path) plus ~196 KB of
+        // scattered VRAM reads to the already-saturated GPU, in order to save a
+        // dot product that AVX2 retires in microseconds across 16 idle cores.
+        // Adding work to the bottleneck to relieve the slack resource is
+        // backwards. Set GPU_RERANK=1 to turn it on and re-measure.
+        if !std::env::var("GPU_RERANK").map(|v| v == "1").unwrap_or(false) {
+            return false;
+        }
+        let need = self.n * self.dim;
+        if vectors_f32.len() < need { return false; }
+        if gpu_lock_and_ensure().is_none() { return false; }
+        let bytes = need * 4;
+        unsafe {
+            let (mut free_b, mut total_b) = (0usize, 0usize);
+            cuMemGetInfo_v2(&mut free_b, &mut total_b);
+            let headroom = 768 * 1024 * 1024;
+            if bytes + headroom > free_b {
+                eprintln!("[GPU] f32 rerank corpus skipped: needs {} MB, {} MB free \
+                           (host rerank stays on)", bytes / 1048576, free_b / 1048576);
+                return false;
+            }
+            let mut d_f = 0u64;
+            if cuMemAlloc_v2(&mut d_f, bytes) != 0 { return false; }
+            if cuMemcpyHtoD_v2(d_f, vectors_f32.as_ptr() as *const std::ffi::c_void, bytes) != 0 {
+                cuMemFree_v2(d_f);
+                return false;
+            }
+            // Staging for the batched path's f32 queries. If this fails the
+            // whole feature stays off rather than half-wired.
+            let mut d_qf = 0u64;
+            if cuMemAlloc_v2(&mut d_qf, self.max_q * self.dim * 4) != 0 {
+                cuMemFree_v2(d_f);
+                return false;
+            }
+            self.d_vec_f32 = d_f;
+            self.d_qf_buf = d_qf;
+            eprintln!("[GPU] f32 rerank corpus resident: {} MB — rerank fused into search kernel",
+                bytes / 1048576);
+            true
+        }
+    }
+}
+
+/// OpusEdge search knobs (env-tunable, cached defaults).
+/// δ ∈ [0.1, 1.0], so the default SelKV gate (1-0.9 = 0.1) keeps the
+/// mechanism live without evicting any reachable node.
+/// Shared-memory bytes for `apgc_search_kernel`. MUST mirror the kernel's own
+/// layout: 3 × BUF search list + 1024-entry dedup set + ceil(D/4) packed
+/// query words + 16 control ints, where BUF = next_pow2(itopk + beam·degree).
+/// `rerank` adds the fused rerank scratch: `dim` floats for the exact query
+/// plus `GPU_TOPK_MAX` floats for the per-candidate accumulators.
+fn apgc_search_smem(itopk: usize, degree: usize, dim: usize, rerank: bool) -> u32 {
+    let beam = gpu_search_beam().clamp(1, 8) as usize;
+    let mut buf = 1usize;
+    while buf < itopk + beam * degree { buf <<= 1; }
+    let d4 = (dim + 3) / 4;
+    // The kernel's rerank width is next_pow2(k) and k is capped at
+    // GPU_TOPK_MAX, so size the accumulator for the rounded-up bound —
+    // GPU_TOPK_MAX itself is not guaranteed to be a power of two.
+    let mut rr_max = 1usize;
+    while rr_max < GPU_TOPK_MAX { rr_max <<= 1; }
+    let rr = if rerank { dim + rr_max } else { 0 };
+    ((3 * buf + 1024 + d4 + 16 + rr) * 4) as u32
+}
+
+/// Threads per block for `apgc_search_kernel`.
+///
+/// A single query runs in ONE block, so blockDim is the only knob that
+/// controls how many warps are resident while the kernel issues its random
+/// neighbour gathers. At 128 threads (4 warps) the SM has essentially no
+/// other warp to switch to while a 400-cycle L2/DRAM miss is in flight, so
+/// the walk runs at memory latency rather than memory bandwidth. Raising it
+/// puts 8-16 warps in flight over the same shared-memory working set.
+fn apgc_search_threads() -> u32 {
+    static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("GPU_SEARCH_THREADS").ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v.clamp(32, 1024) & !31)
+            .unwrap_or(512)
+    })
+}
+
+/// Beam-search list width (ef-class) floor for the APGC GPU search.
+///
+/// 64, not 128. Halving the list halves the per-iteration distance work and
+/// the shared-memory footprint, which is the dominant cost once the kernel is
+/// memory-bound on random graph-neighbour gathers. Measured on 1M real
+/// vectors, `--mode turbo`, batch[1024] QPS / Recall@10:
+///
+///   384d:  128/48 -> 23,485 @ 0.978    64/24 -> 32,531 @ 0.976   (+38%)
+///   768d:  128/48 -> 12,576 @ 0.963    64/24 -> 17,440 @ 0.961   (+39%)
+///
+/// The recall deltas are NOT a cost of this change — they are build noise.
+/// Each arm rebuilds its own graph and the parallel NN-descent refine is
+/// nondeterministic. A third arm at 64/32 (strictly MORE search work than
+/// 64/24) scored 0.957, i.e. lower than both, which is only possible if the
+/// spread is variance rather than signal. Recall is flat to within ~±0.004.
+///
+/// The gain is on the BATCH path specifically. Single-query p50 moved
+/// 519->512us (384d) and 741->722us (768d) — the latency path is dominated by
+/// cold GPU clocks and launch overhead, which these knobs do not touch.
+pub fn gpu_search_itopk() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_SEARCH_ITOPK").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64).clamp(32, 1024)
+    })
+}
+
+/// Beam-search iteration cap for the APGC GPU search. The kernel breaks
+/// early once every node in the top list has been expanded, so this is an
+/// upper bound, not a fixed cost.
+///
+/// 24, not 48. Convergence sits around 16-24: a 100k sweep put the floor at
+/// 16 (recall 0.992) with collapse below it (8 -> 0.911), so 24 keeps a 1.5x
+/// margin over the cliff. Because the kernel early-breaks, raising this above
+/// convergence buys nothing but costs the worst-case query its full budget.
+pub fn gpu_search_iters() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_SEARCH_ITERS").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(24).clamp(1, 512)
+    })
+}
+
+/// Number of top-list nodes expanded per beam iteration.
+pub fn gpu_search_beam() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_SEARCH_BEAM").ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(8).clamp(1, 32)
+    })
+}
+
+fn opusedge_knobs() -> (f32, i32) {
+    let selkv_ratio: f32 = std::env::var("GPU_SELKV_RATIO").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(0.9);
+    let delta_ar_k: i32 = std::env::var("GPU_DELTA_AR_K").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(0);
+    (selkv_ratio, delta_ar_k)
+}
+
+/// Lock-free single-query APGC graph search on a claimed stream slot.
+/// No global GPU mutex: CUDA driver calls are thread-safe (CUDA ≥ 4.0);
+/// each slot has private buffers + its own stream, so N threads overlap
+/// their kernels on the GPU. Returns None if no slot is free or on any
+/// CUDA error — caller falls back to the locked path.
+fn gpu_search_slot(
+    index: &GpuIndex,
+    query_i8: &[i8],
+    query_f32: &[f32],
+    k: usize,
+    itopk: usize,
+    max_iters: usize,
+    entry_node: usize,
+) -> Option<(Vec<i32>, Vec<f32>)> {
+    gpu_search_slot_batch(index, query_i8, query_f32, 1, k, itopk, max_iters, entry_node)
+}
+
+/// Per-slot batched search: `nq` queries in ONE launch on a private stream.
+///
+/// This is the shape that actually feeds the device. Each slot owns a stream,
+/// so up to `slots.len()` of these run concurrently, and each contributes `nq`
+/// blocks instead of 1 — the product is what raises occupancy far enough for
+/// the clock governor to leave its lowest P-state.
+fn gpu_search_slot_batch(
+    index: &GpuIndex,
+    query_i8: &[i8],
+    query_f32: &[f32],
+    nq: usize,
+    k: usize,
+    itopk: usize,
+    max_iters: usize,
+    entry_node: usize,
+) -> Option<(Vec<i32>, Vec<f32>)> {
+    use std::sync::atomic::Ordering as AOrd;
+    if nq == 0 || nq > slot_batch() || k > index.max_k { return None; }
+    if !KERNELS_COMPILED.load(AOrd::Acquire) { return None; }
+    let state = GPU_STATE.get()?;
+    let func = state.get_kernel("apgc_search")?;
+    if !ensure_ctx() { return None; }
+    // Claim a free slot (fetch_or on an already-set bit is a no-op → safe).
+    let mut sid = usize::MAX;
+    for i in 0..index.slots.len() {
+        let bit = 1u32 << i;
+        if index.slot_mask.fetch_or(bit, AOrd::AcqRel) & bit == 0 { sid = i; break; }
+    }
+    if sid == usize::MAX { return None; } // all busy
+    let slot = &index.slots[sid];
+    let release = |m: &std::sync::atomic::AtomicU32| { m.fetch_and(!(1u32 << sid), AOrd::AcqRel); };
+
+    let dim = index.dim;
+    let n = index.n;
+    unsafe {
+        let stream = slot.stream as *mut std::ffi::c_void;
+        if cuMemcpyHtoDAsync_v2(slot.d_q, query_i8.as_ptr() as *const std::ffi::c_void, dim * nq, stream) != 0 {
+            release(&index.slot_mask); return None;
+        }
+        // Fused rerank needs the exact queries too. Both the corpus and a
+        // full-length f32 query block must be present or the phase stays off.
+        let rerank = index.d_vec_f32 != 0 && query_f32.len() >= dim * nq;
+        if rerank && cuMemcpyHtoDAsync_v2(slot.d_qf, query_f32.as_ptr() as *const std::ffi::c_void, dim * 4 * nq, stream) != 0 {
+            release(&index.slot_mask); return None;
+        }
+        let null_ptr: u64 = 0;
+        let (p_vf, p_qf) = if rerank { (&index.d_vec_f32, &slot.d_qf) } else { (&null_ptr, &null_ptr) };
+        let n_i32 = n as i32;
+        let d_i32 = dim as i32;
+        let deg_i32 = index.degree as i32;
+        let k_i32 = k as i32;
+        let itopk_i32 = itopk as i32;
+        let iters_i32 = max_iters as i32;
+        let entry_i32 = entry_node.min(n - 1) as i32;
+        let q_i32: i32 = nq as i32;
+        let (selkv_ratio, delta_ar_k) = opusedge_knobs();
+        let beam = gpu_search_beam();
+        let params: [*mut std::ffi::c_void; 19] = [
+            &index.d_vectors as *const u64 as *mut std::ffi::c_void,
+            &index.d_graph as *const u64 as *mut std::ffi::c_void,
+            &slot.d_q as *const u64 as *mut std::ffi::c_void,
+            &slot.d_idx as *const u64 as *mut std::ffi::c_void,
+            &slot.d_odist as *const u64 as *mut std::ffi::c_void,
+            &index.d_delta as *const u64 as *mut std::ffi::c_void,
+            &n_i32 as *const i32 as *mut std::ffi::c_void,
+            &d_i32 as *const i32 as *mut std::ffi::c_void,
+            &deg_i32 as *const i32 as *mut std::ffi::c_void,
+            &k_i32 as *const i32 as *mut std::ffi::c_void,
+            &itopk_i32 as *const i32 as *mut std::ffi::c_void,
+            &iters_i32 as *const i32 as *mut std::ffi::c_void,
+            &entry_i32 as *const i32 as *mut std::ffi::c_void,
+            &q_i32 as *const i32 as *mut std::ffi::c_void,
+            &selkv_ratio as *const f32 as *mut std::ffi::c_void,
+            &delta_ar_k as *const i32 as *mut std::ffi::c_void,
+            &beam as *const i32 as *mut std::ffi::c_void,
+            p_vf as *const u64 as *mut std::ffi::c_void,
+            p_qf as *const u64 as *mut std::ffi::c_void,
+        ];
+        let smem = apgc_search_smem(itopk, index.degree, index.dim, rerank);
+        let r = cuLaunchKernel(func, nq as u32, 1, 1, apgc_search_threads(), 1, 1, smem, stream,
+            params.as_ptr() as *mut *mut std::ffi::c_void, std::ptr::null_mut());
+        if r != 0 { release(&index.slot_mask); return None; }
+        let out = nq * k;
+        let mut indices = vec![-1i32; out];
+        let mut distances = vec![2.0f32; out];
+        let ok = cuMemcpyDtoHAsync_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, slot.d_idx, out * 4, stream) == 0
+            && cuMemcpyDtoHAsync_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, slot.d_odist, out * 4, stream) == 0
+            && cuStreamSynchronize(stream) == 0;
+        release(&index.slot_mask);
+        if !ok { return None; }
+        Some((indices, distances))
+    }
+}
+
+/// APGC GPU search — score-all-nodes with mixed precision.
+/// Uses fused kernel (single pass, no Q×N buffer) when available,
+/// falls back to two-kernel approach (batch_cosine_dist + topk_select).
+/// Uses persistent GPU buffers — no alloc/free per query.
+///
+/// `queries_f32` is the same queries in exact precision. Pass `&[]` to keep the
+/// rerank on the host; pass the full `num_queries × dim` slice to have the
+/// kernel rerank on-device (requires `upload_f32_corpus` to have succeeded).
+/// When the fused rerank runs, the returned distances are already exact and the
+/// caller must NOT rescore them.
 pub fn gpu_search(
     index: &GpuIndex,
     queries_i8: &[i8],
+    queries_f32: &[f32],
     num_queries: usize,
     k: usize,
     itopk: usize,
     max_iters: usize,
     entry_node: usize,
 ) -> Option<(Vec<i32>, Vec<f32>)> {
-    let func = GPU_STATE.get()?.get_kernel("cagra_search")?;
+    // Hard capacity guards: persistent buffers are sized max_q × max_k.
+    if num_queries == 0 || num_queries > index.max_q || k == 0 || k > index.max_k {
+        return None;
+    }
+
+    // ── Single query: coalesce with whatever else is in flight ──
+    // A lone query launches a gridDim-of-1 kernel, which uses 1 of the
+    // device's SMs and leaves the clock governor parked. Handing it to the
+    // group-commit batcher lets it ride along in a wide launch instead.
+    if num_queries == 1 && itopk > 0 && max_iters > 0 && k <= itopk
+        && index.d_graph != 0 && index.d_delta != 0 && index.degree > 0
+    {
+        if coalesce_enabled() {
+            if let Some(res) = gpu_search_coalesced(
+                index, queries_i8, queries_f32, k, itopk, max_iters, entry_node)
+            {
+                return Some(res);
+            }
+        } else if !index.slots.is_empty() {
+            // GPU_COALESCE=0 — the original per-query stream path, kept so the
+            // two designs can be compared inside one binary against one build.
+            if let Some(res) = gpu_search_slot(
+                index, queries_i8, queries_f32, k, itopk, max_iters, entry_node)
+            {
+                return Some(res);
+            }
+        }
+        // fall through to the locked path on failure
+    }
+
+    gpu_search_batched(index, queries_i8, queries_f32, num_queries, k, itopk, max_iters, entry_node)
+}
+
+/// The batched (globally locked) search body: one launch, `gridDim = Q`.
+///
+/// Split out of [`gpu_search`] so the coalescer's leader can call it directly
+/// without re-entering the single-query coalescing branch.
+fn gpu_search_batched(
+    index: &GpuIndex,
+    queries_i8: &[i8],
+    queries_f32: &[f32],
+    num_queries: usize,
+    k: usize,
+    itopk: usize,
+    max_iters: usize,
+    entry_node: usize,
+) -> Option<(Vec<i32>, Vec<f32>)> {
     let _guard = gpu_lock_and_ensure()?;
     let dim = index.dim;
     let n = index.n;
-    let degree = index.degree;
+    let out_count = num_queries * k;
+
+    // ── APGC graph traversal (paper §3.4, Table 6: ms-class search @1M) ──
+    // Beam search over the CSR graph on GPU — one block per query walks the
+    // graph instead of scanning all N vectors. This is the paper's search
+    // path; the fused brute-force scan below is only the fallback
+    // (itopk == 0) or safety net if the graph kernel fails to launch.
+    if itopk > 0 && max_iters > 0 && k <= itopk
+        && index.d_graph != 0 && index.d_delta != 0 && index.degree > 0
+    {
+        if let Some(apgc_func) = GPU_STATE.get()?.get_kernel("apgc_search") {
+            unsafe {
+                let q_bytes = num_queries * dim;
+                cuMemcpyHtoD_v2(index.d_query_buf, queries_i8.as_ptr() as *const std::ffi::c_void, q_bytes);
+                let rerank = index.d_vec_f32 != 0 && index.d_qf_buf != 0
+                    && queries_f32.len() >= num_queries * dim;
+                if rerank {
+                    cuMemcpyHtoD_v2(index.d_qf_buf, queries_f32.as_ptr() as *const std::ffi::c_void, q_bytes * 4);
+                }
+                let null_ptr: u64 = 0;
+                let (p_vf, p_qf) = if rerank { (&index.d_vec_f32, &index.d_qf_buf) } else { (&null_ptr, &null_ptr) };
+                let n_i32 = n as i32;
+                let d_i32 = dim as i32;
+                let deg_i32 = index.degree as i32;
+                let k_i32 = k as i32;
+                let itopk_i32 = itopk as i32;
+                let iters_i32 = max_iters as i32;
+                let entry_i32 = entry_node.min(n - 1) as i32;
+                let q_i32 = num_queries as i32;
+                let (selkv_ratio, delta_ar_k) = opusedge_knobs();
+                let beam = gpu_search_beam();
+                let params: [*mut std::ffi::c_void; 19] = [
+                    &index.d_vectors as *const u64 as *mut std::ffi::c_void,
+                    &index.d_graph as *const u64 as *mut std::ffi::c_void,
+                    &index.d_query_buf as *const u64 as *mut std::ffi::c_void,
+                    &index.d_idx_buf as *const u64 as *mut std::ffi::c_void,
+                    &index.d_odist_buf as *const u64 as *mut std::ffi::c_void,
+                    &index.d_delta as *const u64 as *mut std::ffi::c_void,
+                    &n_i32 as *const i32 as *mut std::ffi::c_void,
+                    &d_i32 as *const i32 as *mut std::ffi::c_void,
+                    &deg_i32 as *const i32 as *mut std::ffi::c_void,
+                    &k_i32 as *const i32 as *mut std::ffi::c_void,
+                    &itopk_i32 as *const i32 as *mut std::ffi::c_void,
+                    &iters_i32 as *const i32 as *mut std::ffi::c_void,
+                    &entry_i32 as *const i32 as *mut std::ffi::c_void,
+                    &q_i32 as *const i32 as *mut std::ffi::c_void,
+                    &selkv_ratio as *const f32 as *mut std::ffi::c_void,
+                    &delta_ar_k as *const i32 as *mut std::ffi::c_void,
+                    &beam as *const i32 as *mut std::ffi::c_void,
+                    p_vf as *const u64 as *mut std::ffi::c_void,
+                    p_qf as *const u64 as *mut std::ffi::c_void,
+                ];
+                let smem = apgc_search_smem(itopk, index.degree, index.dim, rerank);
+                let r = cuLaunchKernel(apgc_func, num_queries as u32, 1, 1, apgc_search_threads(), 1, 1, smem,
+                    std::ptr::null_mut(), params.as_ptr() as *mut *mut std::ffi::c_void,
+                    std::ptr::null_mut());
+                if r == 0 {
+                    cuCtxSynchronize();
+                    let mut indices = vec![-1i32; out_count];
+                    let mut distances = vec![2.0f32; out_count];
+                    cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, index.d_idx_buf, out_count * 4);
+                    cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, index.d_odist_buf, out_count * 4);
+                    return Some((indices, distances));
+                }
+                // launch failed → fall through to brute-force scan
+            }
+        }
+    }
+
+    // Try fused kernel first (single pass, no Q×N intermediate buffer)
+    if let Some(fused_func) = GPU_STATE.get()?.get_kernel("fused_cosine_topk") {
+        unsafe {
+            let q_bytes = num_queries * dim;
+            cuMemcpyHtoD_v2(index.d_query_buf, queries_i8.as_ptr() as *const std::ffi::c_void, q_bytes);
+
+            let q_i32: i32 = num_queries as i32;
+            let n_i32: i32 = n as i32;
+            let d_i32: i32 = dim as i32;
+            let k_i32: i32 = k as i32;
+
+            // Fused kernel: (queries, vectors, out_idx, out_dist, Q, N, D, k)
+            let fused_params: [*mut std::ffi::c_void; 8] = [
+                &index.d_query_buf as *const u64 as *mut std::ffi::c_void,
+                &index.d_vectors as *const u64 as *mut std::ffi::c_void,
+                &index.d_idx_buf as *const u64 as *mut std::ffi::c_void,
+                &index.d_odist_buf as *const u64 as *mut std::ffi::c_void,
+                &q_i32 as *const i32 as *mut std::ffi::c_void,
+                &n_i32 as *const i32 as *mut std::ffi::c_void,
+                &d_i32 as *const i32 as *mut std::ffi::c_void,
+                &k_i32 as *const i32 as *mut std::ffi::c_void,
+            ];
+            let threads = topk_threads(k);
+            let smem = (threads as usize * k * 8) as u32;
+            let r = cuLaunchKernel(fused_func, num_queries as u32, 1, 1, threads, 1, 1, smem,
+                std::ptr::null_mut(), fused_params.as_ptr() as *mut *mut std::ffi::c_void,
+                std::ptr::null_mut());
+            if r == 0 {
+                cuCtxSynchronize();
+                let mut indices = vec![0i32; out_count];
+                let mut distances = vec![0.0f32; out_count];
+                cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, index.d_idx_buf, out_count * 4);
+                cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, index.d_odist_buf, out_count * 4);
+                return Some((indices, distances));
+            }
+        }
+    }
+
+    // Fallback: two-kernel approach (batch_cosine_dist + topk_select)
+    let dist_func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
+    let topk_func = GPU_STATE.get()?.get_kernel("topk_select")?;
     unsafe {
         let q_bytes = num_queries * dim;
-        if q_bytes > 256 * dim { return None; } // exceeds persistent buffer
-
-        // Upload query to PERSISTENT buffer (no alloc)
         cuMemcpyHtoD_v2(index.d_query_buf, queries_i8.as_ptr() as *const std::ffi::c_void, q_bytes);
 
-        let out_count = num_queries * k;
+        let q_i32: i32 = num_queries as i32;
+        let n_i32: i32 = n as i32;
+        let d_i32: i32 = dim as i32;
+        let k_i32: i32 = k as i32;
 
-        // Kernel args: vectors, graph, queries, out_idx, out_dist,
-        //   N, dim, degree, k, itopk, max_iters, num_queries
-        let mut arg0 = index.d_vectors as *mut std::ffi::c_void;
-        let mut arg1 = index.d_graph as *mut std::ffi::c_void;
-        let mut arg2 = index.d_query_buf as *mut std::ffi::c_void;
-        let mut arg3 = index.d_idx_buf as *mut std::ffi::c_void;
-        let mut arg4 = index.d_dist_buf as *mut std::ffi::c_void;
-        let mut arg5 = n as *mut std::ffi::c_void;
-        let mut arg6 = dim as *mut std::ffi::c_void;
-        let mut arg7 = degree as *mut std::ffi::c_void;
-        let mut arg8 = k as *mut std::ffi::c_void;
-        let mut arg9 = itopk as *mut std::ffi::c_void;
-        let mut arg10 = max_iters as *mut std::ffi::c_void;
-        let mut arg11 = entry_node as *mut std::ffi::c_void;
-        let mut arg12 = num_queries as *mut std::ffi::c_void;
-        let mut args = [
-            &mut arg0, &mut arg1, &mut arg2, &mut arg3, &mut arg4,
-            &mut arg5, &mut arg6, &mut arg7, &mut arg8, &mut arg9,
-            &mut arg10, &mut arg11, &mut arg12,
+        // Step 1: batch_cosine_dist — grid = Q blocks (one per query, grid-stride over N)
+        let dist_params: [*mut std::ffi::c_void; 6] = [
+            &index.d_query_buf as *const u64 as *mut std::ffi::c_void,
+            &index.d_vectors as *const u64 as *mut std::ffi::c_void,
+            &index.d_dist_buf as *const u64 as *mut std::ffi::c_void,
+            &q_i32 as *const i32 as *mut std::ffi::c_void,
+            &n_i32 as *const i32 as *mut std::ffi::c_void,
+            &d_i32 as *const i32 as *mut std::ffi::c_void,
         ];
-
-        let threads = 256u32;
-        // Shared memory: topk_dot + topk_idx + cand_idx[8*degree] + cand_dot[8*degree]
-        // Shared memory: topk[2*itopk] + cand[16*degree] + nc_slot
-        let smem = ((2 * itopk + 16 * degree + 1) * 4) as u32;
-
-        let r = cuLaunchKernel(func,
-            num_queries as u32, 1, 1,   // Grid: one block per query
-            threads, 1, 1,               // Block: 256 threads
-            smem,                        // Shared memory
-            std::ptr::null_mut(),
-            args.as_mut_ptr() as *mut *mut std::ffi::c_void,
+        let r1 = cuLaunchKernel(dist_func, num_queries as u32, 1, 1, 128, 1, 1, 0,
+            std::ptr::null_mut(), dist_params.as_ptr() as *mut *mut std::ffi::c_void,
             std::ptr::null_mut());
-        if r != 0 {
-            let mut err_str: *const i8 = std::ptr::null();
-            cuGetErrorString(r, &mut err_str);
-            let msg = if err_str.is_null() { "unknown".to_string() }
-                      else { std::ffi::CStr::from_ptr(err_str).to_string_lossy().into_owned() };
-            eprintln!("[GPU] cagra_search error {}: {}", r, msg);
-            return None;
-        }
+        if r1 != 0 { return None; }
+
+        // Step 2: topk_select — grid = Q blocks.
+        // Output distances go to the DEDICATED d_odist_buf: writing them into
+        // d_dist_buf (the input matrix) raced with other blocks still reading
+        // row 0 and corrupted results.
+        let topk_params: [*mut std::ffi::c_void; 6] = [
+            &index.d_dist_buf as *const u64 as *mut std::ffi::c_void,
+            &index.d_idx_buf as *const u64 as *mut std::ffi::c_void,
+            &index.d_odist_buf as *const u64 as *mut std::ffi::c_void,
+            &q_i32 as *const i32 as *mut std::ffi::c_void,
+            &n_i32 as *const i32 as *mut std::ffi::c_void,
+            &k_i32 as *const i32 as *mut std::ffi::c_void,
+        ];
+        let tpb = topk_threads(k);
+        let smem = (tpb as usize * k * 8) as u32;
+        let r2 = cuLaunchKernel(topk_func, q_i32 as u32, 1, 1, tpb, 1, 1, smem,
+            std::ptr::null_mut(), topk_params.as_ptr() as *mut *mut std::ffi::c_void,
+            std::ptr::null_mut());
+        if r2 != 0 { return None; }
+
         cuCtxSynchronize();
 
-        // Read from persistent buffers (no alloc/free)
         let mut indices = vec![0i32; out_count];
         let mut distances = vec![0.0f32; out_count];
         cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, index.d_idx_buf, out_count * 4);
-        cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, index.d_dist_buf, out_count * 4);
-
+        cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, index.d_odist_buf, out_count * 4);
         Some((indices, distances))
     }
 }
@@ -900,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cagra_gpu_search() {
+    fn test_apgc_gpu_search() {
         if !gpu_init() { return; }
         // 6 vectors of dim=3, degree=2 graph
         // Graph: 0→{1,2}, 1→{0,3}, 2→{0,4}, 3→{1,5}, 4→{2,5}, 5→{3,4}
@@ -920,15 +2263,20 @@ mod tests {
             2, 5,  // v4→{v2,v5}
             3, 4,  // v5→{v3,v4}
         ];
-        let idx = gpu_build_index(&vectors, &graph, 6, 3, 2).expect("gpu_build_index failed");
+        let delta_scores: Vec<f32> = vec![1.0f32; 6];
+        let idx = gpu_build_index(&vectors, &graph, &delta_scores, 6, 3, 2).expect("gpu_build_index failed");
         // Query: same as v0, should find v0 as nearest
         let queries: Vec<i8> = vec![127, 0, 0];
-        let (indices, distances) = gpu_search(&idx, &queries, 1, 3, 8, 20, 0).expect("gpu_search failed");
-        println!("[GPU] cagra_search: indices={:?} dists={:?}", indices, distances);
+        // Empty f32 queries = int8-only scoring, no fused rerank. The index
+        // here has no f32 corpus uploaded, so the rerank phase is inactive
+        // either way; this exercises the plain graph-traversal path.
+        let (indices, distances) = gpu_search(&idx, &queries, &[], 1, 3, 8, 20, 0)
+            .expect("gpu_search failed");
+        println!("[GPU] apgc_search: indices={:?} dists={:?}", indices, distances);
         // v0 should be the closest (dist ~0)
         assert!(distances[0] < 0.1, "v0 should be closest, got dist={}", distances[0]);
         assert_eq!(indices[0], 0, "first result should be v0");
         idx.free();
-        println!("[GPU] cagra_search VERIFIED — full GPU graph traversal works!");
+        println!("[GPU] apgc_search VERIFIED — full GPU graph traversal works!");
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "vugva-core"
+version = "0.1.0"
+edition = "2021"
+description = "VUGVA — Virtual Unified GPU VRAM Architecture (upstream implementation, github.com/Mr-DS-ML-85/VUGVA). Software-defined GPU memory virtualization with CPU-bypass hybrid DRAM/VRAM tiering."
+license = "AGPL-3.0"
+authors = ["Irfan Mahir <irfan@furylogic.com>"]
+repository = "https://github.com/Mr-DS-ML-85/VUGVA"
+
+[lib]
+name = "vugva_core"
+path = "src/lib.rs"
+
+# Zero external dependencies — pure stdlib Rust.
+# All CUDA Driver API and NVRTC bindings via raw FFI to libcuda.so / libnvrtc.so.

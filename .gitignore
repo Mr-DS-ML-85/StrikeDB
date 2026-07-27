@@ -9,3 +9,6 @@ Cargo.lock
 
 .mimocode/
 bench_ingest.sh
+
+# Benchmark output logs (159 MB and growing; regenerate with dbstrike-bench)
+bench-out/

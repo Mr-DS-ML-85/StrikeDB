@@ -1,0 +1,11 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+description = "Unified inference engine: VUGVA + OpusEdge + APGC integrated."
+license = "Apache-2.0"
+
+[dependencies]
+vugva = { path = "../vugva" }
+opusedge = { path = "../opusedge" }
+apgc = { path = "../apgc" }

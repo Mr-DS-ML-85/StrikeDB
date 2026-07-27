@@ -15,6 +15,12 @@ members = [
     "crates/bench",
     "crates/demos",
     "crates/gpu",
+    "crates/vugva",
+    "crates/vugva-core",
+    "crates/opusedge",
+    "crates/apgc",
+    "crates/engine",
+    "crates/bench-modules",
 ]
 
 [workspace.package]

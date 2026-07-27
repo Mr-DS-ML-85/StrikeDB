@@ -58,14 +58,35 @@ impl Chain {
     /// oldest version when the chain exceeds `MAX_VERSIONS_PER_KEY` — bounds
     /// memory growth on counters and hot keys.
     fn push(&mut self, ts: u64, value: Value) {
-        self.latest_ts = ts;
-        match &value {
-            Value::Tombstone => self.latest = None,
-            v => self.latest = Some(v.clone()),
+        // Versions can arrive OUT OF TIMESTAMP ORDER. `commit_batch` reserves
+        // `ts` from the clock and only then takes the write-queue lock, so two
+        // writers can reserve (10, 11) and enqueue (11, 10). The flusher then
+        // applies 11 before 10, and blindly assigning `latest_ts = ts` would
+        // let the OLDER version win — a lost update. Measured at ~3 in 2000
+        // rounds of 32-way same-key contention, so rare but real. WAL replay
+        // has the same exposure: records are replayed in file order, which is
+        // queue order, not timestamp order.
+        //
+        // Nothing is ever lost on disk in that scenario — both records are
+        // durable — so the crash-recovery tests cannot see it. It is a
+        // *visibility* bug, not a durability one.
+        if ts >= self.latest_ts {
+            self.latest_ts = ts;
+            match &value {
+                Value::Tombstone => self.latest = None,
+                v => self.latest = Some(v.clone()),
+            }
         }
-        self.versions.push(Version { ts, value });
+        // Keep `versions` sorted by ts, because `visible()` relies on a reverse
+        // scan finding the newest version <= snapshot. In the overwhelmingly
+        // common in-order case `partition_point` returns `len()` and this is
+        // exactly the old `push` — no added cost on the fast path.
+        let pos = self.versions.partition_point(|v| v.ts <= ts);
+        self.versions.insert(pos, Version { ts, value });
         if self.versions.len() > MAX_VERSIONS_PER_KEY {
             // O(N) shift once per push, but N is tiny (8) so it's cheap.
+            // Sorted order makes this the genuinely oldest version, which the
+            // previous insertion-ordered vec did not guarantee.
             self.versions.remove(0);
         }
     }
@@ -261,22 +282,51 @@ pub fn shard_of(key: &[u8]) -> usize {
     (fnv1a(hash_input) as usize) & (SHARD_COUNT - 1)
 }
 
-pub struct Engine {
+/// Everything the background flusher thread touches, split out of `Engine`
+/// so the thread can hold an `Arc<FlushCore>` instead of an `Arc<Engine>`.
+///
+/// WHY THIS SPLIT EXISTS. The flusher used to be handed a strong
+/// `Arc<Engine>`. That is a reference cycle in disguise: the engine's
+/// refcount could never fall to zero while the thread lived, and the thread
+/// only exited once `Drop for Engine` set `shutdown`. Each waited on the
+/// other, so `Drop` was unreachable dead code — the flusher thread leaked
+/// once per engine, graceful shutdown never ran, and any Drop-based cleanup
+/// was silently skipped.
+///
+/// `Weak<Engine>` does not fix it either. If the flusher happens to hold a
+/// temporary upgraded strong ref at the moment the last external `Arc` is
+/// dropped, the refcount reaches zero *on the flusher thread*, so
+/// `Engine::drop` runs there and tries to join itself. The condvar it must
+/// wait on also lives inside the object being dropped.
+///
+/// Splitting the state is the fix that has neither problem: `Engine` owns
+/// the only handle to the thread and holds a strong `Arc<FlushCore>`; the
+/// thread holds a second strong `Arc<FlushCore>` and *no* reference to
+/// `Engine`. Dropping the last `Engine` therefore always runs `Drop`, on the
+/// dropping thread, which signals `shutdown` and joins. The `FlushCore`
+/// itself is freed after the join, when the thread's `Arc` goes away.
+struct FlushCore {
     /// Sharded data map. `SHARD_COUNT` must be a power of two for the mask
     /// above. Each shard holds its own BTreeMap under its own RwLock.
     shards: Vec<RwLock<BTreeMap<Key, Chain>>>,
     wal: Mutex<Wal>,
-    /// Path of the primary WAL file — needed to derive the checkpoint file
-    /// name (`<wal>.snap`) and for atomic rename during `checkpoint()`.
-    wal_path: PathBuf,
-    clock: AtomicU64,
     subscribers: RwLock<Vec<Subscriber>>,
     /// Queue of writes awaiting the background flusher.
     write_queue: Mutex<Vec<Arc<PendingWrite>>>,
     /// Wakes the flusher when new writes arrive (and on shutdown).
     queue_cv: Condvar,
-    /// Set by `Drop` to stop the flusher thread.
+    /// Set by `Drop for Engine` to stop the flusher thread.
     shutdown: AtomicBool,
+}
+
+pub struct Engine {
+    /// State shared with the flusher thread. See `FlushCore`.
+    core: Arc<FlushCore>,
+    /// Path of the primary WAL file — needed to derive the checkpoint file
+    /// name (`<wal>.snap`) and for atomic rename during `checkpoint()`.
+    wal_path: PathBuf,
+    clock: AtomicU64,
+    /// Owned solely by `Engine`, so `Drop` is the only joiner.
     flusher: Mutex<Option<JoinHandle<()>>>,
     /// Durability mode. If false (opt-in via `DBSTRIKE_SYNC=0`), commit_batch
     /// applies writes directly to shards and skips the WAL entirely — Redis's
@@ -351,26 +401,28 @@ impl Engine {
             .map(|v| v != "0")
             .unwrap_or(true);
 
-        let engine = Arc::new(Self {
+        let core = Arc::new(FlushCore {
             shards,
             wal: Mutex::new(wal),
-            wal_path,
-            clock: AtomicU64::new(max_ts),
             subscribers: RwLock::new(Vec::new()),
             write_queue: Mutex::new(Vec::new()),
             queue_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
-            flusher: Mutex::new(None),
-            sync_writes,
         });
 
         // Start the background group-commit flusher. It wakes on new writes or
         // shutdown, drains the whole queue in one WAL append + single fsync.
-        {
-            let mut guard = engine.flusher.lock().unwrap();
-            *guard = Some(Self::spawn_flusher(Arc::clone(&engine)));
-        }
-        Ok(engine)
+        // It gets an `Arc<FlushCore>` — deliberately NOT an `Arc<Engine>`, so
+        // the engine's refcount is unaffected and `Drop` stays reachable.
+        let handle = Self::spawn_flusher(Arc::clone(&core));
+
+        Ok(Arc::new(Self {
+            core,
+            wal_path,
+            clock: AtomicU64::new(max_ts),
+            flusher: Mutex::new(Some(handle)),
+            sync_writes,
+        }))
     }
 
     /// Non-durable, throwaway engine for in-process graph builds (the
@@ -382,7 +434,31 @@ impl Engine {
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("build.wal");
         let _ = std::fs::remove_file(&p);
-        Engine::open(&p).unwrap_or_else(|_| Engine::open(std::env::temp_dir().join("dbstrike_fallback_build.wal")).unwrap())
+        match Engine::open(&p) {
+            Ok(e) => {
+                // Unlink the WAL and its directory NOW, while the engine holds
+                // the fd. The mapping stays valid — the inode lives until the
+                // last descriptor closes — so the build engine keeps working,
+                // it just leaves nothing behind however the process dies.
+                //
+                // `Drop for Engine` now does run (the flusher holds an
+                // `Arc<FlushCore>`, not an `Arc<Engine>`), but eager unlink is
+                // still the right call here: Drop does not run on abort,
+                // SIGKILL, or OOM-kill, which is exactly how these leaked.
+                //
+                // Safe for build engines specifically: they are throwaway and
+                // nothing calls `checkpoint()` on them, so `wal_path` is never
+                // re-derived into `<wal>.snap`. Do NOT copy this to
+                // `Engine::open` — a real engine must keep its WAL on disk.
+                let _ = std::fs::remove_file(&p);
+                let _ = std::fs::remove_dir(&dir);
+                e
+            }
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                Engine::open(std::env::temp_dir().join("dbstrike_fallback_build.wal")).unwrap()
+            }
+        }
     }
 
     /// Monotonic timestamp source (also serves as the logical commit clock).
@@ -402,7 +478,7 @@ impl Engine {
     pub fn dbsize(&self) -> usize {
         let snap = self.snapshot();
         let mut n = 0usize;
-        for shard in &self.shards {
+        for shard in &self.core.shards {
             let data = shard.read().unwrap();
             for (_, chain) in data.iter() {
                 if chain.visible(snap).is_some() {
@@ -415,13 +491,13 @@ impl Engine {
 
     /// Register a commit subscriber (reactive sync / CDC).
     pub fn subscribe(&self, cb: Subscriber) {
-        self.subscribers.write().unwrap().push(cb);
+        self.core.subscribers.write().unwrap().push(cb);
     }
 
     /// Point read as of `snapshot`: newest non-future version, honoring
     /// tombstones. O(1) via the latest-value cache in the common case.
     pub fn get_at(&self, key: &[u8], snapshot: u64) -> Option<Value> {
-        let data = self.shards[shard_of(key)].read().unwrap();
+        let data = self.core.shards[shard_of(key)].read().unwrap();
         let chain = data.get(key)?;
         chain.visible(snapshot).cloned()
     }
@@ -436,7 +512,7 @@ impl Engine {
     /// O(log n + m)), then merges results in-order.
     pub fn scan(&self, start: &[u8], end: &[u8], snapshot: u64) -> Vec<(Key, Value)> {
         let mut out: Vec<(Key, Value)> = Vec::new();
-        for shard in &self.shards {
+        for shard in &self.core.shards {
             let data = shard.read().unwrap();
             for (k, chain) in data.range(start.to_vec()..end.to_vec()) {
                 if let Some(v) = chain.visible(snapshot) {
@@ -462,7 +538,7 @@ impl Engine {
         snapshot: u64,
     ) -> Vec<(Key, Value)> {
         let s = shard_of(hint_key);
-        let data = self.shards[s].read().unwrap();
+        let data = self.core.shards[s].read().unwrap();
         let mut out: Vec<(Key, Value)> = Vec::new();
         for (k, chain) in data.range(start.to_vec()..end.to_vec()) {
             if let Some(v) = chain.visible(snapshot) {
@@ -485,7 +561,7 @@ impl Engine {
         limit: usize,
     ) -> Vec<(Key, Value)> {
         let s = shard_of(hint_key);
-        let data = self.shards[s].read().unwrap();
+        let data = self.core.shards[s].read().unwrap();
         let mut out: Vec<(Key, Value)> = Vec::with_capacity(limit);
         for (k, chain) in data.range(start.to_vec()..end.to_vec()).rev() {
             if let Some(v) = chain.visible(snapshot) {
@@ -515,7 +591,7 @@ impl Engine {
         if end.is_empty() {
             // prefix was all 0xFF — scan to the very end of every shard.
             let mut out: Vec<(Key, Value)> = Vec::new();
-            for shard in &self.shards {
+            for shard in &self.core.shards {
                 let data = shard.read().unwrap();
                 for (k, chain) in data.range(prefix.to_vec()..) {
                     if let Some(v) = chain.visible(snapshot) {
@@ -576,12 +652,12 @@ impl Engine {
                 if items.is_empty() {
                     continue;
                 }
-                let mut data = self.shards[i].write().unwrap();
+                let mut data = self.core.shards[i].write().unwrap();
                 for (k, t, v) in items {
                     data.entry(k).or_default().push(t, v);
                 }
             }
-            let subs = self.subscribers.read().unwrap();
+            let subs = self.core.subscribers.read().unwrap();
             if !subs.is_empty() {
                 for m in &broadcast {
                     for s in subs.iter() {
@@ -604,10 +680,10 @@ impl Engine {
             cond: Condvar::new(),
         });
         {
-            let mut q = self.write_queue.lock().unwrap();
+            let mut q = self.core.write_queue.lock().unwrap();
             q.push(Arc::clone(&pending));
         }
-        self.queue_cv.notify_all();
+        self.core.queue_cv.notify_all();
 
         // Wait for this write's group to be flushed.
         let mut state = pending.state.lock().unwrap();
@@ -626,20 +702,20 @@ impl Engine {
 /// Background group-commit flusher: drains the write queue, appends every
 /// pending mutation in one WAL write, fsyncs ONCE, applies version chains, and
 /// wakes all waiters. Stops when `shutdown` is set.
-fn spawn_flusher(engine: Arc<Engine>) -> JoinHandle<()> {
+fn spawn_flusher(core: Arc<FlushCore>) -> JoinHandle<()> {
     thread::spawn(move || loop {
         // Collect the current batch of pending writes.
         let batch: Vec<Arc<PendingWrite>> = {
-            let mut q = engine.write_queue.lock().unwrap();
+            let mut q = core.write_queue.lock().unwrap();
             // Wait until there is work, or it's time to shut down.
-            while q.is_empty() && !engine.shutdown.load(Ordering::SeqCst) {
-                let _g = engine
+            while q.is_empty() && !core.shutdown.load(Ordering::SeqCst) {
+                let _g = core
                     .queue_cv
                     .wait(q)
                     .expect("group-commit flusher condvar poisoned");
                 q = _g;
             }
-            if engine.shutdown.load(Ordering::SeqCst) && q.is_empty() {
+            if core.shutdown.load(Ordering::SeqCst) && q.is_empty() {
                 return;
             }
             q.drain(..).collect()
@@ -647,7 +723,7 @@ fn spawn_flusher(engine: Arc<Engine>) -> JoinHandle<()> {
 
         // Durable step: one append + one fsync for the whole batch.
         let flush_result: io::Result<()> = (|| {
-            let mut wal = engine.wal.lock().unwrap();
+            let mut wal = core.wal.lock().unwrap();
             for pw in &batch {
                 for m in &pw.muts {
                     wal.append(&m.encode())?;
@@ -677,12 +753,12 @@ fn spawn_flusher(engine: Arc<Engine>) -> JoinHandle<()> {
                 if items.is_empty() {
                     continue;
                 }
-                let mut data = engine.shards[i].write().unwrap();
+                let mut data = core.shards[i].write().unwrap();
                 for (k, ts, v) in items {
-                data.entry(k).or_default().push(ts, v);
+                    data.entry(k).or_default().push(ts, v);
                 }
-                }
-            let subs = engine.subscribers.read().unwrap();
+            }
+            let subs = core.subscribers.read().unwrap();
             for pw in &batch {
                 for m in &pw.muts {
                     for s in subs.iter() {
@@ -738,12 +814,12 @@ fn spawn_flusher(engine: Arc<Engine>) -> JoinHandle<()> {
         // `write_queue` and are drained by the flusher — but the flusher can't
         // touch the WAL file while we hold this lock, so no writes race the
         // snapshot boundary.
-        let mut wal_g = self.wal.lock().unwrap();
+        let mut wal_g = self.core.wal.lock().unwrap();
 
         // Collect one mutation per live key from the CURRENT visible state.
         let snapshot_ts = self.clock.load(Ordering::SeqCst);
         let mut muts: Vec<Mutation> = Vec::new();
-        for shard in &self.shards {
+        for shard in &self.core.shards {
             let data = shard.read().unwrap();
             for (key, chain) in data.iter() {
                 // Take the latest (post-prune) view; skip pure tombstones with
@@ -788,10 +864,31 @@ fn spawn_flusher(engine: Arc<Engine>) -> JoinHandle<()> {
 }
 
 impl Drop for Engine {
+    /// Graceful shutdown: stop the flusher and join it.
+    ///
+    /// This is reachable only because the flusher thread holds an
+    /// `Arc<FlushCore>` rather than an `Arc<Engine>` — see `FlushCore` for why
+    /// the previous arrangement made this function dead code.
+    ///
+    /// Ordering matters. `shutdown` is set BEFORE `notify_all`, and the flusher
+    /// re-checks it while holding the `write_queue` lock, so there is no lost
+    /// wakeup: either the flusher is already inside `wait` and the notify
+    /// reaches it, or it has not yet re-acquired the lock and will observe
+    /// `shutdown` on its next check.
+    ///
+    /// The flusher only returns once the queue is empty, so any writes still
+    /// queued at drop time are flushed and fsynced before the join completes.
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.queue_cv.notify_all();
-        if let Some(h) = self.flusher.lock().unwrap().take() {
+        self.core.shutdown.store(true, Ordering::SeqCst);
+        self.core.queue_cv.notify_all();
+        // `lock()` can only be poisoned by a panic while holding this mutex;
+        // nothing but `Drop` and the constructor touch it, so recover rather
+        // than double-panic during unwind.
+        let handle = match self.flusher.lock() {
+            Ok(mut g) => g.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        if let Some(h) = handle {
             let _ = h.join();
         }
     }
@@ -831,7 +928,7 @@ impl Txn {
         // Sharded conflict check: take each shard's read lock only if we
         // actually read a key from it.
         for k in &self.reads {
-            let data = self.engine.shards[shard_of(k)].read().unwrap();
+            let data = self.engine.core.shards[shard_of(k)].read().unwrap();
             if let Some(chain) = data.get(k) {
                 // A version committed after our snapshot means a conflict.
                 if chain.latest_ts > self.snapshot {
@@ -871,6 +968,71 @@ mod tests {
         let p = dir.join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// Regression: dropping an `Engine` must actually run `Drop` and reap the
+    /// flusher thread.
+    ///
+    /// Before the `FlushCore` split, `spawn_flusher` was handed a strong
+    /// `Arc<Engine>`. The refcount could never reach zero while the thread
+    /// lived, and the thread only exited once `Drop` set `shutdown` — so
+    /// `Drop` never ran and every engine leaked its flusher thread.
+    ///
+    /// The probe is a canary `Arc` captured by a subscriber closure.
+    /// Subscribers live inside `FlushCore`, and `FlushCore` is only freed once
+    /// BOTH the engine and the flusher thread have released their handles. So
+    /// `strong_count == 1` after the drop proves two things at once: `Drop`
+    /// ran, and the thread it joined had genuinely exited.
+    ///
+    /// Written to fail rather than hang under the old code: the join deadlock
+    /// would never be reached, because `drop(e)` was simply a no-op there and
+    /// the assertion below would see `strong_count == 2`.
+    #[test]
+    fn drop_reaps_flusher_thread() {
+        let canary = Arc::new(());
+        {
+            let e = Engine::open(tmp("drop_reaps.wal")).unwrap();
+            let held = Arc::clone(&canary);
+            e.subscribe(Arc::new(move |_m: &Mutation| {
+                // Keep `held` alive for as long as the subscriber list is.
+                let _ = &held;
+            }));
+            // Exercise the durable path so the flusher is definitely parked in
+            // `wait` on the condvar when we drop, not still starting up.
+            e.put(b"k".to_vec(), Value::Int(1)).unwrap();
+            assert_eq!(Arc::strong_count(&canary), 2, "subscriber should hold the canary");
+
+            let e = Arc::try_unwrap(e).unwrap_or_else(|_| panic!("engine Arc unexpectedly shared"));
+            drop(e);
+        }
+        assert_eq!(
+            Arc::strong_count(&canary),
+            1,
+            "FlushCore outlived the Engine — Drop did not run or the flusher thread leaked"
+        );
+    }
+
+    /// A queued write must still be flushed and fsynced before `Drop` returns.
+    /// The flusher's shutdown check is `shutdown && queue.is_empty()`, so it
+    /// drains before exiting; this pins that ordering down.
+    #[test]
+    fn drop_flushes_pending_writes() {
+        let path = tmp("drop_flushes.wal");
+        {
+            let e = Engine::open(&path).unwrap();
+            for i in 0..64u64 {
+                e.put(format!("k{i}").into_bytes(), Value::Int(i as i64)).unwrap();
+            }
+        }
+        // Reopen from the WAL alone and confirm every write survived.
+        let e2 = Engine::open(&path).unwrap();
+        for i in 0..64u64 {
+            assert_eq!(
+                e2.get(format!("k{i}").as_bytes()),
+                Some(Value::Int(i as i64)),
+                "write {i} lost across drop + reopen"
+            );
+        }
     }
 
     #[test]
@@ -969,7 +1131,7 @@ mod tests {
         assert_eq!(e.get(b"hot"), Some(Value::Int(49)));
         // Peek the chain length via the internal shard read.
         let shard_ix = shard_of(b"hot");
-        let d = e.shards[shard_ix].read().unwrap();
+        let d = e.core.shards[shard_ix].read().unwrap();
         let chain = d.get(b"hot".as_slice()).unwrap();
         assert!(
             chain.versions.len() <= MAX_VERSIONS_PER_KEY,

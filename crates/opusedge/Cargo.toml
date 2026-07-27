@@ -1,0 +1,6 @@
+[package]
+name = "opusedge"
+version = "0.1.0"
+edition = "2021"
+description = "OpusEdge — Telemetry-guided dynamic compute allocation. Pure Rust implementation of Δ-signal primitives."
+license = "Apache-2.0"

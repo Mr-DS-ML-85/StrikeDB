@@ -1092,8 +1092,14 @@ fn wire_ingest_pipelined_range(addr: &str, id_lo: u64, n: u64, dim: usize, n_thr
             // `.unwrap()` said nothing about *which* command killed the server;
             // this says exactly how far the ingest got and how big the command
             // was, which is what you need to reproduce it.
+            // `DBSTRIKE_INGEST=par` selects VADDBATCH's parallel-rebuild path.
+            // Off by default so the headline ingest number stays the one the
+            // README quotes; settable so the two paths are comparable on the
+            // same dataset in the same run, which is the only way to say what
+            // the sharded rebuild is actually worth.
+            let par_ingest = std::env::var("DBSTRIKE_INGEST").as_deref() == Ok("par");
             let send_batch = |c: &mut Client, ids: &[u64], vecs: &[f32]| -> Result<(), String> {
-                let cmd = vaddbatch_cmd(dim, ids, vecs, false);
+                let cmd = vaddbatch_cmd(dim, ids, vecs, par_ingest);
                 let span = format!(
                     "client {tid}: VADDBATCH ids {}..={} ({} vecs × {dim}d, {} bytes)",
                     ids[0], ids[ids.len() - 1], ids.len(), cmd.len()

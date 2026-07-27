@@ -1,0 +1,6 @@
+[package]
+name = "vugva"
+version = "0.1.0"
+edition = "2021"
+description = "VUGVA — Virtual Unified GPU VRAM Architecture. Chunk-based memory tiering with LRU eviction and lookahead prefetch."
+license = "Apache-2.0"

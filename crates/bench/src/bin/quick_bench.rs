@@ -1,9 +1,11 @@
 //! Quick in-process ingest + search benchmark on real datasets.
 use std::time::Instant;
 
-fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: Vec<f32>, cores: usize) -> Vec<f32> {
-    // norm is OWNED — we can drop it after extracting what's needed.
-    // This saves 1.5-3GB RAM during build.
+fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: Vec<f32>, cores: usize, keep_norm: bool) -> Vec<f32> {
+    // norm is OWNED. In single-mode runs we drop it after build to save
+    // 1.5-3GB RAM. In `--mode all` runs the caller needs the full dataset
+    // back for the next mode (keep_norm=true) — returning only the queries
+    // corrupted every mode after the first (index OOB at ground truth).
     let nq = 200.min(n);
     let queries: Vec<f32> = (0..nq).flat_map(|qi| norm[qi * dim..(qi + 1) * dim].iter().copied()).collect();
 
@@ -25,28 +27,49 @@ fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: Vec<f32>, core
     println!("  MODE: {:?} | {n} × {dim}d | {cores} cores", actual_mode);
     println!("{}", "=".repeat(56));
 
-    // Ground truth FIRST (while norm is fresh)
-    let n_recall = 50.min(nq);
-    println!("Computing recall ground truth ({n_recall} queries)...");
+    // Ground truth FIRST (while norm is fresh).
+    // 50 queries × top-10 is only 500 samples, so recall lands on a 0.002
+    // grid — 0.996 and 0.998 differ by a single neighbour and mode-to-mode
+    // comparisons drown in that noise. 200 queries gives a 0.0005 grid.
+    // Brute force is embarrassingly parallel, so widening it is nearly free.
+    let n_recall = std::env::var("RECALL_QUERIES").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(200).min(nq);
+    println!("Computing recall ground truth ({n_recall} queries, {cores} threads)...");
     let t_bf = Instant::now();
-    let ground_truth: Vec<Vec<u64>> = (0..n_recall).map(|qi| {
-        let q = &norm[qi * dim..(qi + 1) * dim];
-        let mut truth: Vec<(f32, u64)> = (0..n as u64).map(|i| {
-            let mut dot = 0.0f32;
-            for j in 0..dim { dot += q[j] * norm[i as usize * dim + j]; }
-            ((1.0 - dot).max(0.0).min(2.0), i)
-        }).collect();
-        truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        truth.iter().take(10).map(|(_, id)| *id).collect()
-    }).collect();
+    let mut ground_truth: Vec<Vec<u64>> = vec![Vec::new(); n_recall];
+    {
+        let norm_ref: &[f32] = &norm;
+        let chunk = (n_recall + cores - 1) / cores.max(1);
+        std::thread::scope(|s| {
+            for (ci, out) in ground_truth.chunks_mut(chunk.max(1)).enumerate() {
+                let base = ci * chunk.max(1);
+                s.spawn(move || {
+                    let mut truth: Vec<(f32, u64)> = Vec::with_capacity(n);
+                    for (off, slot) in out.iter_mut().enumerate() {
+                        let qi = base + off;
+                        let q = &norm_ref[qi * dim..(qi + 1) * dim];
+                        truth.clear();
+                        for i in 0..n {
+                            let v = &norm_ref[i * dim..(i + 1) * dim];
+                            let mut dot = 0.0f32;
+                            for j in 0..dim { dot += q[j] * v[j]; }
+                            truth.push(((1.0 - dot).max(0.0).min(2.0), i as u64));
+                        }
+                        truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                        *slot = truth.iter().take(10).map(|(_, id)| *id).collect();
+                    }
+                });
+            }
+        });
+    }
     println!("  ground truth: {:.1}s", t_bf.elapsed().as_secs_f64());
 
     // Build graph — GPU path stores only all_i8 (no f32 copies)
     println!("Building HNSW graph...");
     let t2 = Instant::now();
     let vi = views::VectorIndex::build_parallel_tiered(&norm, dim, cores, true);
-    // norm is no longer needed after build — drop it to free RAM
-    drop(norm);
+    // Single-mode runs: norm is no longer needed after build — free the RAM.
+    let saved_norm = if keep_norm { norm } else { Vec::new() };
     let build_s = t2.elapsed().as_secs_f64();
     println!("  build: {build_s:.1}s ({:.0} vec/s)", n as f64 / build_s);
 
@@ -89,6 +112,43 @@ fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: Vec<f32>, core
     let qps = qps_n as f64 / t3.elapsed().as_secs_f64();
     println!("  {cores}-thread QPS: {qps:.0}");
 
+    // Batched QPS — the throughput path.
+    //
+    // The single-query numbers above are LATENCY-bound and cannot saturate a
+    // GPU: each caller blocks on its own result, so in a closed loop the
+    // in-flight query count equals the thread count. The APGC search kernel is
+    // one block per query, so 16 threads means at most 16 resident blocks on a
+    // 24-SM device — and with the device mostly idle between micro-launches the
+    // clock governor never leaves its lowest P-state (measured: 210 MHz of a
+    // 3135 MHz max during search, vs 2805 MHz during the build).
+    //
+    // search_many submits Q queries as ONE launch of Q blocks, which is the
+    // only shape that actually fills the device. Reporting only the
+    // single-query number would understate GPU throughput by an order of
+    // magnitude; reporting only this one would hide the latency story. Both.
+    let batch_sizes = [32usize, 256, 1024];
+    for &bs in &batch_sizes {
+        let bq: Vec<Vec<f32>> = (0..bs)
+            .map(|i| queries_arc[(i % nq) * dim..(i % nq) * dim + dim].to_vec())
+            .collect();
+        // Warm up so we time steady state, not first-touch/JIT.
+        let _ = vi.search_many(&bq, 10);
+        // Run for a fixed WALL time, not a fixed rep count. The GPU clock
+        // governor needs sustained load before it leaves its idle P-state, so
+        // a sub-second sample measures the ramp, not the steady state.
+        let secs: f64 = std::env::var("BATCH_SECS").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(2.0);
+        let t = Instant::now();
+        let mut done = 0usize;
+        while t.elapsed().as_secs_f64() < secs {
+            let _ = vi.search_many(&bq, 10);
+            done += bs;
+        }
+        let el = t.elapsed().as_secs_f64();
+        println!("  batch[{bs:>4}] QPS: {:.0}  ({:.1}µs/query)",
+            done as f64 / el, el * 1e6 / done as f64);
+    }
+
     // Recall
     let mut hits = 0usize;
     for qi in 0..n_recall {
@@ -101,8 +161,8 @@ fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: Vec<f32>, core
     println!("  Recall@10: {recall:.3}");
     println!("  Mode: {actual_mode:?} | Build: {build_s:.1}s | QPS: {qps:.0} | p50: {p50}µs | Recall: {recall:.3}");
 
-    // Return queries for recall (norm is dropped)
-    std::sync::Arc::try_unwrap(queries_arc).unwrap_or_else(|arc| (*arc).clone())
+    // `--mode all`: hand the full dataset back for the next mode.
+    saved_norm
 }
 
 fn main() {
@@ -140,10 +200,10 @@ fn main() {
 
     if mode == "all" {
         for m in &["cpu", "hybrid", "turbo"] {
-            data = run_bench(path, m, n, dim, data, cores);
+            data = run_bench(path, m, n, dim, data, cores, true);
         }
     } else {
-        run_bench(path, mode, n, dim, data, cores);
+        run_bench(path, mode, n, dim, data, cores, false);
     }
 
     println!("\n{}", "=".repeat(56));
