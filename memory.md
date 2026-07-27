@@ -63,7 +63,7 @@ All search columns at matched beam 128.
 |---|---:|
 | Wire `VADDBATCH`, batch 64 | 5,812 vec/s |
 | `bulk_load_fbin` direct (CpuOnly) | **14,183 vec/s** (7.05 s) |
-| `VBULKLOAD` over RESP | **works** — 1k verified; 100k not yet timed |
+| **`VBULKLOAD` over RESP + `GPU.MODE turbo`** | **36,148 vec/s** (100k in 2.77 s) — **6.2× the wire append path** |
 
 ### VUGVA
 
@@ -105,7 +105,9 @@ All search columns at matched beam 128.
 | `gpu_check_capacity` returned VRAM cached at init | over-reported free memory |
 | SelKV gate: `0.1f < 1.0f-0.9f` is **true** in binary32 | every zero-in-degree node silently unreachable |
 | `upload_to_gpu` degree from node 0 alone | every other row truncated |
-| Server re-parsed partial frames from byte zero | 96 MB command ≈ 72 GB of parsing |
+| Server re-parsed partial frames from byte zero | 96 MB command ≈ 72 GB of parsing (fix REVERTED — see below) |
+| **My parse backoff waited for bytes never coming** | any multi-read command hung the connection |
+| `GPU.MODE turbo` probed availability before setting mode | GPU unreachable over RESP entirely |
 | `export_vectors` allocated per vector, then copied again | 100k allocs + 300 MB per rebuild |
 | LGM hysteresis scaled net score (negative → inverted) | residents evicted preferentially |
 
@@ -122,7 +124,9 @@ pages, LGM.md.
 
 ### 3.1 RESP wiring audit ← **highest value**
 Features exist but the server may not reach them. Verify each:
-- [ ] `VBULKLOAD` at 100k with `DBSTRIKE_GPU=turbo` — time it, confirm APGC runs
+- [x] **`VBULKLOAD` at 100k = 2.77 s = 36,148 vec/s**, APGC confirmed running,
+      `VSEARCH` answers in 0.7 ms straight after. Required reverting a parse
+      backoff I had added that deadlocked any command split across reads.
 - [x] **`GPU.MODE turbo` was broken** — probed `gpu_available()` *before*
       setting the mode, but availability only initialises the driver when a GPU
       mode is already current. On a fresh server (default `CpuOnly`) it always
