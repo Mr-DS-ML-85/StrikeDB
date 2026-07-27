@@ -3783,11 +3783,27 @@ impl VectorIndex {
             let k_init = 32;
             let bridge = 16;
 
-            // Convert full dataset to INT8 for GPU
-            let i8_all: Vec<i8> = (0..n).flat_map(|i| {
+            // Convert full dataset to INT8 for GPU.
+            //
+            // L2-normalize first, exactly as `Hnsw::insert_attr` does before it
+            // quantizes. This path used to scale raw coordinates by 127, which
+            // is only correct when the input is already unit-length: anything
+            // larger than 1.0 saturates the `i8` cast and the graph gets built
+            // on clipped garbage. It went unnoticed because real embedding
+            // datasets (sentence-transformers and friends) arrive normalized,
+            // so the corpus this was measured on happened to satisfy the
+            // unstated precondition — while raw client vectors off `VADDBATCH`
+            // do not.
+            let mut i8_all: Vec<i8> = Vec::with_capacity(n * dim);
+            let mut nrm: Vec<f32> = vec![0.0; dim];
+            for i in 0..n {
                 let row = perm_arc[i];
-                (0..dim).map(move |d| (data[row * dim + d] * 127.0) as i8)
-            }).collect();
+                nrm.copy_from_slice(&data[row * dim..(row + 1) * dim]);
+                l2_normalize(&mut nrm);
+                for d in 0..dim {
+                    i8_all.push((nrm[d] * 127.0) as i8);
+                }
+            }
 
             // Call APGC GPU build: seeds+kNN against all vectors, non-seeds→seeds
             let knn_flat = if let Some(graph) = gpu::gpu_build_knn_graph(&i8_all, n, dim, k_init) {
@@ -3886,8 +3902,21 @@ impl VectorIndex {
             for i in 0..n {
                 let true_row = perm_arc[i];
                 let base = true_row * dim;
-                for d in 0..dim { h.all_i8.push((data[base + d] * 127.0) as i8); }
-                h.all_f32.extend_from_slice(&data[base..base + dim]);
+                // Normalize once, then feed BOTH mirrors from it.
+                //
+                // `all_f32` has to hold the normalized vector, not the raw one:
+                // `search_ef` normalizes the query and scores by plain dot
+                // product, treating `1 - dot` as cosine distance. Storing raw
+                // coordinates here makes the exact-f32 rerank disagree with the
+                // int8 traversal it is supposed to be refining — it would
+                // reorder candidates by magnitude rather than by angle. The CPU
+                // path stores the normalized vector (`insert_attr`, via
+                // `l2_normalize` then `all_f32.extend_from_slice(&vector)`);
+                // this now matches it.
+                nrm.copy_from_slice(&data[base..base + dim]);
+                l2_normalize(&mut nrm);
+                for d in 0..dim { h.all_i8.push((nrm[d] * 127.0) as i8); }
+                h.all_f32.extend_from_slice(&nrm);
                 h.nodes.push(Node {
                     id: true_row as u64,
                     neighbors: vec![Vec::new(); h.max_level + 1],
@@ -3927,10 +3956,28 @@ impl VectorIndex {
             let mut pre_tier = if tiered { MmapTier::new(n * dim) } else { None };
             if let Some(ref mut t) = pre_tier {
                 let slice = t.as_mut_slice();
+                let mut row_n: Vec<f32> = vec![0.0; dim];
                 for i in 0..n {
                     let true_row = perm_arc[i];
                     let go = i * dim;
-                    slice[go..go + dim].copy_from_slice(&data[true_row * dim..(true_row + 1) * dim]);
+                    // Normalized, like every other producer of the f32 mirror.
+                    //
+                    // This tier *replaces* `all_f32` below (`f32_tier = Some(t)`
+                    // then `all_f32 = Vec::new()`), so it feeds the exact rerank
+                    // through `vec_at_f32`. That rerank dots against an
+                    // L2-normalized query and reads `1 - dot` as cosine
+                    // distance, so raw vectors here rank by magnitude instead of
+                    // angle — and for any ‖v‖ > 1 the result clamps to 0.0,
+                    // collapsing the top-k into a tie block.
+                    //
+                    // `insert_attr` and `merge_segments` both write normalized
+                    // vectors to this tier; this was the one producer that did
+                    // not, so the bug only appeared with `tiered == true` (the
+                    // 1M / --xlarge paths) and left the non-tiered GPU build
+                    // looking correct.
+                    row_n.copy_from_slice(&data[true_row * dim..(true_row + 1) * dim]);
+                    l2_normalize(&mut row_n);
+                    slice[go..go + dim].copy_from_slice(&row_n);
                 }
             }
 
@@ -4132,16 +4179,41 @@ impl VectorIndex {
         assert_eq!(ids.len(), n, "ids length must match row count");
         assert_eq!(attrs.len(), n, "attrs length must match row count");
 
-        // NOTE (GPU routing, attempted and reverted): delegating to
-        // `build_parallel_tiered` and remapping `node.id` through `ids` looks
-        // exact — that builder does label nodes with the original row index —
-        // but it fails `parallel_build_labels_each_vector_with_its_own_id`
-        // (599/600 wrong). The id remap is fine; the input contract is not.
-        // That builder's GPU path quantizes with a bare `(x * 127.0) as i8`,
-        // i.e. it requires L2-normalized input, while this function is called
-        // from `insert_many_parallel_rebuild` with raw client vectors straight
-        // off `VADDBATCH`. Un-normalized coordinates saturate the i8 cast and
-        // the graph is built on garbage. Normalize before routing here.
+        // Route to the GPU builder when one is available.
+        //
+        // `build_parallel_tiered` carries the APGC GPU path — kNN computed on
+        // device, CPU only wiring edges — and measures 9.29× the serial build
+        // at 100k×384d. Bulk ingest is the caller that most wants it.
+        //
+        // Reuse rather than duplicate. That builder emits an HNSW whose
+        // `node.id` *is* the original row index in every branch it can take, so
+        // the only thing it does not know is the caller's id for each row;
+        // remapping through `ids` afterwards is exact by construction. Copying
+        // the GPU block down here instead would create a second place where
+        // rows are mapped back to client ids, and that mapping is precisely
+        // what was silently inverted below once already — every node labelled
+        // with another vector's id, recall 0.000, search still fast and
+        // plausible. One implementation, one place to get it wrong.
+        //
+        // This needed the GPU block's missing `l2_normalize` first: it used to
+        // assume unit-length input, which raw `VADDBATCH` vectors are not.
+        if gpu::gpu_available() && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly {
+            let built = Self::build_parallel_tiered(data, dim, n_shards, false);
+            {
+                let mut h = built.hnsw.write().unwrap();
+                h.id_to_idx.clear();
+                for i in 0..h.nodes.len() {
+                    let row = h.nodes[i].id as usize;
+                    debug_assert!(row < n, "row {row} out of range for {n} vectors");
+                    let cid = ids[row];
+                    h.nodes[i].id = cid;
+                    h.nodes[i].attr = attrs[row];
+                    h.id_to_idx.insert(cid, i);
+                }
+            }
+            return built;
+        }
+
         let shards = n_shards.max(1).min(n.max(1));
         let mut perm: Vec<usize> = (0..n).collect();
         let mut s = 0x9E3779B97F4A7C15u64;

@@ -104,6 +104,35 @@ impl CorpusTier {
         })
     }
 
+    /// Fill the corpus with `vectors`, row-major int8, `n × dim` bytes.
+    ///
+    /// Writes to whichever tier currently backs the page — for a corpus larger
+    /// than the warm tier that is the spill file, so loading it never requires
+    /// `n × dim` bytes of DRAM at once. That is the property that lets a corpus
+    /// exceed both VRAM and RAM.
+    ///
+    /// Call before [`CorpusTier::device_ptr`]: a page promoted first would
+    /// carry the pre-write contents into VRAM and the kernels would score
+    /// against zeros.
+    pub fn upload(&mut self, vectors: &[i8]) -> crate::GpuResult<()> {
+        let want = self.bytes();
+        if vectors.len() != want {
+            return Err(format!(
+                "CorpusTier::upload: {} bytes for a {}×{} corpus ({want} bytes)",
+                vectors.len(),
+                self.n,
+                self.dim
+            ));
+        }
+        // SAFETY: `i8` and `u8` share size and alignment, and the slice is only
+        // read for the duration of the call.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(vectors.as_ptr() as *const u8, vectors.len()) };
+        self.pool
+            .write_page(&self.name, bytes)
+            .map_err(|e| format!("VUGVA corpus write failed: {e}"))
+    }
+
     /// Device pointer to the corpus on `gpu_idx`, promoting it if it is not
     /// already resident.
     ///
@@ -210,6 +239,47 @@ mod tests {
         assert_eq!(c.dim(), dim);
         assert_eq!(c.bytes(), n * dim);
         assert!(!c.is_empty());
+    }
+
+    /// A corpus larger than the warm tier must round-trip through the cold
+    /// tier and reach the device intact.
+    ///
+    /// This is the end-to-end claim that makes Hybrid meaningful: 64 MB of
+    /// vectors against a 16 MB DRAM budget, written, promoted, and read back
+    /// byte-exact. Allocating is not enough — a corpus that pages in as zeros
+    /// is as useless as one that fails outright.
+    #[test]
+    fn a_corpus_larger_than_dram_round_trips_to_the_device() {
+        if !crate::gpu_init() {
+            eprintln!("no CUDA device — skipping");
+            return;
+        }
+        let (n, dim) = (4096usize, 384usize); // 1.5 MB against a 1 MB budget
+        let mut c = match CorpusTier::with_dram_budget(&[0], n, dim, 1 << 20) {
+            Ok(c) => c,
+            Err(e) => panic!("larger-than-DRAM corpus must allocate: {e}"),
+        };
+        // Position-dependent, so a wrong offset shows up rather than passing.
+        let src: Vec<i8> = (0..n * dim).map(|i| ((i * 31 + (i >> 11)) % 251) as i8).collect();
+        c.upload(&src).expect("upload");
+
+        let dptr = c.device_ptr(0).expect("promote");
+        let mut got = vec![0i8; n * dim];
+        unsafe {
+            let rc = crate::vugva::ffi::cuda::cuMemcpyDtoH_v2(
+                got.as_mut_ptr() as *mut std::ffi::c_void,
+                crate::vugva::ffi::cuda::CUdeviceptr(dptr),
+                n * dim,
+            );
+            assert_eq!(rc, 0, "cuMemcpyDtoH_v2 failed: {rc}");
+        }
+        let bad = got.iter().zip(&src).filter(|(a, b)| a != b).count();
+        assert_eq!(bad, 0, "{bad} of {} bytes differ after the tiered round trip", n * dim);
+
+        assert!(
+            c.upload(&src[..src.len() / 2]).is_err(),
+            "a size mismatch must be rejected, not silently truncated"
+        );
     }
 
     /// The property that motivates the whole type: a corpus larger than the

@@ -625,54 +625,87 @@ impl TieredPool {
                     (off, page.size_bytes)
                 };
 
-                // Attach DRAM staging on demand — a cold page has none until
-                // now. This is where DRAM becomes a cache of T2 rather than
-                // mandatory backing for it.
-                let host_ptr = match maybe_dram_chunk {
-                    Some(c) => c.host_ptr,
-                    None => {
-                        let ptr = self.dram_pools[gpu_idx].allocate(total)?;
-                        let numa = self.dram_pools[gpu_idx].numa_node;
-                        let page = self.vmt.lookup_mut(name).unwrap();
-                        page.dram_chunks.push(DramChunk {
-                            numa_node: numa,
-                            host_ptr: ptr,
-                            size_bytes: total,
-                            // The pool was registered as one range at startup,
-                            // so any chunk carved from it is already pinned.
-                            cuda_registered: true,
-                        });
-                        ptr
+                // Stage through DRAM in bounded chunks.
+                //
+                // The page can legitimately be larger than the whole warm tier
+                // — that is the case T2 exists for — so demanding `total` bytes
+                // of staging would reinstate the DRAM ceiling on the very path
+                // meant to escape it. Instead take whatever the pool can spare,
+                // and stream: read a chunk from the file, push it to the device,
+                // reuse the same buffer.
+                //
+                // Staging is deliberately *not* attached to the page as a
+                // `DramChunk`. It is scratch for this promotion, and recording
+                // it would make DRAM look occupied by a page whose home is the
+                // file, so eviction would later try to write it back.
+                let size = total;
+                let dst_ptr = self.alloc_vram_on_gpu(gpu_idx, size)?;
+
+                let (stage_ptr, stage_len, borrowed) = match maybe_dram_chunk {
+                    // Page already owns DRAM big enough to hold it: use it.
+                    Some(c) if c.size_bytes >= total => (c.host_ptr, total, false),
+                    _ => {
+                        // Halve until the pool can satisfy it, floor 1 MiB —
+                        // below that the per-chunk overhead dominates the copy.
+                        let mut want = total;
+                        let ptr = loop {
+                            match self.dram_pools[gpu_idx].allocate(want) {
+                                Ok(p) => break p,
+                                Err(e) => {
+                                    if want <= (1 << 20) {
+                                        // Undo the VRAM reservation; leaving it
+                                        // would leak a device block per failure.
+                                        let _ = self.free_vram_on_gpu(gpu_idx, dst_ptr, size);
+                                        return Err(e);
+                                    }
+                                    want /= 2;
+                                }
+                            }
+                        };
+                        (ptr, want, true)
                     }
                 };
 
-                // SAFETY: `host_ptr` names `total` bytes inside the pinned pool
-                // that `allocate` just reserved (or that this page already
-                // owned), and the spill range at `offset` was reserved for the
-                // same `page.size_bytes`.
-                unsafe {
+                let copy_res = (|| -> Result<()> {
                     let spill = self.spill.as_ref().ok_or_else(|| {
                         VugvaError::UnknownAllocation(format!(
                             "{name}: page is on Tier::Ssd but no spill file is attached"
                         ))
                     })?;
-                    spill.read_into(offset, host_ptr as *mut u8, total)?;
+                    self.set_context(gpu_idx)?;
+                    let mut done = 0usize;
+                    while done < total {
+                        let this = stage_len.min(total - done);
+                        // SAFETY: `stage_ptr` covers `stage_len` pinned bytes,
+                        // and `offset + done` is inside the range reserved for
+                        // this page's `size_bytes`.
+                        unsafe {
+                            spill.read_into(offset + done as u64, stage_ptr as *mut u8, this)?;
+                            let rc = crate::ffi::cuda::cuMemcpyHtoD_v2(
+                                crate::ffi::cuda::CUdeviceptr(dst_ptr + done as u64),
+                                stage_ptr as *const std::ffi::c_void,
+                                this,
+                            );
+                            crate::check_cu("cuMemcpyHtoD_v2", rc)?;
+                        }
+                        done += this;
+                    }
+                    Ok(())
+                })();
+
+                if borrowed {
+                    self.dram_pools[gpu_idx].free(stage_ptr, stage_len);
+                }
+                if let Err(e) = copy_res {
+                    let _ = self.free_vram_on_gpu(gpu_idx, dst_ptr, size);
+                    return Err(e);
                 }
 
-                let size = total;
-                let src_ptr = host_ptr as u64;
-                let dst_ptr = self.alloc_vram_on_gpu(gpu_idx, size)?;
-
-                self.set_context(gpu_idx)?;
-                unsafe {
-                    crate::ffi::cuda::cuMemcpyHtoDAsync_v2(
-                        crate::ffi::cuda::CUdeviceptr(dst_ptr),
-                        src_ptr as *const std::ffi::c_void,
-                        size,
-                        self.streams.compute[gpu_idx].as_raw(),
-                    );
-                    self.streams.compute[gpu_idx].synchronize()?;
-                }
+                // No further copy: the streaming loop above already placed all
+                // `total` bytes at `dst_ptr`, and the staging buffer has been
+                // returned to the pool. Copying again from `stage_ptr` would
+                // read freed memory and overwrite the good data with whatever
+                // the pool handed to the next allocation.
 
                 self.vmt.lookup_mut(name).unwrap().touch(now);
                 let page = self.vmt.lookup_mut(name).unwrap();
@@ -851,6 +884,100 @@ impl TieredPool {
             .get_mut(gpu_idx)
             .ok_or(VugvaError::InvalidGpu(gpu_idx))?
             .push((bytes, ptr));
+        Ok(())
+    }
+
+    /// Fill a page with `data`, writing to whichever tier currently backs it.
+    ///
+    /// Allocation reserves space; this is what puts bytes in it. Without it a
+    /// page could be created, promoted and read, but never *populated* — so a
+    /// corpus could be tiered and would come back as zeros, which is exactly
+    /// as useless as not tiering it.
+    ///
+    /// Where the bytes land depends on the tier, and that asymmetry is the
+    /// point of the hierarchy:
+    ///
+    /// * `Ssd` — straight to the spill file at the page's reserved offset. No
+    ///   DRAM is touched, so a corpus far larger than the warm tier can be
+    ///   loaded; it streams to NVMe and pages back in on access.
+    /// * `Dram` / `Vram` — across the page's DRAM chunks, which `allocate`
+    ///   split one-per-pool. The split is not uniform: integer division leaves
+    ///   a remainder that goes to the final pool, so the write walks the chunks
+    ///   and consumes each one's own `size_bytes` rather than assuming an even
+    ///   stride.
+    ///
+    /// A page already resident in VRAM keeps its device copy *stale* — this
+    /// writes the host backing only. Callers that overwrite a hot page should
+    /// `demote` it first, so the next `access` re-promotes the new bytes.
+    pub fn write_page(&mut self, name: &str, data: &[u8]) -> Result<()> {
+        let (tier, total, ssd_offset) = {
+            let page = self
+                .vmt
+                .lookup(name)
+                .ok_or_else(|| VugvaError::UnknownAllocation(name.to_string()))?;
+            (page.tier, page.size_bytes, page.ssd_offset)
+        };
+        if data.len() != total {
+            return Err(VugvaError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "write_page({name}): {} bytes for a {total}-byte page — a \
+                     partial write would leave the tail undefined",
+                    data.len()
+                ),
+            )));
+        }
+
+        if tier == Tier::Ssd {
+            let offset = ssd_offset.ok_or_else(|| {
+                VugvaError::UnknownAllocation(format!(
+                    "{name}: page is on Tier::Ssd but has no spill offset"
+                ))
+            })?;
+            let spill = self.spill.as_ref().ok_or_else(|| {
+                VugvaError::UnknownAllocation(format!(
+                    "{name}: page is on Tier::Ssd but no spill file is attached"
+                ))
+            })?;
+            // SAFETY: `data` is a live slice of `total` bytes, and the range at
+            // `offset` was reserved for exactly `page.size_bytes`.
+            unsafe { spill.write_at(data.as_ptr(), total, offset) }?;
+            return Ok(());
+        }
+
+        let chunks: Vec<(usize, usize)> = {
+            let page = self.vmt.lookup(name).unwrap();
+            page.dram_chunks
+                .iter()
+                .map(|c| (c.host_ptr, c.size_bytes))
+                .collect()
+        };
+        let mut written = 0usize;
+        for (host_ptr, size) in chunks {
+            let end = (written + size).min(total);
+            if end <= written {
+                break;
+            }
+            // SAFETY: the chunk covers `size` bytes of the pinned pool, and the
+            // source range is inside `data` by the bounds above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(written),
+                    host_ptr as *mut u8,
+                    end - written,
+                );
+            }
+            written = end;
+        }
+        if written != total {
+            return Err(VugvaError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "write_page({name}): DRAM chunks cover {written} of {total} \
+                     bytes — the page's backing is short"
+                ),
+            )));
+        }
         Ok(())
     }
 

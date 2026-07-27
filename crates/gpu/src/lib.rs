@@ -125,6 +125,18 @@ unsafe impl Sync for GpuState {}
 /// Global GPU state — lazy init on first use.
 static GPU_STATE: std::sync::OnceLock<GpuState> = std::sync::OnceLock::new();
 static GPU_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set once `gpu_unload` has destroyed the context, making GPU use a one-way
+/// door for the rest of the process.
+///
+/// `GPU_STATE` is a `OnceLock`, so the destroyed `GpuState` — dangling `ctx`
+/// and all — is the only one this process will ever have. Without this flag a
+/// later `gpu_init` saw `GPU_ENABLED == false`, got that same state back from
+/// `get_or_init`, and set `GPU_ENABLED = true`: the GPU then reported itself
+/// available while every `cuCtxSetCurrent` failed with 201, so work neither
+/// ran on the device nor fell back to the CPU. Refusing up front turns a
+/// bricked GPU into a clean CPU fallback.
+static GPU_DESTROYED: AtomicBool = AtomicBool::new(false);
 static KERNELS_COMPILED: AtomicBool = AtomicBool::new(false);
 static KERNELS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static KERNEL_LOCK: Mutex<()> = Mutex::new(());
@@ -240,6 +252,9 @@ const KERNEL_SRC: &str = include_str!("../kernels/all_kernels.cu");
 /// Initialize GPU — detect CUDA, create context. Kernels NOT compiled yet.
 pub fn gpu_init() -> bool {
     if GPU_ENABLED.load(Ordering::Relaxed) { return true; }
+    // The context this process had was destroyed and cannot be rebuilt; see
+    // GPU_DESTROYED. Re-enabling here would hand out a dangling context.
+    if GPU_DESTROYED.load(Ordering::Relaxed) { return false; }
     let _guard = GPU_ACCESS.lock().ok();
     // Double-check after acquiring lock.
     if GPU_ENABLED.load(Ordering::Relaxed) { return true; }
@@ -360,7 +375,24 @@ pub fn gpu_info() -> Vec<(&'static str, String)> {
 pub fn gpu_check_capacity(n: usize, dim: usize) -> (bool, usize, usize) {
     if let Some(state) = GPU_STATE.get() {
         let needed = n * dim;
-        (needed <= state.vram_free, needed, state.vram_free)
+        // Query the driver rather than reporting the snapshot taken at init.
+        //
+        // `state.vram_free` is measured once, before anything is uploaded. By
+        // the time this is consulted — to decide whether a corpus fits, or
+        // whether the build can seed in a single launch — hundreds of MB of
+        // index may already be resident, so the cached figure over-reports and
+        // the caller commits to an allocation the device cannot satisfy.
+        let mut free = state.vram_free;
+        unsafe {
+            let (mut f, mut t) = (0usize, 0usize);
+            if !state.ctx.is_null()
+                && cuCtxSetCurrent(state.ctx) == 0
+                && cuMemGetInfo_v2(&mut f, &mut t) == 0
+            {
+                free = f;
+            }
+        }
+        (needed <= free, needed, free)
     } else {
         (false, 0, 0)
     }
@@ -807,11 +839,24 @@ impl GpuBuildBuffers {
             std::ptr::null_mut(), build_params.as_ptr() as *mut *mut std::ffi::c_void,
             std::ptr::null_mut());
         if r != 0 { return None; }
-        cuCtxSynchronize();
-        let mut indices = vec![0i32; q * self.k];
-        let mut distances = vec![0.0f32; q * self.k];
-        cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, self.d_out_idx, out_bytes);
-        cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, self.d_out_dist, out_bytes);
+        // A kernel fault is asynchronous: the launch above returns success and
+        // the error only surfaces here. Leaving this unchecked meant an OOM or
+        // illegal access produced a *silent* all-zeros readback, and since the
+        // caller maps index 0 to a real node, every vector's nearest neighbour
+        // became node 0 — a build that reports success and prints its usual
+        // timing line while producing a useless graph.
+        if cuCtxSynchronize() != 0 { return None; }
+        // Sentinel-initialised, not zero: index 0 and distance 0.0 are both
+        // *valid* results, so a partial copy would be indistinguishable from a
+        // genuine answer. -1 is filtered by every consumer.
+        let mut indices = vec![-1i32; q * self.k];
+        let mut distances = vec![2.0f32; q * self.k];
+        if cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, self.d_out_idx, out_bytes) != 0 {
+            return None;
+        }
+        if cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, self.d_out_dist, out_bytes) != 0 {
+            return None;
+        }
         Some((indices, distances))
     }
 
@@ -1156,7 +1201,15 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
         }
 
         // Output flat CSR
-        let mut result = vec![0usize; n * k];
+        // Pad short adjacency lists with the node's own index, not 0.
+        //
+        // A node whose kNN list came back under-filled (NN-descent writes -1
+        // when it finds fewer than K, and the host filters those out) left the
+        // remaining slots at their zero initialiser. The consumer accepts any
+        // `nb != i && nb < n`, so every such hole became a real edge to node 0
+        // — silently inflating node 0's in-degree and biasing traversal toward
+        // it. Self is the correct filler because the consumer drops it.
+        let mut result: Vec<usize> = (0..n).flat_map(|i| std::iter::repeat_n(i, k)).collect();
         for i in 0..n { for j in 0..k.min(graph[i].len()) { result[i * k + j] = graph[i][j] as usize; } }
 
         bufs.free();
@@ -1207,6 +1260,10 @@ pub fn gpu_unload() {
         unsafe {
             if !state.ctx.is_null() {
                 cuCtxDestroy_v2(state.ctx);
+                // Latch *before* returning: the state behind the `OnceLock` now
+                // holds a dangling context and can never be replaced, so any
+                // later `gpu_init` must decline rather than resurrect it.
+                GPU_DESTROYED.store(true, Ordering::Relaxed);
             }
         }
     }
