@@ -4131,6 +4131,17 @@ impl VectorIndex {
         let n = data.len() / dim;
         assert_eq!(ids.len(), n, "ids length must match row count");
         assert_eq!(attrs.len(), n, "attrs length must match row count");
+
+        // NOTE (GPU routing, attempted and reverted): delegating to
+        // `build_parallel_tiered` and remapping `node.id` through `ids` looks
+        // exact — that builder does label nodes with the original row index —
+        // but it fails `parallel_build_labels_each_vector_with_its_own_id`
+        // (599/600 wrong). The id remap is fine; the input contract is not.
+        // That builder's GPU path quantizes with a bare `(x * 127.0) as i8`,
+        // i.e. it requires L2-normalized input, while this function is called
+        // from `insert_many_parallel_rebuild` with raw client vectors straight
+        // off `VADDBATCH`. Un-normalized coordinates saturate the i8 cast and
+        // the graph is built on garbage. Normalize before routing here.
         let shards = n_shards.max(1).min(n.max(1));
         let mut perm: Vec<usize> = (0..n).collect();
         let mut s = 0x9E3779B97F4A7C15u64;
