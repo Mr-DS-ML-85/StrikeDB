@@ -4194,6 +4194,84 @@ impl VectorIndex {
     /// entries (O(K²), microseconds) — the cheap, correct merge from
     /// `build_parallel`. Used by the parallel `VADDBATCH` ingest path so
     /// batched ids need not be contiguous and recall stays correct.
+    /// Load an `.fbin` file directly into the index, building once.
+    ///
+    /// Format: `[n:u32-le][dim:u32-le][n*dim f32-le]`, ids assigned `0..n`.
+    ///
+    /// This exists because bulk ingest is not reachable through `VADDBATCH` at
+    /// any batch size, and that is not a tuning problem. Small batches take the
+    /// serial append path and never reach the GPU builder; large batches are
+    /// worse, not better — measured on this machine at 100k×384d, batch 64
+    /// completes in ~18 s while batch 512 and 2048 both exceed 200 s, because
+    /// `merge_into`'s bridge pass grows superlinearly in batch size. A 25k
+    /// batch is ~96 MB of RESP text (9.6M floats formatted by the client and
+    /// parsed back by the server) and made zero progress in ten minutes.
+    ///
+    /// So the data never goes over the wire. The client sends a path, the
+    /// server reads the file, and the index is built **once** by the same
+    /// parallel/GPU builder that measures ~3× a 16-thread CPU build. This is
+    /// what Milvus's bulk-insert and Qdrant's snapshot restore do, and for the
+    /// same reason.
+    ///
+    /// Vectors are L2-normalized on load, matching the contract every other
+    /// ingest path applies (`Hnsw::insert_attr` normalizes internally).
+    ///
+    /// Replaces the current index rather than appending: a bulk load is a load,
+    /// and merging it into an existing graph would reintroduce exactly the
+    /// merge cost this path exists to avoid.
+    pub fn bulk_load_fbin(&self, path: &str, n_shards: usize) -> std::io::Result<(usize, usize)> {
+        use std::io::{Error, ErrorKind};
+        let bytes = std::fs::read(path)?;
+        if bytes.len() < 8 {
+            return Err(Error::new(ErrorKind::InvalidData, "fbin shorter than header"));
+        }
+        let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let dim = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        if n == 0 || dim == 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "fbin declares zero rows or dims"));
+        }
+        let want = n
+            .checked_mul(dim)
+            .and_then(|e| e.checked_mul(4))
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "fbin dimensions overflow"))?;
+        if bytes.len() - 8 < want {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "fbin truncated: header declares {n}×{dim} ({want} bytes) but \
+                     only {} bytes of payload follow",
+                    bytes.len() - 8
+                ),
+            ));
+        }
+
+        // Copy out rather than transmuting in place: the payload has no
+        // alignment guarantee and `f32` requires 4-byte alignment.
+        //
+        // `chunks_exact` rather than indexing `bytes[o..o+4]` per element: the
+        // indexed form emits a bounds check and a fallible `try_into` for every
+        // one of the n*dim floats (38.4M at 100k×384d), which is pure overhead
+        // when the length was already validated above.
+        let mut data: Vec<f32> = bytes[8..8 + want]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        drop(bytes);
+        for row in data.chunks_mut(dim) {
+            l2_normalize(row);
+        }
+
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let attrs: Vec<u32> = vec![0u32; n];
+        let built = Self::build_parallel_ids(&data, dim, n_shards, &ids, &attrs);
+        {
+            let mut g = self.hnsw.write().unwrap();
+            *g = built.hnsw.into_inner().unwrap();
+        }
+        self.upload_to_gpu_if_enabled();
+        Ok((n, dim))
+    }
+
     pub fn build_parallel_ids(
         data: &[f32],
         dim: usize,
@@ -5918,3 +5996,66 @@ mod tests {
 }
 
 
+
+#[cfg(test)]
+mod bulk_load_timing {
+    use super::*;
+    /// Times each stage of `bulk_load_fbin` so a slow one is attributable.
+    #[test]
+    #[ignore = "manual: needs /home/irfan/datasets"]
+    fn time_bulk_load_stages() {
+        let path = "/home/irfan/datasets/real_384_100k.fbin";
+        if !std::path::Path::new(path).exists() { return; }
+        let t = std::time::Instant::now();
+        let bytes = std::fs::read(path).unwrap();
+        eprintln!("read      {:?} ({} MB)", t.elapsed(), bytes.len() >> 20);
+        let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let dim = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let want = n * dim * 4;
+        let t = std::time::Instant::now();
+        let mut data: Vec<f32> = bytes[8..8+want].chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        eprintln!("decode    {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        for row in data.chunks_mut(dim) { l2_normalize(row); }
+        eprintln!("normalize {:?}", t.elapsed());
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let attrs = vec![0u32; n];
+        let t = std::time::Instant::now();
+        let _b = VectorIndex::build_parallel_ids(&data, dim, 16, &ids, &attrs);
+        eprintln!("build     {:?}", t.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod bulkload_probe {
+    use super::*;
+
+    /// Isolates `bulk_load_fbin` from the RESP server.
+    ///
+    /// The same call through `VBULKLOAD` did not return within 180 s, and the
+    /// server log showed the builder was never reached — so the question is
+    /// whether the function is slow or the wire plumbing around it is. Ignored
+    /// by default because it needs a dataset that is not in the repo.
+    #[test]
+    #[ignore = "needs /home/irfan/datasets/real_384_100k.fbin"]
+    fn bulk_load_direct_timing() {
+        let path = "/home/irfan/datasets/real_384_100k.fbin";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("dataset absent — skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dbstrike_bulk_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = Engine::open(dir.join("bulk.wal")).unwrap();
+        let idx = VectorIndex::open(e);
+        let t = std::time::Instant::now();
+        let (n, dim) = idx.bulk_load_fbin(path, 16).expect("bulk load");
+        let dt = t.elapsed().as_secs_f64();
+        println!("bulk_load_fbin: {n} x {dim}d in {dt:.2}s = {:.0} vec/s", n as f64 / dt);
+        assert_eq!(n, 100_000);
+        // Sanity: the index must actually answer.
+        let hits = idx.search_ef(&vec![0.1f32; dim], 10, 128);
+        assert!(!hits.is_empty(), "index must be searchable after bulk load");
+    }
+}

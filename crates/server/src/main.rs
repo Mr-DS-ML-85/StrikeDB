@@ -1005,6 +1005,27 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         // O(K²) entry bridge) — a genuinely cores× build with correct recall.
         // Each vector is still written durably to the WAL substrate. Returns the
         // count ingested.
+        // Bulk load from a server-side file. The data never crosses the wire.
+        //
+        // VADDBATCH cannot do bulk ingest at any batch size: small batches take
+        // the serial append path, and large ones are worse rather than better
+        // (100k x 384d measured at ~18 s for batch 64, >200 s for 512 and 2048,
+        // and zero progress for 25k). This hands the builder a path instead.
+        "VBULKLOAD" => {
+            if args.len() != 1 {
+                return err("VBULKLOAD requires exactly one argument: <path-to-.fbin>");
+            }
+            let path = match std::str::from_utf8(&args[0]) {
+                Ok(p) => p,
+                Err(_) => return err("VBULKLOAD path is not valid UTF-8"),
+            };
+            let vi = db.router.vectors();
+            match vi.bulk_load_fbin(path, num_cores()) {
+                Ok((n, dim)) => Resp::Simple(format!("loaded {n} vectors x {dim}d")),
+                Err(e) => err(&format!("VBULKLOAD failed: {e}")),
+            }
+        }
+
         "VADDBATCH" => {
             if args.len() < 2 {
                 return err("VADDBATCH requires [PAR] dim id f1 f2 ... [id f...]...");
