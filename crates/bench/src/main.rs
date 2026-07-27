@@ -1071,6 +1071,20 @@ fn wire_ingest_pipelined_range(addr: &str, id_lo: u64, n: u64, dim: usize, n_thr
     // merge path, not the rebuild one. The old label advertised a code path
     // this function does not exercise — a benchmark log that names the wrong
     // path is worse than no log, because it survives into the README.
+    // `DBSTRIKE_INGEST_BATCH` overrides the vectors-per-command.
+    //
+    // The default of 64 models a streaming writer. A bulk load is a different
+    // workload and wants a much larger batch: `VADDBATCH PAR` only routes to
+    // the GPU builder when the batch is at least a quarter of the current
+    // index, so at 64 vectors it always falls back to the serial append path
+    // and the GPU builder is unreachable from the wire however the server is
+    // configured. Making this settable is what lets a bulk load actually be
+    // benchmarked as a bulk load.
+    let batch_size = std::env::var("DBSTRIKE_INGEST_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(batch_size);
     println!("  ingesting {n} × {dim}d over RESP VADDBATCH (batch={batch_size}, {n_threads} clients) ...");
     let t0 = Instant::now();
     let per = (n as usize).div_ceil(n_threads);

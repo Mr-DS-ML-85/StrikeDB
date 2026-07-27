@@ -4829,6 +4829,38 @@ impl VectorIndex {
     /// Dump every live node as `(id, exact_f32_vector, attr)`. Used by the
     /// parallel rebuild ingest path so an existing index can be combined with a
     /// new batch and re-built in parallel (preserving ids + attributes).
+    /// Export every live vector into one flat, row-major buffer.
+    ///
+    /// The tuple-returning [`VectorIndex::export_vectors`] allocates a `Vec<f32>`
+    /// per vector and the rebuild path then copies all of them again into a
+    /// contiguous buffer — two full passes plus `n` separate allocations, for a
+    /// result that is immediately flattened anyway. At 100k×384d that is 100k
+    /// allocations and roughly 300 MB of copying *per rebuild*, which dominates
+    /// bulk ingest so completely that the GPU build it feeds (2.5 s) is not the
+    /// bottleneck.
+    ///
+    /// Writing straight into a preallocated buffer removes both.
+    pub fn export_flat(&self) -> (Vec<f32>, Vec<u64>, Vec<u32>, usize) {
+        let g = self.hnsw.read().unwrap();
+        let dim = g.dim;
+        if dim == 0 {
+            return (Vec::new(), Vec::new(), Vec::new(), 0);
+        }
+        let live = g.nodes.iter().filter(|n| !n.deleted).count();
+        let mut data = Vec::with_capacity(live * dim);
+        let mut ids = Vec::with_capacity(live);
+        let mut attrs = Vec::with_capacity(live);
+        for (gi, node) in g.nodes.iter().enumerate() {
+            if node.deleted {
+                continue;
+            }
+            data.extend_from_slice(g.vec_at_f32(gi));
+            ids.push(node.id);
+            attrs.push(node.attr);
+        }
+        (data, ids, attrs, dim)
+    }
+
     pub fn export_vectors(&self) -> Vec<(u64, Vec<f32>, u32)> {
         let g = self.hnsw.read().unwrap();
         let dim = g.dim;
@@ -4903,20 +4935,22 @@ impl VectorIndex {
             kvs.push((vec_key(ids[i]), Value::Vector(vectors[i * dim..(i + 1) * dim].to_vec())));
         }
         self.engine.put_batch(kvs)?;
-        let existing = self.export_vectors();
-        let m = existing.len();
+        // Flat export, then append the batch in place.
+        //
+        // This used to go through `export_vectors`, which allocates a `Vec<f32>`
+        // per live vector, and then copied every one of them again into `data`.
+        // At 100k×384d that is 100k allocations plus roughly 300 MB of copying
+        // *per rebuild* — enough that it, not the 2.5 s GPU build it feeds,
+        // dominated bulk ingest and made a large-batch load appear to hang.
+        let (mut data, mut all_ids, mut all_attrs, _) = self.export_flat();
+        let m = all_ids.len();
         let total = m + n;
         if total == 0 {
             return Ok(());
         }
-        let mut data: Vec<f32> = Vec::with_capacity(total * dim);
-        let mut all_ids: Vec<u64> = Vec::with_capacity(total);
-        let mut all_attrs: Vec<u32> = Vec::with_capacity(total);
-        for (id, v, a) in &existing {
-            data.extend_from_slice(v);
-            all_ids.push(*id);
-            all_attrs.push(*a);
-        }
+        data.reserve(n * dim);
+        all_ids.reserve(n);
+        all_attrs.reserve(n);
         for i in 0..n {
             data.extend_from_slice(&vectors[i * dim..(i + 1) * dim]);
             all_ids.push(ids[i]);
