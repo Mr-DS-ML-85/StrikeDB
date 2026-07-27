@@ -2582,6 +2582,18 @@ fn main() {
         std::process::exit(0);
     }
 
+    // GPU mode comparison only — CPU vs Turbo vs Hybrid on one dataset.
+    if let Some(p) = args
+        .iter()
+        .position(|a| a == "--gpu-bench")
+        .and_then(|i| args.get(i + 1).cloned())
+    {
+        s_gpu_bench(&p);
+        let dt = t_start.elapsed().as_secs_f64();
+        println!("\n\x1b[1m=== RESULTS (gpu-bench only) ===\x1b[0m  ({dt:.1}s)");
+        std::process::exit(0);
+    }
+
     // Focused wire QPS head-to-head vs Qdrant (single-client Latency case +
     // 100-client RPS case) without running the whole suite.
     if args.iter().any(|a| a == "--wire-qps") {
@@ -2706,6 +2718,144 @@ fn main() {
 //     merged graph keeps Recall@10, and reports the ingest-speedup vs Qdrant's
 //     weak axis (serial ingest).
 // ══════════════════════════════════════════════════════════════════════════
+/// Mode-by-mode GPU benchmark: CPU / Turbo / Hybrid, nothing else.
+///
+/// The GPU numbers previously had to be extracted from `--parallel-ingest`,
+/// which runs the whole suite first — section 12 alone spends ~96 s on fsync'd
+/// WAL writes before the GPU is touched at all. That made a 2 s build take five
+/// minutes to observe and buried the one comparison that matters.
+///
+/// Each mode is measured in a fresh process-level state and reported as build
+/// rate, Recall@10 against brute-force ground truth, and single-thread query
+/// throughput, so the three are directly comparable on one dataset.
+fn s_gpu_bench(path: &str) {
+    let (n, dim, _data, norm) = load_fbin(path);
+    println!("\n\x1b[1m── GPU BENCH: {n} × {dim}d ({path}) ──\x1b[0m");
+    let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(8);
+    for (k, v) in gpu::gpu_info() {
+        println!("  {k}: {v}");
+    }
+    println!("  hardware threads: {cores}");
+
+    // Ground truth once, shared by every mode — brute force is O(n·nq·dim) and
+    // recomputing it per mode would dominate the run at 1M.
+    let nq = if n > 2000 { 200usize } else { n };
+    println!("  computing brute-force ground truth ({nq} queries × {n} vectors)...");
+    let t_gt = Instant::now();
+    let mut gt: Vec<Vec<u64>> = Vec::with_capacity(nq);
+    for qi in 0..nq {
+        let q = &norm[qi * dim..(qi + 1) * dim];
+        let mut scored: Vec<(u64, f32)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = &norm[i * dim..(i + 1) * dim];
+            let mut dot = 0f32;
+            for j in 0..dim {
+                dot += q[j] * v[j];
+            }
+            scored.push((i as u64, (1.0 - dot).max(0.0).min(2.0)));
+        }
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        gt.push(scored.iter().take(10).map(|(id, _)| *id).collect());
+    }
+    println!("  ground truth in {:.1}s", t_gt.elapsed().as_secs_f64());
+
+    let modes = [
+        ("CPU-only", gpu::ComputeMode::CpuOnly),
+        ("Turbo", gpu::ComputeMode::Turbo),
+        ("Hybrid", gpu::ComputeMode::Hybrid),
+    ];
+
+    let mut rows: Vec<(String, f64, f64, f32, f64, f64)> = Vec::new();
+    for (label, mode) in modes {
+        // Select the mode BEFORE probing availability: `gpu_available` only
+        // brings the driver up when a GPU mode is actually current, so asking
+        // first always answers "no device" and silently skips both GPU rows.
+        gpu::gpu_set_mode(mode);
+        if mode != gpu::ComputeMode::CpuOnly && !gpu::gpu_available() {
+            println!("\n  [{label}] no CUDA device — skipped");
+            continue;
+        }
+        println!("\n  \x1b[1m[{label}]\x1b[0m building {n} × {dim}d ...");
+
+        let t0 = Instant::now();
+        let idx = VectorIndex::build_parallel(&norm, dim, cores);
+        let build_dt = t0.elapsed().as_secs_f64();
+        let rate = n as f64 / build_dt.max(1e-9);
+
+        let mut hits = 0usize;
+        for qi in 0..nq {
+            let q = &norm[qi * dim..(qi + 1) * dim];
+            let res = idx.search_ef(q, 10, 128);
+            hits += res.iter().take(10).filter(|(id, _)| gt[qi].contains(id)).count();
+        }
+        let recall = hits as f32 / (nq * 10) as f32;
+
+        // Two throughput numbers, because they answer different questions and
+        // conflating them is how benchmarks mislead.
+        //
+        // Single-thread is the latency-shaped figure: it reflects the search
+        // path itself, independent of how many cores the box has. Concurrent is
+        // the aggregate-throughput ("RPS") figure Qdrant and Milvus headline,
+        // where the metric is total QPS across saturating clients.
+        let probes = nq.min(200);
+        let t_q = Instant::now();
+        for qi in 0..probes {
+            let q = &norm[qi * dim..(qi + 1) * dim];
+            std::hint::black_box(idx.search_ef(q, 10, 128));
+        }
+        let qps1 = probes as f64 / t_q.elapsed().as_secs_f64().max(1e-9);
+
+        // Concurrent: `cores` threads, each looping the query set. In-process,
+        // so this measures the index rather than the RESP wire.
+        let idx_ref = &idx;
+        let norm_ref = &norm;
+        let rounds = 20usize;
+        let t_c = Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..cores {
+                s.spawn(move || {
+                    for _ in 0..rounds {
+                        for qi in 0..probes {
+                            let q = &norm_ref[qi * dim..(qi + 1) * dim];
+                            std::hint::black_box(idx_ref.search_ef(q, 10, 128));
+                        }
+                    }
+                });
+            }
+        });
+        let qps_c =
+            (cores * rounds * probes) as f64 / t_c.elapsed().as_secs_f64().max(1e-9);
+
+        println!(
+            "  [{label}] build {build_dt:.2}s ({rate:.0} vec/s) · Recall@10 {recall:.3} · \
+             {qps1:.0} QPS (1t) · {qps_c:.0} QPS ({cores}t)"
+        );
+        rows.push((label.to_string(), build_dt, rate, recall, qps1, qps_c));
+    }
+
+    println!("\n\x1b[1m  summary — {n} × {dim}d\x1b[0m");
+    println!("  | mode | build | vec/s | Recall@10 | QPS (1t) | QPS ({cores}t) |");
+    println!("  |---|---:|---:|---:|---:|---:|");
+    for (label, dt, rate, recall, qps1, qpsc) in &rows {
+        println!("  | {label} | {dt:.2}s | {rate:.0} | {recall:.3} | {qps1:.0} | {qpsc:.0} |");
+    }
+    if let Some(base) = rows.iter().find(|r| r.0 == "CPU-only") {
+        for r in rows.iter().filter(|r| r.0 != "CPU-only") {
+            println!(
+                "  {} vs CPU-only: build {:.2}× · QPS(1t) {:.2}× · QPS({cores}t) {:.2}×  (recall {:+.3})",
+                r.0,
+                base.1 / r.1.max(1e-9),
+                r.4 / base.4.max(1e-9),
+                r.5 / base.5.max(1e-9),
+                r.3 - base.3
+            );
+        }
+    }
+    // Leave the process on the CPU path so a later section is not silently
+    // measured under whichever mode happened to run last.
+    gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly);
+}
+
 fn s22_parallel_ingest(path: &str) {
     let (n, dim, _data, norm) = load_fbin(path);
     println!("\n\x1b[1m── MODULE 1 PARALLEL BUILD: {n} × {dim}d ({path}) ──\x1b[0m");

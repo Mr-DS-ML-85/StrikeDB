@@ -1312,6 +1312,14 @@ pub struct GpuIndex {
     /// one wide launch. See [`QueryCoalescer`] — this is what keeps the SMs
     /// and the clock governor busy.
     pub coalescer: QueryCoalescer,
+    /// VUGVA tier backing `d_vectors` in `Hybrid`. `None` in `Turbo`, where the
+    /// corpus is a plain VRAM allocation.
+    ///
+    /// Ownership matters: `CorpusTier` frees its pages on drop, so if the index
+    /// did not hold it, `d_vectors` would dangle as soon as the builder
+    /// returned. It is also what keeps the pool — and therefore the retained
+    /// CUDA context — alive for as long as any pointer derived from it.
+    pub corpus: Option<CorpusTier>,
 }
 
 // ── Query coalescing (group commit for the GPU) ──────────────────────────────
@@ -1558,7 +1566,13 @@ pub struct SearchSlot {
 impl GpuIndex {
     pub fn free(&self) {
         unsafe {
-            cuMemFree_v2(self.d_vectors);
+            // Only free the corpus when this index allocated it. Under VUGVA
+            // the pointer belongs to the `CorpusTier`'s pool, which returns it
+            // to its own VRAM cache on drop — freeing it here as well is a
+            // double free of a live device block.
+            if self.corpus.is_none() {
+                cuMemFree_v2(self.d_vectors);
+            }
             cuMemFree_v2(self.d_graph);
             if self.d_delta != 0 { cuMemFree_v2(self.d_delta); }
             if self.d_query_buf != 0 { cuMemFree_v2(self.d_query_buf); }
@@ -1595,30 +1609,62 @@ pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], delta_scores: &[f3
         let mut d_v = 0u64;
         let mut d_g = 0u64;
         let mut d_d = 0u64;
+        // Kept alive for the index's lifetime: dropping a `CorpusTier` frees
+        // its pages, which would leave `d_vectors` dangling mid-query.
+        let mut tier: Option<corpus_tier::CorpusTier> = None;
         match mode {
             ComputeMode::Turbo => {
                 if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 { return None; }
                 cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
             }
             _ => {
-                // VUGVA (paper §4, Algorithm 2): hot pages are VRAM-Resident;
-                // DRAM is the *fallback* tier, not the primary residence.
-                // If the dataset fits the free-VRAM budget, promote everything
-                // to Resident up front — managed memory (page-fault migration)
-                // is only for the > VRAM case. The old code used managed
-                // memory unconditionally, so every search page-faulted over
-                // PCIe (~20 ms/query at 1M×384d).
-                let (mut free_b, mut total_b) = (0usize, 0usize);
-                cuMemGetInfo_v2(&mut free_b, &mut total_b);
-                let vram_fits = v_bytes + 512 * 1024 * 1024 <= free_b; // keep 512MB headroom
-                if vram_fits && cuMemAlloc_v2(&mut d_v, v_bytes) == 0 {
-                    cuMemcpyHtoD_v2(d_v, vectors_i8.as_ptr() as *const std::ffi::c_void, v_bytes);
-                    eprintln!("[VUGVA] {} MB promoted VRAM-Resident (fits budget)", v_bytes / 1024 / 1024);
-                } else if cuMemAllocManaged(&mut d_v, v_bytes, CU_MEM_ATTACH_GLOBAL) == 0 {
-                    std::ptr::copy_nonoverlapping(vectors_i8.as_ptr(), d_v as *mut i8, v_bytes);
-                    eprintln!("[VUGVA] {} MB in unified memory (exceeds VRAM budget, Warm tier)", v_bytes / 1024 / 1024);
-                } else {
-                    return None;
+                // VUGVA (paper §4, Algorithm 2): the corpus is served through
+                // the three-tier pool — VRAM (T0) → page-locked NUMA DRAM (T1)
+                // → NVMe (T2) — rather than by a plain device allocation.
+                //
+                // This is what distinguishes Hybrid from Turbo. Previously both
+                // ended in the same `cuMemAlloc` when the corpus fit, and
+                // Hybrid's only difference was a `cuMemAllocManaged` fallback
+                // when it did not: CUDA's own page-fault migration, which is
+                // not VUGVA and gives no control over placement, no NUMA
+                // locality, and no NVMe tier at all. Measured side by side, the
+                // two modes were indistinguishable (recall 0.994 vs 0.994,
+                // throughput within noise) because they ran identical code.
+                //
+                // `CorpusTier` owns the allocation and decides its own tier
+                // from the corpus size, so a corpus larger than VRAM *and*
+                // larger than the DRAM budget still loads — it streams to NVMe
+                // and pages back through bounded DRAM staging on access.
+                match corpus_tier::CorpusTier::new(&[0], n, dim)
+                    .and_then(|mut c| {
+                        c.upload(vectors_i8)?;
+                        let p = c.device_ptr(0)?;
+                        Ok((c, p))
+                    })
+                {
+                    Ok((c, ptr)) => {
+                        eprintln!(
+                            "[VUGVA] {} MB corpus served via TieredPool (T0/T1/T2)",
+                            v_bytes / 1024 / 1024
+                        );
+                        d_v = ptr;
+                        tier = Some(c);
+                    }
+                    Err(e) => {
+                        // Fall back to a plain device allocation rather than
+                        // failing the whole index: a machine without the DRAM
+                        // headroom for a warm tier should still serve a corpus
+                        // that fits VRAM outright.
+                        eprintln!("[VUGVA] tiering unavailable ({e}); using plain VRAM");
+                        if cuMemAlloc_v2(&mut d_v, v_bytes) != 0 {
+                            return None;
+                        }
+                        cuMemcpyHtoD_v2(
+                            d_v,
+                            vectors_i8.as_ptr() as *const std::ffi::c_void,
+                            v_bytes,
+                        );
+                    }
                 }
             }
         }
@@ -1696,6 +1742,7 @@ pub fn gpu_build_index(vectors_i8: &[i8], graph_flat: &[i32], delta_scores: &[f3
             d_odist_buf: d_ob, d_vec_f32: 0, d_qf_buf: 0, max_q, max_k,
             slots, slot_mask: std::sync::atomic::AtomicU32::new(0),
             coalescer: QueryCoalescer::new(),
+            corpus: tier,
         })
     }
 }

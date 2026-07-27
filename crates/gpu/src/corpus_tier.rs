@@ -198,6 +198,25 @@ pub fn mode_uses_tiering(mode: ComputeMode) -> bool {
 mod tests {
     use super::*;
 
+    /// Serialize every test that allocates device memory.
+    ///
+    /// `cargo test` runs these as parallel threads in one process, and CUDA
+    /// contexts and VRAM are process-global. This is not a theoretical concern
+    /// here: the round-trip test below reads back near-total garbage
+    /// (1,566,595 of 1,572,864 bytes wrong) when run alongside the rest of the
+    /// crate's GPU tests, and is byte-exact when run alone or with
+    /// `--test-threads=1`. Two tests binding different contexts on interleaved
+    /// threads hand each other device pointers that are not valid in the
+    /// context that reads them.
+    ///
+    /// The same lock exists in `vugva`'s hardware tests for the same reason.
+    /// The poison is recovered rather than propagated: one panicking test
+    /// should not cascade into every later one.
+    fn gpu_exclusive() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn only_hybrid_is_tiered() {
         assert!(
@@ -221,6 +240,7 @@ mod tests {
     /// and page-locks real DRAM, so there is nothing to assert without one.
     #[test]
     fn reports_the_shape_it_was_allocated_with() {
+        let _gpu = gpu_exclusive();
         if !crate::gpu_init() {
             eprintln!("no CUDA device — skipping");
             return;
@@ -250,6 +270,7 @@ mod tests {
     /// is as useless as one that fails outright.
     #[test]
     fn a_corpus_larger_than_dram_round_trips_to_the_device() {
+        let _gpu = gpu_exclusive();
         if !crate::gpu_init() {
             eprintln!("no CUDA device — skipping");
             return;
@@ -293,6 +314,7 @@ mod tests {
     /// neither tier bounds the corpus.
     #[test]
     fn a_corpus_larger_than_the_dram_budget_still_allocates() {
+        let _gpu = gpu_exclusive();
         if !crate::gpu_init() {
             eprintln!("no CUDA device — skipping");
             return;

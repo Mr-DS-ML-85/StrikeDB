@@ -185,7 +185,19 @@ void apgc_search_kernel(
     }
     __syncthreads();
 
-    float selkv_min = 1.0f - selkv_ratio;       // OpusEdge SelKV gate
+    // OpusEdge SelKV gate.
+    //
+    // The epsilon is load-bearing, not defensive padding. Host-side δ is
+    // `0.1f + 0.9f * indeg / max_indeg`, so a zero-in-degree node scores
+    // *exactly* 0.1f. At the default ratio of 0.9 the naive threshold is
+    // `1.0f - 0.9f`, which in binary32 is 0.10000002 — strictly greater than
+    // 0.1f. Every node with no in-edges therefore failed the gate and was
+    // permanently excluded as a search candidate, putting an unexplainable
+    // floor under GPU recall that looks like poor graph quality rather than an
+    // arithmetic artefact. The two constants are computed by different
+    // expressions and cannot be relied on to round to the same value, so the
+    // comparison is given a tolerance well below any meaningful δ spacing.
+    float selkv_min = 1.0f - selkv_ratio - 1e-5f;
     // OpusEdge Delta-AR: read only a prefix of the δ-sorted adjacency.
     // Opt-in only — the default reads the full neighbour list, because
     // truncating it costs far more recall than it saves time (see header).
