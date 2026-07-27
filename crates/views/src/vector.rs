@@ -5000,7 +5000,25 @@ impl VectorIndex {
         //
         // The mode is NEVER silently changed here: if the GPU index is missing
         // or the launch fails we just fall through to the CPU path.
-        if mode == gpu::ComputeMode::Turbo {
+        // Single queries stay on the CPU even under Turbo.
+        //
+        // A graph query is one CUDA block, so a lone query leaves 23 of 24 SMs
+        // idle on this class of device and the launch plus PCIe round-trip cost
+        // more than the walk they replace. Measured at 100k×384d: GPU 1,834 QPS
+        // against the CPU's 2,991 for one thread, and 21,263 against 26,568 at
+        // sixteen — raising concurrency does not rescue it, because sixteen
+        // client threads is still only sixteen blocks.
+        //
+        // The device wins decisively on *batches* (33,690 vs 3,009 QPS at
+        // 256 queries — 11.2×), which is what `search_many` submits. Routing by
+        // query shape rather than by mode means a user selecting Turbo gets the
+        // GPU where it helps and the CPU where it does not, instead of having to
+        // know this and choose per call site.
+        //
+        // `DBSTRIKE_GPU_SINGLE=1` forces the device path anyway, so the
+        // regression stays measurable rather than becoming unreachable.
+        let force_single_gpu = std::env::var("DBSTRIKE_GPU_SINGLE").as_deref() == Ok("1");
+        if mode == gpu::ComputeMode::Turbo && force_single_gpu {
             let guard = self.gpu_idx.read().unwrap();
             if let Some(ref idx) = *guard {
                 let fetch_k = gpu::GPU_TOPK_MAX.min(idx.n).max(k.min(idx.n));
@@ -5116,10 +5134,19 @@ impl VectorIndex {
         let mode = gpu::gpu_get_mode();
         let num_queries = queries.len();
 
-        // ── TURBO: Batch ALL queries into ONE GPU kernel call ──
-        // This is the APGC way: Q blocks × 256 threads, one kernel launch.
-        // GPU stays busy the entire time — no per-query overhead.
-        if mode == gpu::ComputeMode::Turbo && gpu::gpu_available() {
+        // ── GPU: batch ALL queries into ONE kernel call ──
+        // The APGC way: Q blocks × 256 threads, one launch. This is the shape
+        // that fills the device — 11.2× the CPU at 256 queries — and it is why
+        // batching, not concurrency, is what makes GPU search worth using.
+        //
+        // Hybrid takes this path as well as Turbo. It was previously gated on
+        // Turbo alone, which meant a mode whose entire purpose is serving a
+        // corpus through VUGVA uploaded that corpus to the device and then
+        // never read it — every Hybrid query ran on the CPU, so its throughput
+        // column measured graph quality and said nothing about tiering.
+        if matches!(mode, gpu::ComputeMode::Turbo | gpu::ComputeMode::Hybrid)
+            && gpu::gpu_available()
+        {
             let guard = self.gpu_idx.read().unwrap();
             if let Some(ref idx) = *guard {
                 // Normalize once, keep BOTH representations: int8 drives the

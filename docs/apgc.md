@@ -98,30 +98,37 @@ GPU-accelerated distance computation using Tensor Cores:
 Real embeddings, 100k × 384-d, RTX 4060 (8 GB) + Ryzen 7700 (16 threads).
 Reproduce with `dbstrike-bench --gpu-bench <vectors.fbin>` (~25 s).
 
-| mode | build | vec/s | Recall@10 | QPS (1t) | QPS (16t) | QPS (batch 256) | search on |
-|---|---:|---:|---:|---:|---:|---:|---|
-| CPU-only | 7.41 s | 13,498 | **0.999** | 2,991 | 26,568 | 3,009 | CPU |
-| Turbo | **2.54 s** | **39,325** | 0.993 | 1,834 | 21,263 | **33,690** | GPU |
-| Hybrid (VUGVA) | 2.81 s | 35,572 | 0.994 | 8,720 | **92,434** | 8,488 | CPU |
+| mode | build | vec/s | Recall@10 | QPS (1t) | QPS (16t) | QPS (batch 256) |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU-only | 7.16 s | 13,964 | **0.999** | 2,900 | 23,675 | 2,832 |
+| Turbo | **2.57 s** | **38,916** | 0.994 | **7,607** | **86,641** | **35,198** |
+| Hybrid (VUGVA) | 2.85 s | 35,105 | 0.994 | 8,288 | 80,133 | 27,747 |
+
+Turbo vs CPU-only: build **2.79×** · 1t **2.62×** · 16t **3.66×** · batch **12.43×**
 
 **What this shows, including what it does not.**
 
-*Build is where the GPU wins.* 2.54 s against 7.41 s — **2.9×** — at a cost of
-0.006 recall. Phase 1 (pivot assignment) and the NN-descent refine both run on
+*Build is where the GPU wins.* 2.57 s against 7.16 s — **2.79×** — at a cost of
+0.005 recall. Phase 1 (pivot assignment) and the NN-descent refine both run on
 device; the CPU only wires edges.
 
-*Batched GPU search wins by 11.2×; single-query search loses by 0.61×.* A graph
-query is one CUDA block, so on a 24-SM device a lone query leaves 23 SMs idle —
-and 16 concurrent client threads is still only 16 blocks, which is why raising
-thread count does not rescue it. Batching 256 queries fills the device and
-yields 33,690 QPS against the CPU's 3,009. Note this is *not* the coalescer:
-disabling it (`GPU_COALESCE=0`) changes single-query throughput by ~1%, so the
-cost is genuine per-launch and PCIe latency rather than a batch-window stall.
+*Only the batch column is GPU search: 12.4×.* 35,198 QPS against the CPU's
+2,832. A graph query is one CUDA block, so a lone query leaves 23 of 24 SMs idle
+— and 16 client threads is still only 16 blocks, which is why raising thread
+count never rescued it. Single queries are therefore routed to the CPU in every
+mode; `DBSTRIKE_GPU_SINGLE=1` forces the device path and reproduces the 0.61×
+regression. Ruled out as causes: the coalescer (`GPU_COALESCE=0` moves it ~1%)
+and a shared-memory cliff (7–12 KB used against the 48 KB limit).
 
-*Hybrid's QPS column is not a GPU number.* `search_ef` takes the device path only
-under `Turbo`. Hybrid serves its corpus through VUGVA's `TieredPool` and then
-searches on CPU, so 92,434 measures the CPU search path over a GPU-built graph.
-The graph really is better; the number is not evidence about tiering.
+*The 1t and 16t columns measure graph quality, not hardware.* Every row runs the
+same CPU search code there, and Turbo still wins 2.62× and 3.66× because the
+APGC graph — flat, degree-54, locality-ordered — is cheaper to walk than a
+CPU-built M=32 hierarchy. A CPU-only deployment keeps most of that gain provided
+the index was built on a GPU.
+
+*Hybrid now takes the device path for batches too.* `search_many` was gated on
+`Turbo` alone, so the mode whose whole purpose is serving a corpus through VUGVA
+uploaded that corpus and never read it. Both GPU modes now batch on device.
 
 *The tiering is not stressed here.* 36 MB fits VRAM, so nothing demotes or
 spills. T2 has unit and hardware coverage (a corpus 1.5× the DRAM budget writes
