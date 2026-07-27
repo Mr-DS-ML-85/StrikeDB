@@ -2838,6 +2838,21 @@ fn s_gpu_bench(path: &str) {
         let qs: Vec<Vec<f32>> = (0..batch)
             .map(|qi| norm[qi * dim..(qi + 1) * dim].to_vec())
             .collect();
+        // Validate batched output before timing it.
+        //
+        // `search_many` is the path batches take to the device, and until now
+        // nothing checked what it returned — recall was only ever measured
+        // through `search_ef`. A batch path that silently returns wrong
+        // neighbours would have shown up as a throughput win, which is the most
+        // dangerous shape a bug can take here.
+        let batch_hits: usize = idx
+            .search_many(&qs, 10)
+            .iter()
+            .enumerate()
+            .map(|(qi, res)| res.iter().take(10).filter(|(id, _)| gt[qi].contains(id)).count())
+            .sum();
+        let recall_b = batch_hits as f32 / (batch * 10) as f32;
+
         let batch_rounds = 20usize;
         let t_b = Instant::now();
         for _ in 0..batch_rounds {
@@ -2847,7 +2862,8 @@ fn s_gpu_bench(path: &str) {
 
         println!(
             "  [{label}] build {build_dt:.2}s ({rate:.0} vec/s) · Recall@10 {recall:.3} · \
-             {qps1:.0} 1t · {qps_c:.0} {cores}t · {qps_b:.0} batch{batch}"
+             {qps1:.0} 1t · {qps_c:.0} {cores}t · {qps_b:.0} batch{batch} \
+             (batch recall {recall_b:.3})"
         );
         rows.push((label.to_string(), build_dt, rate, recall, qps1, qps_c, qps_b));
     }
