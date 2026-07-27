@@ -53,10 +53,30 @@ The id remap is correct. The **input contract** is not:
 - Un-normalized coordinates saturate the `i8` cast → the graph is built on
   garbage. Not mislabelled: genuinely wrong neighbours.
 
+**Survey done — the diagnosis is worse than "normalize before routing".**
+`l2_normalize` is called *inside* `Hnsw::insert_attr` (`vector.rs:1988`,
+`:2021`), so every CPU insert path normalizes internally and **all**
+`build_parallel*` callers legitimately pass raw data. The GPU block is the only
+place that quantizes without normalizing first.
+
+That makes this a **latent bug in the GPU build path itself**, not merely a
+routing mismatch:
+
+- It works on `real_*.fbin` only because sentence-transformer embeddings happen
+  to arrive L2-normalized already. The 9.29× / recall-0.994 result is therefore
+  correct *for that data* and would silently degrade on any un-normalized corpus.
+- Two sites need it, both in `build_parallel_tiered`'s GPU block:
+  - `let i8_all = ... (data[row * dim + d] * 127.0) as i8` (~`:3786`)
+  - `for d in 0..dim { h.all_i8.push((data[base + d] * 127.0) as i8) }` (~`:3889`)
+- `h.all_f32` (~`:3890`) must store the **normalized** vector too, since the
+  exact-f32 rerank dots it against a normalized query — check what the CPU path
+  puts in `all_f32` and match it exactly, or rerank scores will disagree with
+  traversal scores.
+
 **To finish:**
-1. L2-normalize before routing. **First check whether existing `build_parallel*`
-   callers already pre-normalize** — normalizing inside the builder could
-   double-normalize them. This survey is the actual work.
+1. Normalize per row inside the GPU block (all three sites above), matching what
+   `insert_attr` does. Do **not** normalize at the call site — that would leave
+   the latent bug in place for every other GPU-build caller.
 2. Re-run `parallel_build_labels_each_vector_with_its_own_id` under
    `DBSTRIKE_GPU=turbo`; must pass at 1, 4, **and** 8 shards (1 shard skips the
    shuffle, so it passes even when broken — 4/8 are the meaningful cases).
