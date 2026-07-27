@@ -242,4 +242,4 @@ Future work includes: (1) extending APGC to support billion-scale datasets, (2) 
 
 **Keywords**: GPU-accelerated ANN search, mixed-precision graph construction, KV-aware search pruning, unified VRAM architecture, dynamic precision switching, LLM inference integration
 
-**License**: CC BY-NC 4.0
+**License**: AGPLv3
