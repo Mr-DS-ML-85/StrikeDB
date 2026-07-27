@@ -1,61 +1,68 @@
-# APGC — Adaptive Precision Graph Construction
+# APGC — GPU-Built, CPU-Served ANN Index
 
 ## Overview
 
-APGC builds kNN graphs using mixed-precision distance computation, adapting precision to node importance. Combined with KV-aware search pruning from OpusEdge and memory tiering from VUGVA.
+APGC constructs a kNN graph entirely on the GPU in INT8, then serves queries from
+the CPU. Index residence is managed by VUGVA's VRAM→DRAM→NVMe tiering.
 
-## Precision Hierarchy
+The name is historical: "Adaptive Precision Graph Construction" described an
+earlier design. What shipped adapts precision differently — see below — and the
+paper (`research/APGC_Paper.tex`) is titled for what the system actually does.
 
-```
-Node Importance (top → bottom):
-┌─────────────────────────────────────┐
-│  Seed nodes (1%)     → FP32 (4B)   │  Maximum precision
-│  High-importance (9%) → BF16 (2B)   │  Wide exponent range
-│  Majority (80%)      → FP16/BF16   │  Tensor Core accelerated
-│  Near-outlier (9%)   → FP8 (1B)    │  4× memory reduction
-│  Outlier (1%)        → INT8 (1B)   │  Maximum compression
-└─────────────────────────────────────┘
-Overall: 50% memory savings vs FP32-only
-```
+## Precision: INT8 throughout, exact where it matters
 
-## Algorithm
+Construction runs entirely in INT8 via `dp4a`. That is not a compromise, it is
+the fast path — per instruction on `sm_89`:
 
-```
-Input: V[N][D], precision thresholds, GPU capabilities
-Output: kNN graph G with mixed-precision edges
+| instruction | multiply-accumulates |
+|---|---:|
+| `dp4a` (INT8) | **4** |
+| `half2` FMA (FP16) | 2 |
+| FP32 FMA | 1 |
 
-Phase 1: Seed Initialization
-  seeds = random_sample(V, 1%)
-  G_seed = build_knn(seeds, k, FP32)  // Full precision for critical nodes
+So a precision hierarchy assigning FP16 to the *majority* of distance work —
+which an earlier design did — would roughly **halve** build throughput. INT8
+everywhere is both simpler and faster.
 
-Phase 2: Precision Assignment
-  for each node v in V:
-    if v is seed:        precision = FP32
-    elif v < 90th %ile:  precision = BF16 (or FP16 on V100)
-    elif v < 99th %ile:  precision = FP8 (or FP16 on V100)
-    else:                precision = INT8
+Precision is instead spent where quantization error changes the answer:
 
-Phase 3: Graph Expansion
-  for each node v in V \ seeds:
-    distances[v][*] = compute_distance(v, V, precision[v])
-    G.add_edges(v, top_k(distances[v]))
-```
+- **Candidate rerank** — the graph is walked in INT8, and the retrieved
+  candidates are rescored against exact FP32 vectors, fused into the same kernel
+  launch. Touches O(k) vectors rather than the O(ef·degree) the walk visits.
+- **Entry nodes** — every descent starts from the same few nodes, so error there
+  propagates into every query while error at a leaf affects one.
 
-## KV-Aware Search Pruning
+The principle: **precision follows error propagation, not node rank.**
 
-Uses LLM attention patterns to guide graph traversal:
+## Construction pipeline
 
-1. **Attention Scoring**: OpusEdge provides per-token importance via Δ signal
-2. **Region Weighting**: High-attention graph nodes are expanded at FP32 precision
-3. **Precision Selection**: Low-attention nodes use INT8 or are skipped entirely
-4. **Beam Pruning**: Reduce search beam from N to K based on attention scores
+Three phases, all INT8:
 
-```
-Search Pruning Results (8192 candidates):
-  Input:  8192 candidates
-  Output: 32 pruned candidates (99.6% reduction)
-  Latency: 68.8 µs (14.5K prunes/s)
-```
+1. **Pivot assignment** — `min(n/50, 2048)` pivots by strided sampling; each node
+   records its nearest and second-nearest pivot. The cap matters: a pivot set
+   proportional to n makes this O(n²).
+2. **Locality ordering** — sort by (pivot, 2nd pivot, distance) and wire each
+   node to its neighbours in that 1-D order. **Zero distance computations.** Its
+   job is a non-degenerate starting point plus cache-friendly node numbering.
+3. **GPU NN-descent** — 8–12 passes; candidates from own list ∪ reverse list ∪
+   forward/reverse joins, exact INT8 top-k retained, double-buffered on device.
+
+## Search pruning (SelKV / Delta-AR)
+
+Adjacency lists are sorted by node **hubness** — `delta = 0.1 + 0.9·indeg/max_indeg`,
+i.e. normalized graph in-degree.
+
+Two things worth stating plainly:
+
+- This is a **graph-degree heuristic, not an LLM attention signal.** An earlier
+  design routed OpusEdge Δ scores here; the shipped code does not.
+- **Both gates are effectively off by default.** SelKV's threshold at
+  `selkv_ratio=0.9` sits at the minimum possible δ, so nothing is pruned;
+  Delta-AR (`delta_ar_k=0`) reads the full adjacency. Enabling either trades
+  recall for negligible latency, which is why they are off.
+
+The surviving effect is the δ-ordering of adjacency, which changes candidate
+visit order.
 
 ## GPU Integration
 
