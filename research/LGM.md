@@ -159,8 +159,17 @@ The GPU in LGM is not just for distance computation. It is the **membrane orches
 1. **Parallel Edge Updates**: The GPU updates thousands of edge weights simultaneously
 2. **Online Training**: The lightweight GNN trains on GPU using query feedback
 3. **Tier Movement**: The GPU coordinates VUGVA to move vectors between tiers
-4. **Batch Search**: Large batches are searched on GPU (12.43× speedup)
-5. **Single Query Routing**: Small queries are routed to CPU (2.62× speedup)
+4. **Batch Search**: Large batches are searched on GPU. Measured at 100k×384-d
+   on an RTX 4060: 22,116 QPS at a matched beam of 128 — **7.7× a single CPU
+   core, but 0.79× a saturated 16-core CPU (27,894 QPS)**. On this hardware the
+   device does *not* win at search; batching only closes the gap. An earlier
+   draft cited 12.43× here, which compared an unequal beam against a
+   single-threaded baseline and is retracted.
+5. **Single Query Routing**: Small queries are routed to CPU. Forced onto the
+   device a single query reaches 0.61× the CPU, because a graph traversal is
+   inherently sequential and maps to one CUDA block — 23 of 24 SMs idle.
+6. **Build**: this is where the GPU actually wins — **~3×** (≈3.5× once NVRTC
+   compilation is excluded from the timer), at 0.994 recall against 0.999.
 
 ### 3.6 Query Routing Policy
 
