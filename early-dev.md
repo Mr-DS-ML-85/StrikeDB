@@ -88,33 +88,55 @@ A note explaining all this is already in the source at the call site.
 
 ## 2. GPU / APGC
 
-### 2.1 `#77` — wire `CorpusTier` into `GpuIndex` for Hybrid search
-**Status:** blocked on a missing prerequisite I discovered late.
+### 2.1 `#77` — `CorpusTier` → `GpuIndex`: **done**, but search does not use it
+`TieredPool::write_page` → `CorpusTier::upload` → `gpu_build_index` serves the
+Hybrid corpus from the tier. Confirmed live by the log line
+`[VUGVA] 36 MB corpus served via TieredPool (T0/T1/T2)`. `GpuIndex` owns the
+tier (it frees its pages on drop, so `d_vectors` would otherwise dangle) and
+`GpuIndex::free` skips the corpus pointer when the tier owns it.
 
-`CorpusTier` (`crates/gpu/src/corpus_tier.rs`) has `allocate` / `device_ptr` /
-`demote` / `sweep` but **no `upload()`** — there is no way to get vectors *into*
-the tier. Chain required:
+**The remaining gap is on the search side, not the memory side.**
+`search_ef:5003` branches to the device only under `Turbo`:
 
-1. `TieredPool::write_page()` in `vugva` `tiered.rs` — write host data into a
-   page, spill-file-aware (for `Tier::Ssd` pages this must write through to the
-   file; `SpillFile::write_at` already exists for exactly this)
-2. `CorpusTier::upload(&[i8])`
-3. Swap `GpuIndex.d_vectors` (`crates/gpu/src/lib.rs:~1160`) to come from
-   `CorpusTier::device_ptr` when mode is Hybrid
-4. Replace the binary VRAM check in `gpu_should_use_gpu`
-   (`crates/gpu/src/lib.rs:459`) — it currently falls back to CPU when the corpus
-   exceeds VRAM, which is the exact cliff VUGVA exists to remove
+```rust
+if mode == gpu::ComputeMode::Turbo { ... gpu_idx ... }
+```
 
-**Until this lands, `Hybrid` is `Turbo`-with-CPU-fallback, not a third tier.**
+So Hybrid uploads its corpus through VUGVA and then searches on **CPU**. Its
+QPS column measures graph quality, not tiering. Either extend that branch to
+Hybrid, or accept that Hybrid means "GPU build + CPU search" and say so.
+
+Also still true: `gpu_should_use_gpu:459` keeps the binary fits-in-VRAM check.
 
 ### 2.2 `#67` — fuse f32 rerank into `apgc_search`
 In progress before this session. Turbo currently emits the int8 ranking and the
 host reranks unless `d_vec_f32` is populated.
 
-### 2.3 `#73` — VUGVA prefetch + DMA ring still stubbed
-`prefetch.rs` (Look-Ahead Attention Tracking) and `dma.rs` (descriptor ring) are
-scaffolding. The paper's §3.2/§5.2 prefetch is not implemented. Promotion works
-but is synchronous — no overlap of transport with compute.
+### 2.3 `#73` — prefetch: **done at the pool level**; ring still advisory
+`TieredPool::prefetch(name, gpu_idx)` issues the DRAM→VRAM copy on the prefetch
+stream and records an event; `access` claims it via `claim_prefetch` and only
+waits on the event. Measured (8 × 32 MiB, RTX 4060):
+
+```
+issue 7.47 ms · claim 12.69 ms   vs   cold 40.81 ms   → 3.2× on the claim
+```
+
+Covered by `paper_prefetch_overlaps_transport_with_compute`, which asserts both
+halves — that the timing improves *and* that each page carries its own bytes
+(distinct per-page contents, so a prefetch returning the wrong page's pointer
+fails rather than passing).
+
+Still open here:
+- `prefetch.rs::prefetch_ahead` remains the old layer-schedule API whose `Dram`
+  and `Ssd` arms are empty (`// here we record the intent`). Only its
+  VRAM→VRAM peer copy is real. The pool-level `prefetch` above supersedes it for
+  every caller that has a `TieredPool`; `prefetch_ahead` should either be
+  rewritten on top of it or removed.
+- Cold (T2) pages are **not** prefetched — a file read would have to happen
+  before any device copy, and blocking there defeats the purpose. They promote
+  synchronously.
+- `dma.rs`'s descriptor ring is still bookkeeping: real transfers go through
+  `cuMemcpy*Async` on the stream pool, not the ring.
 
 ### 2.4 Remaining CPU round-trips in the build
 `#78` fixed Phase-1 seeding (single launch when VRAM allows; log line
@@ -150,6 +172,17 @@ exists and is proven (`build_parallel_ids`, `merge_segments`, recall 0.994 vs
 that lands.
 
 ---
+
+### 2.5 GPU search is slower than CPU search — the biggest open perf question
+Once `upload_to_gpu` was actually called (it had one caller in the tree, so
+`GpuIndex` was never built outside `quick_bench`), the real device numbers
+appeared and Turbo is **0.62× single-thread / 0.77× concurrent** against CPU
+search at 100k×384d — ~545 µs/query vs ~340 µs.
+
+Per-query launch + PCIe round-trip exceed the graph walk they replace.
+`QueryCoalescer` exists to amortize exactly this and evidently is not engaging
+on this path — that is the first thing to check. Until it is understood, the
+defensible claim is **GPU-accelerated *build***, not GPU-accelerated search.
 
 ## 4. Unproven / unmeasured — needed before publishing
 

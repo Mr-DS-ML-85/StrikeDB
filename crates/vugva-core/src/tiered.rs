@@ -75,6 +75,14 @@ pub struct TieredPool {
     /// corpus larger than the DRAM pool fails to allocate, which is the
     /// capacity cliff the third tier exists to remove.
     spill: Option<crate::spill::SpillFile>,
+    /// Promotions started by [`TieredPool::prefetch`] and not yet claimed.
+    ///
+    /// `name → (gpu_idx, device_ptr, size, completion event)`. This is what
+    /// makes the paper's §3.2 look-ahead real rather than advisory: the copy is
+    /// issued on the prefetch stream and the CPU returns immediately, so the
+    /// transfer overlaps whatever the compute stream is doing. `access` then
+    /// finds the work already in flight and only has to wait on the event.
+    inflight: std::collections::HashMap<String, (usize, u64, usize, crate::streams::CudaEvent)>,
     /// Idle timeout for demotion (nanoseconds).
     idle_threshold_ns: u64,
     /// Hot-access threshold for proactive promotion.
@@ -336,6 +344,7 @@ impl TieredPool {
             dram_pools,
             vram_free: vec![Vec::new(); num_gpus],
             spill: None,
+            inflight: std::collections::HashMap::new(),
             idle_threshold_ns: DEFAULT_IDLE_NS,
             hot_threshold: HOT_ACCESS_THRESHOLD,
         })
@@ -464,6 +473,14 @@ impl TieredPool {
     /// Total data transferred: megabytes.
     pub fn access(&mut self, name: &str, gpu_idx: usize) -> Result<u64> {
         let now = current_time_ns();
+
+        // A prefetch may already have moved this page. Claiming it turns the
+        // access into a wait on an event that is very likely already signalled,
+        // instead of starting a transfer now — which is the entire point of
+        // running the look-ahead.
+        if let Some(ptr) = self.claim_prefetch(name, gpu_idx, now)? {
+            return Ok(ptr);
+        }
 
         // Step 1: Check tier and get source info (immutable borrow).
         //
@@ -885,6 +902,105 @@ impl TieredPool {
             .ok_or(VugvaError::InvalidGpu(gpu_idx))?
             .push((bytes, ptr));
         Ok(())
+    }
+
+    /// Start promoting `name` to `gpu_idx` without waiting for it.
+    ///
+    /// This is Algorithm 3 (Look-Ahead Prefetch) at the pool level. The copy is
+    /// issued on the *prefetch* stream and an event is recorded behind it, so
+    /// the call returns as soon as the descriptor is queued and the transfer
+    /// runs alongside whatever the compute stream is doing. A later [`access`]
+    /// finds the work in flight and only has to wait on the event, which is how
+    /// `T_total = max(T_compute(n), T_transport(n+1))` from §3.2 is actually
+    /// obtained rather than merely described.
+    ///
+    /// Only the DRAM→VRAM edge is prefetched. A cold page needs a file read
+    /// before any device copy can start, and issuing blocking I/O here would
+    /// defeat the purpose — cold pages are promoted synchronously by `access`.
+    ///
+    /// Idempotent and best-effort: prefetching a resident page, a page already
+    /// in flight, or a page whose promotion cannot be started is a no-op rather
+    /// than an error. A prefetch that fails must never break the access that
+    /// follows it.
+    ///
+    /// [`access`]: TieredPool::access
+    pub fn prefetch(&mut self, name: &str, gpu_idx: usize) -> Result<()> {
+        if self.inflight.contains_key(name) {
+            return Ok(());
+        }
+        let (tier, total, host_ptr) = {
+            let page = match self.vmt.lookup(name) {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let hp = page.dram_chunks.first().map(|c| c.host_ptr);
+            (page.tier, page.size_bytes, hp)
+        };
+        if tier != Tier::Dram {
+            return Ok(());
+        }
+        let host_ptr = match host_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let dst = self.alloc_vram_on_gpu(gpu_idx, total)?;
+        self.set_context(gpu_idx)?;
+        let event = crate::streams::CudaEvent::new_blocking()?;
+        // SAFETY: `dst` is a fresh device block of `total` bytes and `host_ptr`
+        // names `total` bytes of the pinned pool.
+        unsafe {
+            let rc = crate::ffi::cuda::cuMemcpyHtoDAsync_v2(
+                crate::ffi::cuda::CUdeviceptr(dst),
+                host_ptr as *const std::ffi::c_void,
+                total,
+                self.streams.prefetch[gpu_idx].as_raw(),
+            );
+            if rc != 0 {
+                // Hand the block back rather than stranding it; the caller is
+                // no worse off than if prefetch had not been attempted.
+                let _ = self.free_vram_on_gpu(gpu_idx, dst, total);
+                return check_cu("cuMemcpyHtoDAsync_v2", rc);
+            }
+        }
+        event.record(&self.streams.prefetch[gpu_idx])?;
+        self.inflight
+            .insert(name.to_string(), (gpu_idx, dst, total, event));
+        Ok(())
+    }
+
+    /// Number of prefetches issued and not yet claimed by an `access`.
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.len()
+    }
+
+    /// Claim a prefetch started earlier, if one matches this page and GPU.
+    ///
+    /// Returns the device pointer once the transfer has landed. A prefetch for
+    /// a *different* GPU is discarded rather than used: the pointer would be
+    /// invalid in the requesting context, and silently returning it is exactly
+    /// the class of bug that produces plausible-looking garbage.
+    fn claim_prefetch(&mut self, name: &str, gpu_idx: usize, now: u64) -> Result<Option<u64>> {
+        let Some((pf_gpu, ptr, size, event)) = self.inflight.remove(name) else {
+            return Ok(None);
+        };
+        if pf_gpu != gpu_idx {
+            let _ = self.free_vram_on_gpu(pf_gpu, ptr, size);
+            return Ok(None);
+        }
+        event.synchronize()?;
+        let page = self.vmt.lookup_mut(name).unwrap();
+        let elem_size = page.element_size;
+        page.vram_chunks.push(Chunk {
+            gpu_ordinal: self.cluster.ordinals[gpu_idx],
+            device_ptr: ptr,
+            size_bytes: size,
+            num_elements: size / elem_size,
+        });
+        page.tier = Tier::Vram;
+        page.state = PageState::Resident;
+        page.touch(now);
+        Ok(Some(ptr))
     }
 
     /// Fill a page with `data`, writing to whichever tier currently backs it.
