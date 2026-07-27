@@ -14,6 +14,7 @@
 \citation{rabitq2026}
 \citation{opusedge2026}
 \citation{vugva2026}
+\@writefile{toc}{\contentsline {paragraph}{Relationship to an earlier draft.}{2}{section*.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {2}Background and Related Work}{2}{section.2}\protected@file@percent }
 \newlabel{sec:related}{{2}{2}{Background and Related Work}{section.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.1}GPU-Accelerated ANN Search}{2}{subsection.2.1}\protected@file@percent }
@@ -21,45 +22,53 @@
 \newlabel{tab:sota}{{2}{2}{State-of-the-art GPU-accelerated ANN systems}{table.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.2}KV Cache Optimization}{2}{subsection.2.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Unified Memory Architectures}{2}{subsection.2.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {3}APGC Architecture}{2}{section.3}\protected@file@percent }
-\newlabel{sec:architecture}{{3}{2}{APGC Architecture}{section.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Mixed-Precision Graph Construction}{2}{subsection.3.1}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Ternary precision hierarchy for graph construction.}}{2}{table.3}\protected@file@percent }
-\newlabel{tab:precision}{{3}{2}{Ternary precision hierarchy for graph construction}{table.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}KV-Aware Search Pruning}{2}{subsection.3.2}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces APGC system architecture with VUGVA-aware three-tier memory hierarchy.}}{3}{figure.1}\protected@file@percent }
-\newlabel{fig:overview}{{1}{3}{APGC system architecture with VUGVA-aware three-tier memory hierarchy}{figure.1}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}VUGVA-Aware Memory Tiering}{3}{subsection.3.3}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces VUGVA-aware memory tiering for graph data.}}{3}{table.4}\protected@file@percent }
-\newlabel{tab:tiering}{{4}{3}{VUGVA-aware memory tiering for graph data}{table.4}{}}
-\newlabel{eq:tier_score}{{1}{3}{VUGVA-Aware Memory Tiering}{equation.1}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Dynamic Precision Switching Kernel}{3}{subsection.3.4}\protected@file@percent }
-\citation{ootomo2024cagra}
+\@writefile{toc}{\contentsline {section}{\numberline {3}APGC Architecture}{3}{section.3}\protected@file@percent }
+\newlabel{sec:architecture}{{3}{3}{APGC Architecture}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Precision Allocation}{3}{subsection.3.1}\protected@file@percent }
+\newlabel{sec:precision}{{3.1}{3}{Precision Allocation}{subsection.3.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{The candidate set.}{3}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The entry points.}{3}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Construction Pipeline}{3}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:pipeline}{{3.2}{3}{Construction Pipeline}{subsection.3.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Phase 1: pivot assignment.}{3}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Phase 2: locality ordering.}{3}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Phase 3: GPU NN-descent.}{3}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}VUGVA-Backed Index Residence}{3}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:vugva}{{3.3}{3}{VUGVA-Backed Index Residence}{subsection.3.3}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces APGC system architecture with VUGVA-aware three-tier memory hierarchy.}}{4}{figure.1}\protected@file@percent }
+\newlabel{fig:overview}{{1}{4}{APGC system architecture with VUGVA-aware three-tier memory hierarchy}{figure.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Query-Shape Routing}{4}{subsection.3.4}\protected@file@percent }
+\newlabel{sec:routing}{{3.4}{4}{Query-Shape Routing}{subsection.3.4}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {4}Experimental Results}{4}{section.4}\protected@file@percent }
-\newlabel{sec:evaluation}{{4}{4}{Experimental Results}{section.4}{}}
+\newlabel{sec:results}{{4}{4}{Experimental Results}{section.4}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Setup}{4}{subsection.4.1}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Experimental configuration.}}{4}{table.5}\protected@file@percent }
-\newlabel{tab:setup}{{5}{4}{Experimental configuration}{table.5}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Build Time}{4}{subsection.4.2}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Graph construction performance.}}{4}{table.6}\protected@file@percent }
-\newlabel{tab:build}{{6}{4}{Graph construction performance}{table.6}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Recall@10}{4}{subsection.4.3}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Search quality and latency.}}{4}{table.7}\protected@file@percent }
-\newlabel{tab:recall}{{7}{4}{Search quality and latency}{table.7}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Memory Usage}{4}{subsection.4.4}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces Memory consumption comparison.}}{4}{table.8}\protected@file@percent }
-\newlabel{tab:memory}{{8}{4}{Memory consumption comparison}{table.8}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.5}Aggregate Performance}{4}{subsection.4.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {5}Novelty and Contributions}{4}{section.5}\protected@file@percent }
-\newlabel{sec:novelty}{{5}{4}{Novelty and Contributions}{section.5}{}}
+\newlabel{sec:setup}{{4.1}{4}{Setup}{subsection.4.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{On the choice of baseline.}{4}{section*.8}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Experimental configuration.}}{4}{table.3}\protected@file@percent }
+\newlabel{tab:setup}{{3}{4}{Experimental configuration}{table.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Reproduction.}{4}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Build, Recall, and Throughput}{4}{subsection.4.2}\protected@file@percent }
+\newlabel{sec:mainresults}{{4.2}{4}{Build, Recall, and Throughput}{subsection.4.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Construction: 2.98$\times $.}{4}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Traversal cost: 2.6--3.1$\times $.}{4}{section*.11}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Construction and search, 100k $\times $ 384d, beam 128 throughout. ``Turbo'' is GPU-built with device dispatch for batches; ``Hybrid'' is additionally VUGVA-backed. Single queries execute on the CPU in all three rows (Section~\ref {sec:routing}).}}{5}{table.4}\protected@file@percent }
+\newlabel{tab:main}{{4}{5}{Construction and search, 100k $\times $ 384d, beam 128 throughout. ``Turbo'' is GPU-built with device dispatch for batches; ``Hybrid'' is additionally VUGVA-backed. Single queries execute on the CPU in all three rows (Section~\ref {sec:routing})}{table.4}{}}
+\@writefile{toc}{\contentsline {paragraph}{Where the GPU does not win.}{5}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Why the Graph Is Cheaper to Traverse}{5}{subsection.4.3}\protected@file@percent }
+\newlabel{sec:graphquality}{{4.3}{5}{Why the Graph Is Cheaper to Traverse}{subsection.4.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Confounds, stated.}{5}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Practical consequence.}{5}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Threats to Validity}{5}{subsection.4.4}\protected@file@percent }
+\newlabel{sec:threats}{{4.4}{5}{Threats to Validity}{subsection.4.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Positioning}{5}{section.5}\protected@file@percent }
+\newlabel{sec:novelty}{{5}{5}{Positioning}{section.5}{}}
 \bibcite{ootomo2024cagra}{1}
 \bibcite{jasper2026}{2}
 \bibcite{pca2026}{3}
 \bibcite{rabitq2026}{4}
 \bibcite{opusedge2026}{5}
 \bibcite{vugva2026}{6}
-\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Recall@10 comparison across configurations.}}{5}{figure.2}\protected@file@percent }
-\newlabel{fig:recall}{{2}{5}{Recall@10 comparison across configurations}{figure.2}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {6}Conclusion}{5}{section.6}\protected@file@percent }
-\newlabel{sec:conclusion}{{6}{5}{Conclusion}{section.6}{}}
-\gdef \@abspage@last{5}
+\@writefile{toc}{\contentsline {paragraph}{What we do not claim.}{6}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Conclusion}{6}{section.6}\protected@file@percent }
+\newlabel{sec:conclusion}{{6}{6}{Conclusion}{section.6}{}}
+\gdef \@abspage@last{6}
