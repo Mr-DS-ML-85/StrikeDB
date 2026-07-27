@@ -93,7 +93,45 @@ GPU-accelerated distance computation using Tensor Cores:
 | APGC mixed-precision | 1.8 GB | 0 | 1.8 GB |
 | APGC + VUGVA tiered | 0.6 GB | 1.2 GB | 1.8 GB |
 
+## Measured performance
+
+Real embeddings, 100k × 384-d, RTX 4060 (8 GB) + Ryzen 7700 (16 threads).
+Reproduce with `dbstrike-bench --gpu-bench <vectors.fbin>` (~20 s).
+
+| mode | build | vec/s | Recall@10 | QPS (1t) | QPS (16t) | search runs on |
+|---|---:|---:|---:|---:|---:|---|
+| CPU-only | 7.23 s | 13,823 | **0.999** | 2,970 | 27,459 | CPU |
+| Turbo | **2.49 s** | **40,216** | 0.993 | 1,833 | 21,219 | GPU |
+| Hybrid (VUGVA) | **2.77 s** | **36,074** | 0.994 | 8,704 | 86,869 | CPU |
+
+**What this shows, including what it does not.**
+
+*Build is where the GPU wins.* 2.49 s against 7.23 s — **2.9×** — at a cost of
+0.006 recall. Phase 1 (pivot assignment) and the NN-descent refine both run on
+device; the CPU only wires edges.
+
+*GPU search currently loses.* Turbo is **0.62×** single-thread and **0.77×**
+concurrent versus CPU search. At ~545 µs/query against the CPU's ~340 µs, the
+per-query launch and PCIe round-trip cost more than the graph walk they replace.
+This should invert on larger corpora or with batched queries — `QueryCoalescer`
+exists for exactly that — but it is unproven at any scale we have measured, and
+should not be presented as a win.
+
+*Hybrid's QPS column is not a GPU number.* `search_ef` takes the device path only
+under `Turbo`. Hybrid serves its corpus through VUGVA's `TieredPool` and then
+searches on CPU, so 86,869 measures the CPU search path over a GPU-built graph.
+The graph really is better; the number is not evidence about tiering.
+
+*The tiering is not stressed here.* 36 MB fits VRAM, so nothing demotes or
+spills. T2 has unit and hardware coverage (a corpus 1.5× the DRAM budget writes
+to NVMe and promotes back byte-exact) but no end-to-end benchmark.
+
+Not yet measured: 1M × 384-d and 1M × 768-d in any GPU mode.
+
 ## CAGRA Comparison
+
+APGC **replaces** CAGRA rather than extending it; the rows below are design
+differences, not benchmark results. Only the table above is measured.
 
 | Feature | CAGRA | APGC |
 |---------|-------|------|

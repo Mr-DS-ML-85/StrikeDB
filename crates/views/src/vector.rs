@@ -3633,7 +3633,33 @@ impl VectorIndex {
     /// Build a graph in parallel from a normalized f32 matrix (row-major n×dim).
     /// IDs are assigned 0..n. The merged graph is queryable via `search_ef` etc.
     pub fn build_parallel(data: &[f32], dim: usize, n_shards: usize) -> Self {
-        Self::build_parallel_tiered(data, dim, n_shards, false)
+        let idx = Self::build_parallel_tiered(data, dim, n_shards, false);
+        idx.upload_to_gpu_if_enabled();
+        idx
+    }
+
+    /// Push the finished graph to the device when a GPU mode is selected.
+    ///
+    /// Without this, `GpuIndex` was never constructed anywhere outside
+    /// `quick_bench`: `upload_to_gpu` had exactly one caller in the tree, so
+    /// `gpu_idx` stayed `None`, `search_ef`'s Turbo branch fell straight
+    /// through, and *every* GPU search path — the APGC kernel, the fused
+    /// rerank, the VUGVA corpus tier, the SelKV gate — was unreachable code.
+    /// Both GPU modes measured as the CPU search path walking a GPU-built
+    /// graph, which is why Turbo and Hybrid kept landing within noise of each
+    /// other however they were configured.
+    ///
+    /// Failure is deliberately silent-but-logged rather than fatal: an upload
+    /// that does not fit VRAM should degrade to CPU search, not abort a build
+    /// that already succeeded.
+    fn upload_to_gpu_if_enabled(&self) {
+        if gpu::gpu_get_mode() == gpu::ComputeMode::CpuOnly {
+            return;
+        }
+        if !gpu::gpu_available() {
+            return;
+        }
+        self.upload_to_gpu();
     }
 
     /// MODULE 2 diagnostic: bytes of exact f32 currently held in RAM (the
@@ -4484,10 +4510,24 @@ impl VectorIndex {
         let g = self.hnsw.read().unwrap();
         let n = g.nodes.len();
         let dim = g.dim;
-        let degree = g.nodes.first().map(|n| {
-            let total: usize = n.neighbors.iter().map(|l| l.len()).sum();
-            total.max(32)
-        }).unwrap_or(0);
+        // Widest adjacency in the graph, not node 0's.
+        //
+        // Every row is padded or truncated to this number, so taking it from a
+        // single node silently truncates everyone else's neighbours whenever
+        // that node happens to be under-connected — and node 0 is exactly the
+        // node that used to collect the GPU builder's padding entries, so it
+        // was the worst possible sample. Scanning is O(n) against a build that
+        // is already O(n log n).
+        let degree = g
+            .nodes
+            .iter()
+            .map(|nd| nd.neighbors.iter().map(|l| l.len()).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+            .max(32);
+        if g.nodes.is_empty() {
+            return;
+        }
         if degree == 0 || n == 0 { return; }
         // Flat CSR: merge ALL HNSW levels into one wide graph for GPU kernel
         let gpu_degree = degree.min(64); // cap at 64 to fit in shared memory

@@ -393,13 +393,46 @@ scenario, where the headline metric is QPS, not per-request p99.
 
 ### 🔥 GPU / Tiered Compute (APGC + VUGVA) — **experimental**
 
-> **Status, stated plainly.** The GPU path is under active development and is
-> **not** the path the benchmarks above measure. Until recently the compute mode
-> defaulted to `CpuOnly` and no benchmark harness initialised the device, so any
-> "GPU" figure previously published here was produced by the CPU path. Those
-> numbers have been removed rather than restated, and no GPU performance table
-> appears below until one is measured end-to-end on a device. If you need
-> production numbers today, use the CPU figures above — they are reproducible.
+> **Status, stated plainly.** The GPU accelerates **index construction**, not
+> search. Build is 2.6–2.9× a 16-core CPU build at equal recall. GPU *search* is
+> currently **slower** than the CPU path at 100k×384d — the numbers are below,
+> including the ones that do not flatter us. Nothing here is inferred; every row
+> comes from `--gpu-bench` on the hardware named beneath it.
+
+**Measured — 100k × 384-d real embeddings, RTX 4060 + Ryzen 7700 (16 threads):**
+
+| mode | build | vec/s | Recall@10 | QPS (1 thread) | QPS (16 threads) | search runs on |
+|---|---:|---:|---:|---:|---:|---|
+| CPU-only | 7.23 s | 13,823 | **0.999** | 2,970 | 27,459 | CPU |
+| **Turbo** | **2.49 s** | **40,216** | 0.993 | 1,833 | 21,219 | **GPU** |
+| **Hybrid** (VUGVA) | **2.77 s** | **36,074** | 0.994 | 8,704 | 86,869 | CPU |
+
+```bash
+./target/release/dbstrike-bench --gpu-bench /path/to/vectors.fbin   # ~20 s
+```
+
+**Read the table honestly:**
+
+* **Build is the real GPU win.** 2.49 s vs 7.23 s — **2.9×** — for −0.006 recall.
+  That is the number worth having: an agent rebuilding an index does not wait
+  22 s, it waits 2.5.
+* **GPU search is a regression at this scale.** Turbo is **0.62×** single-thread
+  and **0.77×** concurrent against the CPU path. At ~545 µs/query versus the
+  CPU's ~340 µs, per-query launch and PCIe round-trip cost more than the HNSW
+  walk they replace. GPU search should win on larger corpora or batched queries;
+  at 100k×384d it does not, and we are not going to claim it does.
+* **Hybrid's QPS column is not a GPU number.** `search_ef` takes the device path
+  only under `Turbo`, so Hybrid uploads its corpus through VUGVA and then
+  searches on CPU. Its 86,869 measures the CPU search path over a GPU-built
+  graph — the graph is better, which is a real effect, but it is not tiering and
+  not GPU search.
+* **VUGVA is live but unstressed here.** A 36 MB corpus fits VRAM comfortably, so
+  the tier never has to demote or spill. The larger-than-VRAM case is what T2
+  exists for and is not yet benchmarked.
+
+Three compute modes. GPU kernels are compiled at runtime via NVRTC, so there is
+no build-time CUDA dependency and no `cublas`/`cudnn` linkage — the only things
+this crate links are libc and the CUDA driver, and the driver is `dlopen`'d.
 
 Three compute modes. GPU kernels are compiled at runtime via NVRTC, so there is
 no build-time CUDA dependency and no `cublas`/`cudnn` linkage — the only things
@@ -453,12 +486,22 @@ GPU.UNLOAD            → release GPU resources
 ```
 
 **Known limitations** (measured, RTX 4060):
-- GPU utilization during graph build is **2–5%**: the seeding phase
-  synchronises and reads back per batch instead of keeping work on device.
-- `hybrid` does not yet serve search from `TieredPool`, so it behaves as
-  `turbo`-with-fallback rather than as a third tier.
-- Build time is CPU-bound regardless of mode — concurrent ingest is serialized
-  by a single graph write lock and scales ~1.8× across 16 cores.
+- **GPU search is slower than CPU search at 100k×384d** — 0.62× single-thread,
+  0.77× concurrent. Per-query launch and PCIe round-trip (~545 µs/query vs the
+  CPU's ~340 µs) exceed what the device saves on the graph walk. Expected to
+  invert on larger corpora or with batched queries; unproven either way, so
+  treat GPU search as experimental and use CPU search in production.
+- **`hybrid` does not take the GPU search path at all.** `search_ef` branches to
+  the device only under `Turbo`. Hybrid serves its corpus through VUGVA and then
+  searches on CPU, so its QPS column reflects graph quality rather than tiering.
+- **VUGVA's cold tier is unexercised by these numbers.** A 36 MB corpus fits
+  VRAM, so nothing demotes or spills. The larger-than-VRAM case — the reason T2
+  exists — has unit and hardware tests but no end-to-end benchmark yet.
+- **Wire ingest does not use the GPU builder.** `VADDBATCH` still takes the
+  serial append path, which is serialized by a single graph write lock and
+  scales ~1.8× across 16 cores. The 2.9× build speedup above is the in-process
+  bulk builder; the wire number in the table further up is unchanged.
+- 1M×384-d and 1M×768-d GPU figures are **not yet measured**.
 
 #### 🧪 TurboQuant / PQ head-to-head vs Qdrant (Module 6, 3000 × 768-d, in-process)
 
