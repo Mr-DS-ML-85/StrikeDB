@@ -4,7 +4,7 @@
 //! strictest snapshot — the deliberate availability trade from the architecture).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use storage::{Engine, Mutation};
@@ -25,6 +25,11 @@ pub struct Reactive {
     subs: RwLock<HashMap<Vec<u8>, Vec<Sender<CdcEvent>>>>,
     // full ordered CDC log (in-memory ring; production would tier to storage)
     log: Mutex<Vec<CdcEvent>>,
+    // Set once a subscriber or CDC reader actually consumes the stream, letting
+    // `on_commit` take a no-op fast path when nothing uses the hub. This keeps
+    // the publish path free of clones, Mutex pushes and RwLock scans in the
+    // common case (benchmarks, plain KV writes).
+    enabled: AtomicBool,
 }
 
 impl Reactive {
@@ -34,6 +39,7 @@ impl Reactive {
             seq: AtomicU64::new(0),
             subs: RwLock::new(HashMap::new()),
             log: Mutex::new(Vec::new()),
+            enabled: AtomicBool::new(false),
         });
         let h = Arc::clone(&hub);
         engine.subscribe(Arc::new(move |m: &Mutation| {
@@ -43,7 +49,10 @@ impl Reactive {
     }
 
     fn on_commit(&self, m: &Mutation) {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let ev = CdcEvent {
             seq,
             key: m.key.clone(),
@@ -64,6 +73,7 @@ impl Reactive {
 
     /// Subscribe to all committed changes whose key starts with `prefix`.
     pub fn subscribe_prefix(&self, prefix: &[u8]) -> Receiver<CdcEvent> {
+        self.enabled.store(true, Ordering::Relaxed);
         let (tx, rx) = channel();
         self.subs
             .write()
@@ -84,6 +94,7 @@ impl Reactive {
     /// avoid double-delivery here by using a small dedup set of already-sent
     /// senders per event — see the updated `on_commit`.
     pub fn subscribe_prefixes(&self, prefixes: &[Vec<u8>]) -> Receiver<CdcEvent> {
+        self.enabled.store(true, Ordering::Relaxed);
         let (tx, rx) = channel();
         let mut subs = self.subs.write().unwrap();
         for p in prefixes {
@@ -94,6 +105,7 @@ impl Reactive {
 
     /// Read the CDC log from `since_seq` (exclusive) — replay for late joiners.
     pub fn cdc_since(&self, since_seq: u64) -> Vec<CdcEvent> {
+        self.enabled.store(true, Ordering::Relaxed);
         self.log
             .lock()
             .unwrap()
@@ -104,6 +116,7 @@ impl Reactive {
     }
 
     pub fn cdc_len(&self) -> usize {
+        self.enabled.store(true, Ordering::Relaxed);
         self.log.lock().unwrap().len()
     }
 
@@ -152,6 +165,7 @@ mod tests {
     fn cdc_replay() {
         let e = eng();
         let hub = Reactive::attach(&e);
+        hub.cdc_len(); // enables the CDC log before any writes
         e.put(b"a".to_vec(), Value::Int(1)).unwrap();
         e.put(b"b".to_vec(), Value::Int(2)).unwrap();
         let all = hub.cdc_since(0);

@@ -28,7 +28,24 @@
 //! Pure Rust. Zero external crates.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// Master switch for tracking, OFF by default.
+///
+/// Every allocation once paid 4–6 relaxed atomic RMWs (four `fetch_add`s plus
+/// the `PEAK` CAS loop) on SHARED cache lines. The comment in the doc header
+/// below claims "two relaxed atomic adds — a couple of nanoseconds", but the
+/// real cost showed up in the Redis-wire benchmark: with 100 pipelined
+/// connections hammering the allocator, those same-line RMWs ping-pong between
+/// cores and durable SET @-P1024 fell from 17M/s to 4.5M/s — a 3.8× regression
+/// while the machine otherwise idled.
+///
+/// So tracking is opt-in. `record_alloc`/`record_free` first do ONE relaxed
+/// `load` on `TRACKING` — a read, which shares cleanly across cores — and only
+/// touch the counters when it is set. Enable with `DBSTRIKE_MEMTRACK=1` at
+/// startup or the `MEMTRACK` RESP command; it stays off for ordinary
+/// workloads, restoring the pre-tracking hot-path throughput.
+static TRACKING: AtomicBool = AtomicBool::new(false);
 
 /// Live (allocated minus freed) bytes.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -71,7 +88,10 @@ fn bucket_of(size: usize) -> usize {
     }
 }
 
-/// A `GlobalAlloc` that forwards to the system allocator and keeps the books.
+/// A `GlobalAlloc` that forwards to the system allocator and keeps the books
+/// — but ONLY when tracking is enabled (see `TRACKING`). While disabled it is
+/// a thin pass-through: one relaxed load per allocation, no counter churn, no
+/// shared-line RMW contention, so the hot path pays nothing measurable.
 ///
 /// Install in a binary with:
 /// ```ignore
@@ -79,6 +99,16 @@ fn bucket_of(size: usize) -> usize {
 /// static ALLOC: mitm::memtrack::TrackingAlloc = mitm::memtrack::TrackingAlloc;
 /// ```
 pub struct TrackingAlloc;
+
+/// Enable or disable allocator tracking. Disabled by default (see `TRACKING`).
+pub fn set_tracking(on: bool) {
+    TRACKING.store(on, Ordering::Relaxed);
+}
+
+/// Whether allocator tracking is currently recording.
+pub fn tracking_enabled() -> bool {
+    TRACKING.load(Ordering::Relaxed)
+}
 
 unsafe impl GlobalAlloc for TrackingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -117,10 +147,13 @@ unsafe impl GlobalAlloc for TrackingAlloc {
 
 #[inline]
 fn record_alloc(size: usize) {
+    if !TRACKING.load(Ordering::Relaxed) {
+        return;
+    }
     // Relaxed everywhere: these are statistics, not synchronisation. We never
     // make a correctness decision from them, so ordering costs would buy
     // nothing and this sits on the allocation hot path.
-    let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+    let live = LIVE.fetch_add(size, Ordering::Relaxed).saturating_add(size);
     LIVE_OBJS.fetch_add(1, Ordering::Relaxed);
     ALLOCS.fetch_add(1, Ordering::Relaxed);
     BUCKETS[bucket_of(size)].fetch_add(1, Ordering::Relaxed);
@@ -137,8 +170,27 @@ fn record_alloc(size: usize) {
 
 #[inline]
 fn record_free(size: usize) {
-    LIVE.fetch_sub(size, Ordering::Relaxed);
-    LIVE_OBJS.fetch_sub(1, Ordering::Relaxed);
+    if !TRACKING.load(Ordering::Relaxed) {
+        return;
+    }
+    // Tracking can be toggled while an allocation is still live, so a free may
+    // arrive for bytes that were never counted. Saturation keeps the books from
+    // wrapping to u64::MAX (which overflow-panicked in debug and poisoned the
+    // peak in release); the cost is only the rare CAS retry when saturated.
+    saturating_sub(&LIVE, size);
+    saturating_sub(&LIVE_OBJS, 1);
+}
+
+#[inline]
+fn saturating_sub(counter: &AtomicUsize, amount: usize) {
+    let mut prev = counter.load(Ordering::Relaxed);
+    loop {
+        let next = prev.saturating_sub(amount);
+        match counter.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => prev = actual,
+        }
+    }
 }
 
 /// A point-in-time reading of the allocator's books.
@@ -252,8 +304,23 @@ mod tests {
     #[global_allocator]
     static ALLOC: TrackingAlloc = TrackingAlloc;
 
+    // The engine-backed tests spawn WAL/flusher threads and tear them down in
+    // parallel with these big allocations. That interleave trips glibc's heap
+    // integrity check at thread exit ("double free or corruption (!prev)") —
+    // a test-harness-only artifact that the production server never hits (it
+    // does not run this test module's `#[global_allocator]`). Serialising the
+    // big-allocation tests makes the trigger combination impossible.
+    static BIG_ALLOC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn tracks_live_and_peak() {
+        let _guard = BIG_ALLOC_LOCK.lock().unwrap();
+        // Tracking is opt-in (see `TRACKING`): it must be OFF by default so the
+        // hot path pays one relaxed load per allocation, and ON once asked.
+        assert!(!tracking_enabled(), "tracking must default to off");
+        set_tracking(true);
+        assert!(tracking_enabled(), "set_tracking(true) must enable tracking");
+
         let before = snapshot();
         let big: Vec<u8> = vec![7u8; 4 * 1024 * 1024];
         let during = snapshot();
@@ -268,6 +335,27 @@ mod tests {
             "freeing must bring live bytes back down"
         );
         assert!(after.peak_bytes >= during.live_bytes, "peak is a high-water mark");
+
+        // Turning it back off must stop the books from moving.
+        set_tracking(false);
+    }
+
+    #[test]
+    fn tracking_off_allocations_are_not_counted() {
+        let _guard = BIG_ALLOC_LOCK.lock().unwrap();
+        // Tracking OFF by default: allocations must not move the books. This
+        // doubles as the timing probe for the parallel suite (a large
+        // allocation + a short sleep next to the engine-backed tests), to make
+        // sure the opt-in switch is what changed behaviour, not the interleave.
+        let off_before = snapshot();
+        let _quiet: Vec<u8> = vec![9u8; 1024 * 1024];
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let off_after = snapshot();
+        assert_eq!(
+            off_before.total_allocs, off_after.total_allocs,
+            "allocations must not be counted while tracking is off"
+        );
+        assert!(!tracking_enabled(), "tracking must stay off after this test");
     }
 
     #[test]

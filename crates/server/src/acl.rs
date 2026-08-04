@@ -14,6 +14,7 @@
 //! hash(salt + password) == stored_hash.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -237,6 +238,16 @@ pub struct AclStore {
     users: RwLock<HashMap<String, User>>,
     /// The server requirepass (if set via env DBSTRIKE_REQUIREPASS).
     requirepass: Option<String>,
+    /// When true, the per-command permission gate must run on the RESP hot
+    /// path. When false it is provably a no-op (no requirepass, and no user
+    /// exists whose categories could deny a command), so the dispatch loop
+    /// skips it entirely and pays one relaxed load instead of a lock + scan.
+    ///
+    /// Set true at construction when auth is required, and latched true by any
+    /// mutation that can introduce a restriction (`del_user`,
+    /// `set_user_categories`, disabling a user). Never set back to false, so
+    /// enforcement can only become MORE strict, never silently weaker.
+    strict: AtomicBool,
 }
 
 impl AclStore {
@@ -266,10 +277,26 @@ impl AclStore {
             },
         );
 
+        let strict = requirepass.is_some();
         Arc::new(Self {
             users: RwLock::new(users),
             requirepass,
+            strict: AtomicBool::new(strict),
         })
+    }
+
+    /// True if the per-command permission gate must run on this request.
+    /// In the default no-auth install this stays false, so the RESP hot path
+    /// skips the ACL work entirely (a single relaxed load).
+    pub fn needs_permission_check(&self) -> bool {
+        self.strict.load(Ordering::Relaxed)
+    }
+
+    /// Latch strict mode on. Used by every ACL mutation that can deny a
+    /// command the default user could otherwise run, and by AUTH when a named
+    /// (possibly restricted) user authenticates.
+    pub fn latch_strict(&self) {
+        self.strict.store(true, Ordering::Relaxed);
     }
 
     /// Authenticate a password against the default user (Redis `AUTH password`).
@@ -337,6 +364,11 @@ impl AclStore {
         let mut users = self.users.write().unwrap();
         if let Some(user) = users.get_mut(username) {
             user.enabled = enabled;
+            if !enabled {
+                // A disabled user could otherwise run commands under a stale
+                // connection, so the gate must stay armed.
+                self.latch_strict();
+            }
             true
         } else {
             false
@@ -348,6 +380,9 @@ impl AclStore {
         let mut users = self.users.write().unwrap();
         if let Some(user) = users.get_mut(username) {
             user.categories = cats;
+            // A category list narrower than All can deny commands the default
+            // user would run — the gate must stay armed from here on.
+            self.latch_strict();
             true
         } else {
             false
@@ -357,7 +392,11 @@ impl AclStore {
     /// Delete a user. Returns true if the user existed.
     pub fn del_user(&self, username: &str) -> bool {
         let mut users = self.users.write().unwrap();
-        users.remove(username).is_some()
+        let removed = users.remove(username).is_some();
+        if removed {
+            self.latch_strict();
+        }
+        removed
     }
 
     /// Get a user's info as a flat string (Redis ACL GETUSER format).

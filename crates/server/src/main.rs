@@ -103,6 +103,14 @@ fn main() -> std::io::Result<()> {
     let memory = TieredMemory::new(300);
     let acl = AclStore::new(requirepass.clone());
 
+    // Allocator tracking is opt-in: it is off for ordinary workloads (the
+    // shared-line atomics otherwise cost ~3.8× on the pipelined hot path) and
+    // turns on when the operator asks — either `DBSTRIKE_MEMTRACK=1` at
+    // startup or a `MEMTRACK` RESP command at runtime.
+    if std::env::var("DBSTRIKE_MEMTRACK").map(|v| v != "0" && v != "").unwrap_or(false) {
+        mitm::memtrack::set_tracking(true);
+    }
+
     let db = Arc::new(Db {
         engine,
         reactive,
@@ -294,12 +302,16 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
             }
 
             // ── ACL: permission check ─────────────────────────────────
+            // Fast path: in the default no-auth install `strict` is false and
+            // nothing can deny a command, so this collapses to one relaxed
+            // load. It only latches true once auth/restrictions are configured
+            // (DBSTRIKE_PASS, ACL SETUSER/DELUSER, disabling a user).
             if db.acl.requires_auth() && current_user.is_empty() {
                 write_resp_buf(&mut out, &err("NOAUTH Authentication required"))?;
                 i += 1;
                 continue;
             }
-            if !current_user.is_empty() {
+            if db.acl.needs_permission_check() {
                 let cat = command_category(&name);
                 if !db.acl.can_command(&current_user, &name, cat) {
                     write_resp_buf(&mut out, &err("ERR permission denied"))?;
@@ -619,6 +631,9 @@ fn dispatch_auth(db: &Db, args: &[Vec<u8>], current_user: &mut String) -> Resp {
             let raw = String::from_utf8_lossy(&args[1]);
             let password = raw.strip_prefix('>').unwrap_or(&raw);
             if db.acl.auth_user(&username, password) {
+                // A named user may be restricted, so the per-command gate must
+                // run for the rest of this connection (and any other auth path).
+                db.acl.latch_strict();
                 *current_user = username.to_string();
                 // Enable the user after successful auth so commands work.
                 db.acl.set_user_enabled(&username, true);
@@ -1461,6 +1476,12 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         // MEMTRACK HIST adds the cumulative size histogram, which separates a
         // handful of runaway buffers from millions of small allocations.
         "MEMTRACK" => {
+            // First call switches tracking on, so the numbers mean something
+            // (nothing is recorded while tracking is off). Subsequent calls are
+            // free reads of the running totals.
+            if !mitm::memtrack::tracking_enabled() {
+                mitm::memtrack::set_tracking(true);
+            }
             let tag = args
                 .first()
                 .map(|a| String::from_utf8_lossy(a).to_string())
