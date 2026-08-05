@@ -613,6 +613,7 @@ DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380</code></pre
 redis-cli -p 6380 SET user:1 ada
 redis-cli -p 6380 VADD 1 1.0 0.0 0.0
 redis-cli -p 6380 VSEARCH 5 1.0 0.0 0.0          # dense k-NN (ef=128)
+redis-cli -p 6380 VDEL 1                          # :1 — remove a vector (correct wrong agent memory)
 redis-cli -p 6380 VSEARCH 5 F 3 1.0 0.0 0.0      # Module 4 filtered by category
 redis-cli -p 6380 VSEARCH 5 H 0 1.0 1.0 0.0 0.0  # Module 5 hybrid dense+sparse
 redis-cli -p 6380 VSEARCHA 5 1.0 0.0 0.0         # query-adaptive beam
@@ -664,6 +665,7 @@ python3 tests/test_dbstrike.py</code></pre>
       <div class="table-wrap"><table>
         <tr><th>Command</th><th>Args</th><th>Returns</th></tr>
         <tr><td><code>VADD</code></td><td>id f1 f2...</td><td>OK (writes dense + derived attr + sparse terms)</td></tr>
+        <tr><td><code>VDEL</code></td><td>id [id...]</td><td>:n (tombstone vector ids — purged from every search path + sparse/BM25; re-add with <code>VADD</code> to correct a wrong agent-owned vector)</td></tr>
         <tr><td><code>VADDBATCH</code></td><td>[PAR] dim id f... [id f...]...</td><td>:n (default: parallel shards + serial bridge-merge; <code>PAR</code>: full-graph parallel rebuild, genuinely cores×)</td></tr>
         <tr><td><code>VSETQUANT</code></td><td>mode</td><td>OK (INT8/BINARY/BINARY2/BINARY15/TURBO1/15/2/4/PRODUCT; empty index only)</td></tr>
         <tr><td><code>VFITQUANT</code></td><td>dim n id f... ...</td><td>OK (fit Turbo/PQ params; the <code>dim</code> pins the turbo rotation — a mismatched-dim insert returns a clean error, not a crash)</td></tr>
