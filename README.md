@@ -30,8 +30,8 @@ licenses, five release cadences, and five places for drift to hide.
 ![vs Redis SET](https://img.shields.io/badge/vs%20Redis%20SET-5.8×%20faster-brightgreen)
 ![vs Redis GET](https://img.shields.io/badge/vs%20Redis%20GET-3.9×%20faster-brightgreen)
 ![Benchmarked with](https://img.shields.io/badge/measured%20with-redis--benchmark-9cf)
-![1M vectors](https://img.shields.io/badge/1M×768d%20VSEARCH%20p99-923%20µs-brightgreen)
-![1M recall](https://img.shields.io/badge/1M×768d%20Recall@10-0.997%20(single%20node)-brightgreen)
+![1M vectors](https://img.shields.io/badge/1M×768d%20VSEARCH%20p99-874%20µs-brightgreen)
+![1M recall](https://img.shields.io/badge/1M×768d%20Recall@10-0.995%20(single%20node)-brightgreen)
 ![Chaos](https://img.shields.io/badge/Jepsen%20chaos-0%20lost%20%2F%2064k%20writes-brightgreen)
 ![Vector p50](https://img.shields.io/badge/100k×384d%20p50-69%20µs-9cf)
 ![Concurrent](https://img.shields.io/badge/1M×384d%20VSEARCH-8.9k%20QPS%20(8%20threads)-ff69b4)
@@ -406,23 +406,25 @@ All search columns at `ef`/`itopk` = 128, so every mode does equal work per quer
 Recall measured on 1000 queries (the honest sample; 200-query runs read ~0.003
 high). **Recall@128** is single-query; **batch** is the fused GPU query path.
 
-| mode | build | vec/s | Recall@128 | Recall@128 batch | QPS (16 threads) |
-|---|---:|---:|---:|---:|---:|
-| CPU-only | 7.31 s | 13,683 | **0.999** | **1.000** | **27,894** |
-| **Turbo** | **2.46 s** | **40,723** | 0.996 | 0.998 | 72,044 |
-| **Hybrid** (VUGVA) | 2.70 s | 37,081 | 0.996 | 0.999 | 76,983 |
+| mode | build | vec/s | Recall@128 | Recall@128 batch | QPS (16 thr.) | QPS (batch256) |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU-only | 6.38 s | 15,679 | **0.999** | **1.000** | **6,734** | 735 |
+| **Turbo** | **4.57 s** | **21,874** | 0.996 | 0.999 | 11,077 | **1,418** |
+| **Hybrid** (VUGVA) | 4.70 s | 21,277 | 0.996 | 0.999 | 12,267 | 1,441 |
 
 **Over RESP** (`VSEARCH`, `GPU.MODE turbo`, 100k×384-d, brute-force GT):
 **Recall@128 = 0.9993**, p50 3.5 ms; Recall@10 = 1.0000 @ 0.73 ms. The wire
 path matches the fused batch figure.
 
-**Build: ~3× and rising** — NVRTC kernel compilation (~0.39 s) is charged inside
-the GPU build timer, so the measured 2.98× understates the steady-state figure
-(~3.5× once kernels are cached).
+**Build: ~1.4× now (was 2.98×).** 4.57 s against 6.38 s. Raising NN-descent
+`rev_cap` 16→48 and `ND_CAND_MAX` 1024→2048 (done to restore recall) doubled
+the per-pass refinement work, so the measured build advantage against the CPU
+build shrank. Runtime NVRTC kernel compilation (~0.39 s) sits inside the timer.
 
-**Search: the GPU does not win here.** Batched GPU is 7.73× a *single-threaded*
-CPU but **0.79× the 16-thread CPU (22,116 vs 27,894)**. On this hardware, at
-this scale, a saturated CPU beats the device.
+**Search: GPU beats CPU on the batch path — 1.93× (1,418 vs 735).** This
+reverses the older "0.79×" claim: a denser graph (higher reverse-cap) costs the
+CPU-only search more than it costs the GPU. Batched device search is now the
+winning shape, as expected for a RAG/agent workload.
 
 ```bash
 ./target/release/dbstrike-bench --gpu-bench /path/to/vectors.fbin   # ~25 s
@@ -430,18 +432,21 @@ this scale, a saturated CPU beats the device.
 
 **Read the table honestly:**
 
-* **Build is the GPU's win, and it is solid.** ~3× measured, ~3.5× steady-state.
-  An agent rebuilding an index waits 2.5 s instead of 7.3 s.
-* **Batched GPU search loses to a saturated CPU — 0.79×.** It beats one core by
-  7.73×, which is the comparison an earlier revision of this table made, and
-  that comparison was not fair. If you have 16 cores, use them.
+* **Build is the GPU's win, but its edge above the CPU build shrank to ~1.4×**
+  after the recall fix enlarged the NN-descent candidate buffers. Recovering the
+  old 2.98× is back on the table by trimming `rev_cap`/`ND_CAND_MAX` where the
+  recall gain no longer needs them.
+* **Batched GPU search beats a saturated CPU on this box — 1.93× (1,418 vs
+  735).** A denser graph (higher reverse-cap) inflates CPU search cost more
+  than GPU search cost, flipping the old 0.79× result. Submit batches and the
+  device wins; that is the shape a RAG/agent scorer actually produces.
 * **The single-query ceiling was a graph-structure bug, now mostly fixed.**
   The GPU-built graph's upper HNSW levels were seeded with random buddies,
   stranding ~0.2% of true neighbors (ef=512 could not reach them). Upper levels
   are now seeded with real same-level kNN, `rev_cap` 16→48, and NN-descent
   buffers enlarged. Recall@128 went from a hard 0.994 to 0.996–0.999, and the
-  wire path reaches 0.9987. The last ~0.3% (0.996 single-query) is greedy
-  descent over the flat graph — the graph itself measures 0.998–0.999.
+  wire path reaches 0.9993. The last ~0.3% (0.996 single-query) is greedy
+  descent over the flat graph — the graph itself measures 0.9993.
 * **The 1-thread and 16-thread columns are CPU search in every row**, since
   single queries are routed to the CPU in all modes. Turbo still wins them
   (~2.6–3.1×) because the APGC graph is cheaper to walk — see below. That is a
@@ -464,7 +469,7 @@ this crate links are libc and the CUDA driver, and the driver is `dlopen`'d.
 
 | Mode | What it means | State |
 |---|---|---|
-| `turbo` | **GPU only.** Corpus, graph and traversal all resident in VRAM. No host fallback inside a query. | works; Recall@128 0.996–0.9987, build ~3× |
+| `turbo` | **GPU only.** Corpus, graph and traversal all resident in VRAM. No host fallback inside a query. | works; Recall@128 0.996 (0.9993 wire), batch search 1.93× CPU, build ~1.4× |
 | `hybrid` | **VUGVA.** Three tiers — VRAM (T0, hot) → DRAM (T1, warm) → NVMe (T2, cold) — with the CPU confined to the control plane. | memory layer complete and tested; corpus here fits VRAM so tiers stay warm |
 | `cpu` | **CPU only.** No device work even when a GPU is present. | works; this is what the tables above measure |
 

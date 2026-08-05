@@ -45,11 +45,16 @@ what is done, what is open, what is broken, and what will mislead you.
 `nq` = 1000 queries (was 200). Two metrics: **Recall@128** (single-query, the hard
 one) and **batch Recall@128** (fused GPU query path).
 
-| mode | build | vec/s | Recall@128 | Recall@128 batch | QPS 16t |
-|---|---:|---:|---:|---:|---:|
-| CPU-only | 7.31 s | 13,683 | **0.999** | **1.000** | 27,894 |
-| Turbo | 2.46 s | 40,723 | 0.996 | 0.998 | 72,044 |
-| Hybrid (VUGVA) | 2.70 s | 37,081 | 0.996 | 0.999 | 76,983 |
+| mode | build | vec/s | Recall@128 | Recall@128 batch | QPS 16t | QPS batch256 |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU-only | 6.38 s | 15,679 | **0.999** | **1.000** | 6,734 | 735 |
+| Turbo | 4.57 s | 21,874 | 0.996 | 0.999 | 11,077 | 1,418 |
+| Hybrid (VUGVA) | 4.70 s | 21,277 | 0.996 | 0.999 | 12,267 | 1,441 |
+
+- **Build ~1.4×** (was 2.98× pre-fix). `rev_cap` 16→48 + `ND_CAND_MAX` 2048
+  doubled per-pass refinement; this is the cost of the recall restoration.
+- **Batched GPU search 1.93× the 16-thread CPU** (1,418 vs 735) — the denser
+  graph flips the old 0.79×. The device wins when queries arrive as batches.
 
 - **Recall@128 over RESP** (server `VSEARCH`, `GPU.MODE turbo`, 100k×384d):
   **0.9993** at k=128, p50 3.5 ms — best wire number on record, after the
