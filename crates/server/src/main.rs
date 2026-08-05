@@ -498,6 +498,17 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Namespace a reducer target key into the Kv surface (`kv:<key>`). The KV
+/// view (GET/SET/INCR) reads prefixed keys, but the reducer VM operates on
+/// raw keys; without this a `STOREINT`/counter write lands where `GET` can
+/// never see it.
+fn kv_key(key: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(key.len() + 3);
+    b.extend_from_slice(b"kv:");
+    b.extend_from_slice(key);
+    b
+}
+
 /// True for I/O errors that just mean "the client hung up mid-request".
 /// These aren't bugs and shouldn't spam the console.
 fn is_benign_disconnect(e: &std::io::Error) -> bool {
@@ -1471,7 +1482,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("by is not an i64"),
             };
-            let prog = counter_reducer(&key, by);
+            let prog = counter_reducer(&kv_key(&key), by);
             match db.reducers.invoke(&rname, &shardkey, &prog) {
                 ReducerResult::Ok { output, .. } => Resp::Int(output.unwrap_or(0)),
                 ReducerResult::Aborted(e) => err(&format!("reducer aborted: {e}")),
@@ -2301,11 +2312,11 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                     "MUL" => instrs.push(Instr::Mul),
                     "LOADINT" => {
                         if !need(&mut i, 1) { return err("LOADINT requires a key"); }
-                        instrs.push(Instr::LoadInt(args[i].clone())); i += 1;
+                        instrs.push(Instr::LoadInt(kv_key(&args[i]))); i += 1;
                     }
                     "STOREINT" => {
                         if !need(&mut i, 1) { return err("STOREINT requires a key"); }
-                        instrs.push(Instr::StoreInt(args[i].clone())); i += 1;
+                        instrs.push(Instr::StoreInt(kv_key(&args[i]))); i += 1;
                     }
                     "JUMP" => {
                         if !need(&mut i, 1) { return err("JUMP requires an idx"); }
