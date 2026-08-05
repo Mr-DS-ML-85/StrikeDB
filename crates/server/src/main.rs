@@ -88,7 +88,7 @@ struct ConsensusStore {
 }
 
 fn main() -> std::io::Result<()> {
-    let mut args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
     let addr = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:6380".to_string());
     let mut log_path: Option<String> = None;
     let mut i = 2;
@@ -970,14 +970,18 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
         }
         "DEL" => {
-            if args.len() != 1 {
-                return err("DEL requires key");
+            if args.is_empty() {
+                return err("DEL requires at least one key");
             }
-            match db.kv.del_b(&args[0]) {
-                Ok(true) => Resp::Int(1),
-                Ok(false) => Resp::Int(0),
-                Err(e) => err(&e.to_string()),
+            let mut deleted = 0i64;
+            for a in args {
+                match db.kv.del_b(a) {
+                    Ok(true) => deleted += 1,
+                    Ok(false) => {}
+                    Err(e) => return err(&e.to_string()),
+                }
             }
+            Resp::Int(deleted)
         }
         "INCR" | "INCRBY" => {
             let (key, by) = if name == "INCR" {
