@@ -1,7 +1,7 @@
 # DB-Strike — Working Memory
 
 **Master state file. Update on every code change.**
-Last updated: 2026-07-27 · 22 commits ahead of `origin/main`, **none pushed**
+Last updated: 2026-08-05 · 22 commits ahead of `origin/main`, **none pushed**
 
 Companion: `early-dev.md` holds longer-form findings. This file is the index —
 what is done, what is open, what is broken, and what will mislead you.
@@ -42,20 +42,30 @@ what is done, what is open, what is broken, and what will mislead you.
 
 ### GPU bench — `dbstrike-bench --gpu-bench <file.fbin>` (~25 s)
 
-All search columns at matched beam 128.
+`nq` = 1000 queries (was 200). Two metrics: **Recall@128** (single-query, the hard
+one) and **batch Recall@128** (fused GPU query path).
 
-| mode | build | vec/s | Recall@10 | QPS 1t | QPS 16t | QPS batch |
-|---|---:|---:|---:|---:|---:|---:|
-| CPU-only | 7.31 s | 13,683 | **0.999** | 2,781 | **27,894** | 2,860 |
-| Turbo | **2.46 s** | **40,723** | 0.994 | 8,590 | 72,044 | 22,116 |
-| Hybrid (VUGVA) | 2.70 s | 37,081 | 0.994 | 7,576 | 76,983 | 18,542 |
+| mode | build | vec/s | Recall@128 | Recall@128 batch | QPS 16t |
+|---|---:|---:|---:|---:|---:|
+| CPU-only | 7.31 s | 13,683 | **0.999** | **1.000** | 27,894 |
+| Turbo | 2.46 s | 40,723 | 0.996 | 0.998 | 72,044 |
+| Hybrid (VUGVA) | 2.70 s | 37,081 | 0.996 | 0.999 | 76,983 |
 
-- **Build ~3×** (≈3.5× steady-state; NVRTC compile ~0.39 s sits inside the timer)
-- **Batched GPU search 0.79× a saturated 16-core CPU** — 7.73× one core. The GPU
-  does *not* win at search on this hardware.
-- 1t/16t columns run identical CPU code in all rows; the 2.6–3.1× gap is
-  **graph structure**, not hardware, and survives CPU-only deployment.
-- Batch recall validated: matches single-query recall exactly.
+- **Recall@128 over RESP** (server `VSEARCH`, `GPU.MODE turbo`, 100k×384d):
+  **0.9993** at k=128, p50 3.5 ms — best wire number on record, after the
+  `apgc_search_smem` sizer fix. Recall@10 over wire = 1.0000 @ 0.73 ms.
+- The 0.999 user remembered was **Recall@10-era** (CPU 0.999 / GPU 0.994), not a
+  lost Recall@128 config. `f176f12` switched the headline metric; Recall@128 is
+  structurally harder and single-path GPU plateaus at 0.996–0.9987.
+- **Root cause of the ceiling (fixed):** upper HNSW levels on the GPU-built
+  graph were wired with *random* buddies (4/node); upper-level greedy descent
+  stranded ~0.2% of true neighbors. ef=512, 24 NN-descent passes, diversity
+  heuristic: all no-ops. The only things that moved recall: upper levels seeded
+  with **real nearest same-level neighbors** from the GPU NN-descent kNN list
+  (`crates/views/src/vector.rs`), `rev_cap` 16→48 (`crates/gpu/src/lib.rs`),
+  `ND_CAND_MAX` 1024→2048 + `ND_HASH` 2048→4096 (`all_kernels.cu`).
+- **200-query samples lie**: 0.999 at 200q was upward jitter; honest stable
+  numbers only appear at ≥1000 queries. Always bench with `nq` ≥ 1000.
 
 ### Ingest
 
@@ -110,6 +120,10 @@ All search columns at matched beam 128.
 | `GPU.MODE turbo` probed availability before setting mode | GPU unreachable over RESP entirely |
 | `export_vectors` allocated per vector, then copied again | 100k allocs + 300 MB per rebuild |
 | LGM hysteresis scaled net score (negative → inverted) | residents evicted preferentially |
+| **Upper HNSW levels seeded with random buddies (4/node)** | ~0.2% of true neighbors structurally unreachable; ef=512 could not fix it |
+| **`apgc_search_smem` sizer still used 1024 for the dedup set** | `SR_HASH` was raised 1024→8192 in `all_kernels.cu` but host'd dynamic shared-mem sizer wasn't updated; the kernel's `vis`/`qcache`/`s_ctl` overran the buffer and corrupted the bitonic sort → `apgc_search` returned sentinel `-1/2.0`. Broke 3 GPU unit tests; only visible in the test harness (the live benchmark path never exercised the raw kernel). Fixed by syncing sizer to `SR_HASH = 8192`. |
+| **NN-descent `rev_cap` 16 + `ND_CAND_MAX` 1024 undersized** | reverse-neighbor refinement starved the GPU graph's local structure |
+| **`nq`=200 sample in `s_gpu_bench`** | masked 0.999-at-200q = jitter; honest numbers need ≥1000 queries |
 
 ### Retracted
 
@@ -136,6 +150,12 @@ Features exist but the server may not reach them. Verify each:
       absence. Same ordering bug appeared independently in `--gpu-bench`.
 - [ ] Does `VSEARCH` use `search_many` for pipelined batches?
 - [ ] Is the LGM membrane reachable from the server at all? (currently not)
+
+### 3.1b Single-path Recall@128 plateau (0.996 vs CPU 0.999)
+Graph is near (batch/wire hit 0.998–0.999) but CPU greedy descent over the flat
+GPU graph + weak upper levels strands ~0.3% of true neighbors. Tried and failed:
+ef=512, 24 passes, diversity heuristic. Next candidates: strengthen upper-level
+fanout/degree, or a short GPU-recall-only pass fused into `search_unified`.
 
 ### 3.2 DGM §3.2 — lock-free COW slab graph (~500 lines)
 Streaming insert/delete without rebuild. **This is also the real fix for
@@ -200,7 +220,9 @@ Calling it "learned tiering" repeats the overclaim already retracted once.
   passed at 1 shard and only bit at 4/8, because 1 shard skips the shuffle.
 - **`cargo test -p gpu` needs `--test-threads=1`** or a `gpu_exclusive()` lock;
   parallel CUDA contexts hand each other invalid pointers (observed:
-  1,566,595 of 1,572,864 bytes wrong).
+  1,566,595 of 1,572,864 bytes wrong). Three GPU unit tests
+  (`test_apgc_gpu_search`, `test_batch_cosine_dist`, `test_gpu_init`) were also
+  failing from the sizer/SR_HASH mismatch — now fixed (see bug table), all 8 pass.
 
 ---
 

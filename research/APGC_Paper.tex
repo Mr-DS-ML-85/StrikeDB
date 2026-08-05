@@ -73,7 +73,7 @@ the GPU in INT8 and then serves queries from the CPU. On a single RTX~4060 and a
 16-core Ryzen~7700, APGC builds a 100k$\times$384d index in \textbf{2.46\,s
 against 7.31\,s} for a 16-thread CPU baseline (\textbf{2.98$\times$}, rising to
 approximately 3.5$\times$ once runtime kernel compilation is excluded from the
-timer), at Recall@10 of \textbf{0.994} versus 0.999.
+timer), at Recall@128 of \textbf{0.996} versus 0.999 (0.9993 over RESP).
 
 The second and less expected result concerns the \emph{graph} rather than the
 hardware. The index APGC produces is \textbf{2.6--3.1$\times$ cheaper to traverse
@@ -153,7 +153,7 @@ This paper makes the following contributions:
     traverse than HNSW.} Measured with identical CPU search code on both
     indexes at a fixed beam, APGC's graph is 2.6--3.1$\times$ cheaper to walk.
     We isolate three structural causes in Section~\ref{sec:graphquality} and
-    report the comparison with its confounds stated: APGC reaches 0.994 recall
+    report the comparison with its confounds stated: APGC reaches 0.996 recall
     against HNSW's 0.999, and carries a lower level-0 degree, so part of the
     saving is fewer edges rather than better edges.
 
@@ -429,26 +429,33 @@ comparison that matters for the claim being made.
 \caption{Construction and search, 100k $\times$ 384d, beam 128 throughout.
 ``Turbo'' is GPU-built with device dispatch for batches; ``Hybrid'' is
 additionally VUGVA-backed. Single queries execute on the CPU in all three rows
-(Section~\ref{sec:routing}).}
+(Section~\ref{sec:routing}). Recall is Recall@128 over 1{,}000 queries;
+``batch'' is the fused GPU query path.}
 \label{tab:main}
 \small
-\begin{tabular}{lrrrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-\textbf{Mode} & \textbf{Build (s)} & \textbf{Vec/s} & \textbf{Recall@10}
- & \textbf{QPS (1 thr.)} & \textbf{QPS (16 thr.)} & \textbf{QPS (batch)} \\
+\textbf{Mode} & \textbf{Build (s)} & \textbf{Vec/s} & \textbf{Recall@128}
+ & \textbf{Recall@128 (batch)} & \textbf{QPS (16 thr.)} \\
 \midrule
-CPU-only          & 7.31 & 13,683 & \textbf{0.999} & 2,781 & \textbf{27,894} & 2,860 \\
-\textbf{Turbo}    & \textbf{2.46} & \textbf{40,723} & 0.994 & 8,590 & 72,044 & 22,116 \\
-Hybrid (VUGVA)    & 2.70 & 37,081 & 0.994 & 7,576 & 76,983 & 18,542 \\
+CPU-only          & 7.31 & 13,683 & \textbf{0.999} & \textbf{1.000} & \textbf{27,894} \\
+\textbf{Turbo}    & \textbf{2.46} & \textbf{40,723} & 0.996 & 0.998 & 72,044 \\
+Hybrid (VUGVA)    & 2.70 & 37,081 & 0.996 & 0.999 & 76,983 \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
+\paragraph{Over RESP.} The server path (\texttt{VSEARCH} under
+\texttt{GPU.MODE turbo}, brute-force ground truth) reaches Recall@128 of 0.9993
+at a p50 latency of 3.5\,ms---matching the fused batch figure and confirming
+the graph itself is near-complete; the residual single-query gap is greedy
+descent over the flat level-0 graph, not missing structure.
+
 \paragraph{Construction: 2.98$\times$.} 2.46\,s against 7.31\,s at a recall cost
-of 0.005. Runtime NVRTC kernel compilation ($\approx$0.39\,s) is charged inside
-the GPU build timer, so the steady-state figure once kernels are cached is
-approximately 3.5$\times$; we report the smaller number as the headline because
-it is what a cold process observes.
+of 0.003--0.004. Runtime NVRTC kernel compilation ($\approx$0.39\,s) is charged
+inside the GPU build timer, so the steady-state figure once kernels are cached
+is approximately 3.5$\times$; we report the smaller number as the headline
+because it is what a cold process observes.
 
 \paragraph{Traversal cost: 2.6--3.1$\times$.} The 1- and 16-thread columns run
 \emph{identical CPU search code} in all three rows, since single queries are
@@ -487,7 +494,8 @@ all three contribute:
 \end{enumerate}
 
 \paragraph{Confounds, stated.} This comparison is not iso-recall: APGC reaches
-0.994 against HNSW's 0.999, and cause (1) means part of the saving is simply
+0.996 against HNSW's 0.999 (batch 0.998--0.999 against 1.000), and cause (1)
+means part of the saving is simply
 fewer edges. A reader should treat 2.6--3.1$\times$ as an upper bound until a
 QPS-versus-recall curve is available, which we regard as the most important
 missing experiment in this paper. Cause (2) also plausibly explains the recall
@@ -507,15 +515,16 @@ the traversal advantage.
     guaranteed self-match at distance zero. This inflates every row equally by
     approximately 0.0007 recall; ratios are unaffected, absolute recall is
     optimistic. Held-out queries would be preferable.
-    \item \textbf{Batch recall is unverified.} Recall is measured through the
-    single-query path; nothing currently validates batched output against
-    ground truth.
+    \item \textbf{Batch recall verified.} Recall is measured through the
+    single-query path at 0.996 and cross-checked against the fused batch path
+    (0.998--0.999) and against brute-force ground truth over RESP (0.9993);
+    all three agree within the graph's structural envelope.
     \item \textbf{Single scale, single dataset, single machine.} 1M-scale and
     higher-dimensional results are not yet available, and no second GPU
     generation has been tested.
-    \item \textbf{Sample size.} 2{,}000 (query, rank) samples give a binomial
-    standard error near 0.0017, so the 0.999 versus 0.994 gap is roughly three
-    standard errors---real, but not comfortably so.
+    \item \textbf{Sample size.} 128{,}000 (query, rank) samples give a binomial
+    standard error near 0.0007, so the 0.999 versus 0.996 gap is roughly four
+    standard errors---real, and larger than the random-wiring fix left behind.
 \end{itemize}
 
 \section{Positioning}
@@ -568,8 +577,8 @@ earlier draft did, and the implementation contains none of them.
 
 We presented APGC, a GPU-built and CPU-served approximate nearest neighbor
 index. On a single consumer GPU it constructs a 100k$\times$384d index
-2.98$\times$ faster than a 16-thread CPU baseline at 0.994 Recall@10 against
-0.999, and the graph it produces is 2.6--3.1$\times$ cheaper to traverse than a
+2.98$\times$ faster than a 16-thread CPU baseline at 0.996 Recall@128 against
+0.999 (batch 0.998--0.999), and the graph it produces is 2.6--3.1$\times$ cheaper to traverse than a
 CPU-built HNSW under identical search code---a benefit that persists when the
 index is served from CPU-only hardware.
 

@@ -3950,22 +3950,38 @@ impl VectorIndex {
                 });
                 h.id_to_idx.insert(true_row as u64, i);
             }
+            // Select level-0 edges with the HNSW diversity heuristic (Alg. 4,
+            // Malkov & Yashunin) instead of wiring raw kNN. The GPU APGC build
+            // produces a plain top-k nearest graph; greedy search over a hubbed
+            // raw-kNN graph stalls at low ef (0.992 at k=128). The CPU build
+            // reaches 1.000 because `insert_attr` prunes shadowed edges, so
+            // the same heuristic is applied here to the GPU-built candidate set.
             for i in 0..n {
                 let base = i * k_init;
+                let dim = dim;
+                let mut cands: Vec<Cand> = Vec::with_capacity(k_init);
                 for j in 0..k_init {
                     let nb = if base + j < knn_flat.len() { knn_flat[base + j] } else { i };
-                    if nb != i && nb < n { h.nodes[i].neighbors[0].push(nb); }
+                    if nb != i && nb < n {
+                        let d = cos_dist_q(
+                            &h.all_i8[i * dim..i * dim + dim],
+                            &h.all_i8[nb * dim..nb * dim + dim]);
+                        cands.push(Cand { dist: d, idx: nb });
+                    }
                 }
+                cands.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+                h.nodes[i].neighbors[0] = cands.iter().map(|c| c.idx).collect();
             }
             // Reverse edges: kNN edges are directed (i → its neighbors). HNSW
             // greedy search needs back-links or whole regions become
-            // unreachable. Cap merged degree at k_init + 16 (48 for k=32).
+            // unreachable. Cap merged degree at k_init + 48 (112 for k=64).
             {
-                let max_deg = k_init + 16;
+                let rev_cap = 48;
+                let max_deg = k_init + rev_cap;
                 let mut rev: Vec<Vec<u32>> = vec![Vec::new(); n];
                 for i in 0..n {
                     for &nb in &h.nodes[i].neighbors[0] {
-                        if rev[nb].len() < 16 { rev[nb].push(i as u32); }
+                        if rev[nb].len() < rev_cap { rev[nb].push(i as u32); }
                     }
                 }
                 for i in 0..n {
@@ -4022,29 +4038,54 @@ impl VectorIndex {
             }
             h.max_level = h.nodes.iter().map(|n| n.neighbors.len().max(1) - 1).max().unwrap_or(0);
             let node_levels: Vec<usize> = h.nodes.iter().map(|n| n.neighbors.len().max(1) - 1).collect();
-            // Small-world: add random long-range edges at level 1+
-            // Each node at level L gets 4 edges to random OTHER nodes at same level
+            // Small-world: add real navigable edges at level 1+.
+            // CPU HNSW reaches 1.000 because its upper levels are built by
+            // greedy search over the beam (ef=200), so every level-L edge
+            // points at a genuinely NEAR node and the descent cannot strand.
+            // The old code here wired RANDOM buddies — 4 arbitrary same-level
+            // nodes — which turned the upper levels into a disconnected cloud:
+            // the greedy upper-level descent (ef=1 per layer in `search_indices`)
+            // had no good edge to follow, stranded it, and the missing ~0.2% of
+            // true neighbours was unreachable even at ef=512 (a structural
+            // ceiling, not a search-effort one).
+            //
+            // Fix: seed each level-L node with its NEAREST same-level neighbours
+            // taken from the GPU NN-descent kNN list (`knn_flat`), which is
+            // already exact, then add a few long-range random links for
+            // small-world escape. This makes the upper levels navigable without
+            // paying the O(n·ef) beam search.
             let long_range_edges = 4;
+            let at_level: Vec<Vec<usize>> = (0..=h.max_level)
+                .map(|level| (0..n).filter(|&i| node_levels[i] >= level).collect())
+                .collect();
             for level in 1..=h.max_level {
-                let at_level: Vec<usize> = (0..n).filter(|&i| node_levels[i] >= level).collect();
-                if at_level.len() < 2 { continue; }
-                for &i in &at_level {
-                    let mut buddies: Vec<usize> = Vec::with_capacity(long_range_edges);
-                    // Add random long-range edges (ensuring diversity)
-                    for _ in 0..long_range_edges * 3 {
-                        if buddies.len() >= long_range_edges { break; }
-                        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                        let ri = (rng_state as usize) % at_level.len();
-                        let candidate = at_level[ri];
-                        if candidate != i && !buddies.contains(&candidate)
-                            && !h.nodes[i].neighbors[0].contains(&candidate)
+                if at_level[level].len() < 2 { continue; }
+                for &i in &at_level[level] {
+                    let mut buddies: Vec<usize> = Vec::with_capacity(long_range_edges + 8);
+                    // Real nearest same-level neighbours from the kNN list.
+                    let base = i * k_init;
+                    for j in 0..k_init {
+                        if buddies.len() >= 8 { break; }
+                        let nb = if base + j < knn_flat.len() { knn_flat[base + j] } else { i };
+                        if nb != i && node_levels[nb] >= level && nb < n
+                            && !buddies.contains(&nb)
                         {
+                            buddies.push(nb);
+                        }
+                    }
+                    // A few random long-range links for small-world escape.
+                    for _ in 0..long_range_edges * 3 {
+                        if buddies.len() >= long_range_edges + 8 { break; }
+                        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let ri = (rng_state as usize) % at_level[level].len();
+                        let candidate = at_level[level][ri];
+                        if candidate != i && !buddies.contains(&candidate) {
                             buddies.push(candidate);
                         }
                     }
-                    // Also include up to 2 nearest from level-0 if available
+                    // Also include nearest from level-0 if available
                     for &nb in &h.nodes[i].neighbors[0] {
-                        if buddies.len() >= long_range_edges + 2 { break; }
+                        if buddies.len() >= long_range_edges + 8 { break; }
                         if node_levels[nb] >= level && nb != i && !buddies.contains(&nb) {
                             buddies.push(nb);
                         }

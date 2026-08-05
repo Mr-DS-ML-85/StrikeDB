@@ -2753,7 +2753,7 @@ fn s_gpu_bench(path: &str) {
 
     // Ground truth once, shared by every mode — brute force is O(n·nq·dim) and
     // recomputing it per mode would dominate the run at 1M.
-    let nq = if n > 2000 { 200usize } else { n };
+    let nq = if n > 5000 { 1000usize } else { n };
     println!("  computing brute-force ground truth ({nq} queries × {n} vectors)...");
     let t_gt = Instant::now();
     let mut gt: Vec<Vec<u64>> = Vec::with_capacity(nq);

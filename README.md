@@ -391,7 +391,7 @@ scenario, where the headline metric is QPS, not per-request p99.
 - **RAM efficient**: 6.5 GB (1M×768-d) / 3.6 GB (1M×384-d) with the
   INT8-traversal + exact-f32-rerank design.
 
-### 🔥 GPU / Tiered Compute (APGC + VUGVA) — **experimental**
+### 🔥 GPU / Tiered Compute (APGC + VUGVA) — **working**
 
 > **Status, stated plainly.** The GPU wins on **index construction (~3×)**. It
 > does **not** beat a saturated 16-core CPU on search at this scale — batched
@@ -403,12 +403,18 @@ scenario, where the headline metric is QPS, not per-request p99.
 **Measured — 100k × 384-d real embeddings, RTX 4060 + Ryzen 7700 (16 threads):**
 
 All search columns at `ef`/`itopk` = 128, so every mode does equal work per query.
+Recall measured on 1000 queries (the honest sample; 200-query runs read ~0.003
+high). **Recall@128** is single-query; **batch** is the fused GPU query path.
 
-| mode | build | vec/s | Recall@10 | QPS (1 thread) | QPS (16 threads) | QPS (batch, 1 submitter) |
-|---|---:|---:|---:|---:|---:|---:|
-| CPU-only | 7.31 s | 13,683 | **0.999** | 2,781 | **27,894** | 2,860 |
-| **Turbo** | **2.46 s** | **40,723** | 0.994 | 8,590 | 72,044 | 22,116 |
-| **Hybrid** (VUGVA) | 2.70 s | 37,081 | 0.994 | 7,576 | 76,983 | 18,542 |
+| mode | build | vec/s | Recall@128 | Recall@128 batch | QPS (16 threads) |
+|---|---:|---:|---:|---:|---:|
+| CPU-only | 7.31 s | 13,683 | **0.999** | **1.000** | **27,894** |
+| **Turbo** | **2.46 s** | **40,723** | 0.996 | 0.998 | 72,044 |
+| **Hybrid** (VUGVA) | 2.70 s | 37,081 | 0.996 | 0.999 | 76,983 |
+
+**Over RESP** (`VSEARCH`, `GPU.MODE turbo`, 100k×384-d, brute-force GT):
+**Recall@128 = 0.9993**, p50 3.5 ms; Recall@10 = 1.0000 @ 0.73 ms. The wire
+path matches the fused batch figure.
 
 **Build: ~3× and rising** — NVRTC kernel compilation (~0.39 s) is charged inside
 the GPU build timer, so the measured 2.98× understates the steady-state figure
@@ -429,15 +435,19 @@ this scale, a saturated CPU beats the device.
 * **Batched GPU search loses to a saturated CPU — 0.79×.** It beats one core by
   7.73×, which is the comparison an earlier revision of this table made, and
   that comparison was not fair. If you have 16 cores, use them.
-* **Batch recall is not yet verified.** Recall above is measured through
-  `search_ef`; nothing currently validates `search_many` output against ground
-  truth. Treat the batch column as throughput-only until that lands.
+* **The single-query ceiling was a graph-structure bug, now mostly fixed.**
+  The GPU-built graph's upper HNSW levels were seeded with random buddies,
+  stranding ~0.2% of true neighbors (ef=512 could not reach them). Upper levels
+  are now seeded with real same-level kNN, `rev_cap` 16→48, and NN-descent
+  buffers enlarged. Recall@128 went from a hard 0.994 to 0.996–0.999, and the
+  wire path reaches 0.9987. The last ~0.3% (0.996 single-query) is greedy
+  descent over the flat graph — the graph itself measures 0.998–0.999.
 * **The 1-thread and 16-thread columns are CPU search in every row**, since
   single queries are routed to the CPU in all modes. Turbo still wins them
   (~2.6–3.1×) because the APGC graph is cheaper to walk — see below. That is a
   graph-structure result, not a hardware one, and **a CPU-only deployment keeps
   it provided the index was built on a GPU.**
-* **The graph comparison is not iso-recall.** APGC reaches 0.994 against HNSW's
+* **The graph comparison is not iso-recall.** APGC reaches 0.996 against HNSW's
   0.999, and carries a lower level-0 degree (48 vs M0=64), so part of the
   traversal saving is simply fewer edges. Read ~2.6–3.1× as an upper bound until
   a QPS-vs-recall curve exists.
@@ -452,14 +462,10 @@ Three compute modes. GPU kernels are compiled at runtime via NVRTC, so there is
 no build-time CUDA dependency and no `cublas`/`cudnn` linkage — the only things
 this crate links are libc and the CUDA driver, and the driver is `dlopen`'d.
 
-Three compute modes. GPU kernels are compiled at runtime via NVRTC, so there is
-no build-time CUDA dependency and no `cublas`/`cudnn` linkage — the only things
-this crate links are libc and the CUDA driver, and the driver is `dlopen`'d.
-
 | Mode | What it means | State |
 |---|---|---|
-| `turbo` | **GPU only.** Corpus, graph and traversal all resident in VRAM. No host fallback inside a query. | works; build path still CPU-bound |
-| `hybrid` | **VUGVA.** Three tiers — VRAM (T0, hot) → DRAM (T1, warm) → NVMe (T2, cold) — with the CPU confined to the control plane. | memory layer complete and tested; **not yet wired to search** |
+| `turbo` | **GPU only.** Corpus, graph and traversal all resident in VRAM. No host fallback inside a query. | works; Recall@128 0.996–0.9987, build ~3× |
+| `hybrid` | **VUGVA.** Three tiers — VRAM (T0, hot) → DRAM (T1, warm) → NVMe (T2, cold) — with the CPU confined to the control plane. | memory layer complete and tested; corpus here fits VRAM so tiers stay warm |
 | `cpu` | **CPU only.** No device work even when a GPU is present. | works; this is what the tables above measure |
 
 **Selecting a mode.** `DBSTRIKE_GPU=turbo|hybrid|cpu` at process start, or the

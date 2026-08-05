@@ -1075,7 +1075,7 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
         // kernels, double-buffered graph). Falls back to the CPU loop below
         // on any allocation/launch failure.
         let gpu_refined = (|| {
-            let rev_cap = 16usize;
+            let rev_cap = 48usize;
             let state = GPU_STATE.get()?;
             let rev_func = state.get_kernel("nn_rev")?;
             let nd_func = state.get_kernel("nn_descent")?;
@@ -1827,13 +1827,20 @@ fn apgc_search_smem(itopk: usize, degree: usize, dim: usize, rerank: bool) -> u3
     let mut buf = 1usize;
     while buf < itopk + beam * degree { buf <<= 1; }
     let d4 = (dim + 3) / 4;
+    // The kernel's per-iteration dedup set. This MUST match `SR_HASH` in
+    // `all_kernels.cu`; otherwise the host underallocates dynamic shared
+    // memory and the kernel's `vis`/`qcache`/`s_ctl` pointers overrun the
+    // buffer, silently corrupting the bitonic sort (results come back as
+    // sentinel -1/2.0). Forced back in sync when `apgc_search`'s dedup set
+    // grew from 1024 to 8192 for better candidate dedup at scale.
+    const SR_HASH: usize = 8192;
     // The kernel's rerank width is next_pow2(k) and k is capped at
     // GPU_TOPK_MAX, so size the accumulator for the rounded-up bound —
     // GPU_TOPK_MAX itself is not guaranteed to be a power of two.
     let mut rr_max = 1usize;
     while rr_max < GPU_TOPK_MAX { rr_max <<= 1; }
     let rr = if rerank { dim + rr_max } else { 0 };
-    ((3 * buf + 1024 + d4 + 16 + rr) * 4) as u32
+    ((3 * buf + SR_HASH + d4 + 16 + rr) * 4) as u32
 }
 
 /// Threads per block for `apgc_search_kernel`.

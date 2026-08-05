@@ -630,8 +630,8 @@ void nn_rev_kernel(const int* __restrict__ graph, int* __restrict__ rev,
 //   2. Parallel dp4a scoring across all threads.
 //   3. Parallel K-step arg-max selection (block tree reduction).
 // Own edges are always in the candidate set, so a pass can never degrade a list.
-#define ND_CAND_MAX 1024
-#define ND_HASH 2048
+#define ND_CAND_MAX 2048
+#define ND_HASH 4096
 #define ND_HMASK (ND_HASH - 1)
 
 __device__ __forceinline__ void nd_try_insert(int w, int* hash, int* cand, int* nc_ptr) {
