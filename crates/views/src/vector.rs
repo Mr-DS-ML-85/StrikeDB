@@ -79,6 +79,9 @@ pub struct SparseIndex {
     n: usize,
     /// Average doc length (BM25 `avgdl`).
     avgdl: f32,
+    /// Real client id → insertion order, so `remove` can tombstone a doc that
+    /// was added under its client id without a linear scan.
+    id_to_order: HashMap<u64, usize>,
 }
 
 impl SparseIndex {
@@ -89,6 +92,7 @@ impl SparseIndex {
             doc_len: Vec::new(),
             n: 0,
             avgdl: 0.0,
+            id_to_order: HashMap::new(),
         }
     }
 
@@ -97,15 +101,45 @@ impl SparseIndex {
     fn add(&mut self, id: u64, terms: Vec<(u32, f32)>) {
         let dl = terms.len();
         let order = self.doc_terms.len();
-        let _ = id; // id is implicit by insertion order; kept for parity/clarity
         for &(t, _) in &terms {
             self.postings.entry(t).or_default().push(order as u64);
         }
         self.doc_terms.push(terms);
         self.doc_len.push(dl);
+        self.id_to_order.insert(id, order);
         self.n += 1;
         let new_avg = self.avgdl + (dl as f32 - self.avgdl) / self.n as f32;
         self.avgdl = new_avg;
+    }
+
+    /// Tombstone the doc added under `id`: drop its postings entries (so no
+    /// sparse/BM25 query can ever surface it again) and zero its local doc
+    /// terms. Leaves the slot in place to keep all other orders stable, which
+    /// is what makes hybrid joins by id remain correct after deletes.
+    fn remove(&mut self, id: u64) {
+        let Some(order) = self.id_to_order.remove(&id) else {
+            return;
+        };
+        let old_len = self.doc_len[order];
+        let terms = std::mem::take(&mut self.doc_terms[order]);
+        for &(t, _) in &terms {
+            if let Some(p) = self.postings.get_mut(&t) {
+                p.retain(|&d| d as usize != order);
+                if p.is_empty() {
+                    self.postings.remove(&t);
+                }
+            }
+        }
+        self.doc_len[order] = 0;
+        if self.n > 1 {
+            // Running-average removal: n and avgdl stay consistent with the
+            // remaining live docs so BM25 idf / length norms stay stable.
+            self.avgdl = (self.avgdl * self.n as f32 - old_len as f32) / (self.n as f32 - 1.0);
+            self.n -= 1;
+        } else {
+            self.avgdl = 0.0;
+            self.n = 0;
+        }
     }
 
     /// BM25 score of `query_terms` against the doc at `order`. `k1`/`b` are the
@@ -5572,13 +5606,19 @@ impl VectorIndex {
         count
     }
 
-    pub fn forget(&self, id: u64) {
+    /// Tombstone a vector id: drop its durable KV, mark the HNSW node deleted
+    /// (search filters these in every path), remove it from the id→idx map, and
+    /// purge its sparse/BM25 postings. Returns whether the id was present.
+    pub fn forget(&self, id: u64) -> bool {
         let _ = self.engine.delete(vec_key(id));
         let mut g = self.hnsw.write().unwrap();
         if let Some(&idx) = g.id_to_idx.get(&id) {
             g.nodes[idx].deleted = true;
         }
-        g.id_to_idx.remove(&id);
+        let present = g.id_to_idx.remove(&id).is_some();
+        drop(g);
+        self.sparse.write().unwrap().remove(id);
+        present
     }
 }
 

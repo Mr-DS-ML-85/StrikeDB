@@ -441,7 +441,7 @@ pub fn command_category(cmd: &str) -> PermCategory {
         "CONFIG" | "SELECT" | "FLUSHALL" | "FLUSHDB" | "COMMAND" => PermCategory::Admin,
         "CLIENT" => PermCategory::Admin,
         // Vector
-        "VADD" | "VADDBATCH" | "VBULKLOAD" | "VSEARCH" | "VSEARCHA" | "VSEARCH.MANY"
+        "VADD" | "VADDBATCH" | "VBULKLOAD" | "VDEL" | "VSEARCH" | "VSEARCHA" | "VSEARCH.MANY"
         | "VSETQUANT" | "VFITQUANT" | "VQUANT" | "VCALIBRATE" => PermCategory::Vector,
         // Time-series
         "TSADD" | "TSADD.F" | "TSRANGE" | "TSRANGE.LATEST" | "TSLATEST" | "TSAVG" => PermCategory::TimeSeries,

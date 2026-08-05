@@ -88,6 +88,7 @@ redis-cli -p 6380 PING          # -> PONG
 redis-cli -p 6380 SET user:1 ada
 redis-cli -p 6380 VADD 1 1.0 0.0 0.0
 redis-cli -p 6380 VSEARCH 5 1.0 0.0 0.0
+redis-cli -p 6380 VDEL 1          # -> :1  tombstone a vector (no longer searchable)
 redis-cli -p 6380 SUBSCRIBE trades &
 redis-cli -p 6380 PUBLISH trades "hello"
 redis-cli -p 6380 CHECKPOINT   # snapshot current state + truncate WAL
@@ -684,7 +685,7 @@ regression vs the `-P64` number (5.71M/s) and a **~261×** regression vs the
 `PING · SET · GET · MSET · MGET · DEL · INCR · INCRBY · KEYS · DBSIZE ·
 SELECT · COMMAND · FLUSHALL · FLUSHDB · SUBSCRIBE · PUBLISH · QUIT ·
 AUTH · ACL`
-plus StrikeDB-native: `VADD · VADDBATCH · VSETQUANT · VFITQUANT · VQUANT ·
+plus StrikeDB-native: `VADD · VDEL · VADDBATCH · VSETQUANT · VFITQUANT · VQUANT ·
 VSEARCH · VSEARCHA · VSEARCH.MANY · VCALIBRATE · TABLE.* · TSADD · TSADD.F ·
 TSRANGE · TSAVG · TSRANGE.LATEST · CDCLEN · CRDT.* · HLC.* · REDUCE ·
 REDUCE.PROGRAM · MEM.* · RAG.* · RAG.CONTEXT · CACHE.* · GETAT · SCAN ·
@@ -700,6 +701,11 @@ attribute + sparse/BM25 terms in a single command; one `VSEARCH` serves every
 access path through optional trailing flags — no per-module command sprawl:
 
 - `VADD <id> f1 f2 …` — store vector `id`; attr buckets + sparse/BM25 terms derived from coords
+- `VDEL <id> [id …]` — tombstone vector(s) by id; returns the count that were present.
+  Marks the HNSW node deleted (filtered from every search path — CPU, GPU, filtered,
+  hybrid), drops the durable KV, and purges the sparse/BM25 postings. Vital for
+  correcting a mistyped / superseded agent-owned vector without a rebuild:
+  `VDEL <id>` then re-`VADD` the correction. `VDEL 999` → `:0` if absent.
 - `VADDBATCH dim id f… [id f…]…` — batched ingest. **Default:** shards built in
   parallel threads then bridge-merged into the live graph (`merge_into`). **Correct
   but single-threaded at the merge step** — for repeated small batches the serial

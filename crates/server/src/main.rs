@@ -995,6 +995,28 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             Resp::Simple("OK".into())
         }
 
+        // VDEL id [id ...]  -> :<count>
+        // Tombstone vectors by id: drops each durable KV, marks the HNSW node
+        // deleted (every search path filters these), and purges each id's
+        // sparse/BM25 postings. Counts the ids that were actually present.
+        "VDEL" => {
+            if args.is_empty() {
+                return err("VDEL requires at least one id");
+            }
+            let vi = db.router.vectors();
+            let mut deleted = 0u64;
+            for a in args {
+                let id: u64 = match std::str::from_utf8(a).ok().and_then(|s| s.parse().ok()) {
+                    Some(n) => n,
+                    None => return err("id is not a u64"),
+                };
+                if vi.forget(id) {
+                    deleted += 1;
+                }
+            }
+            Resp::Int(deleted as i64)
+        }
+
         // VADDBATCH [PAR] dim id0 f0..f{dim-1} id1 f0..f{dim-1} ...  -> :n
         // Multi-core ingest (Module 1). Default: builds the batch as parallel
         // shards and bridge-merges into the live graph via `merge_into`
