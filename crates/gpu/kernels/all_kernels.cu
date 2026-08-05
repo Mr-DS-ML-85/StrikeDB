@@ -177,8 +177,13 @@ void apgc_search_kernel(
     if (tid == 0) {
         float dot = 0.0f;
         if (query_f32 != nullptr) {
+            // The exact corpus and exact query are both supplied together, so
+            // score the entry against the f32 corpus. Reading the int8 buffer
+            // (via (const float*)vectors) interprets 4 packed bytes as one
+            // float and hands the walk a garbage seed score.
             const float* qf = query_f32 + (size_t)qid * D;
-            const float* vv = (const float*)vectors + (size_t)entry_node * D;
+            const float* vv = (vec_f32 != nullptr) ? (vec_f32 + (size_t)entry_node * D)
+                                                   : (const float*)vectors + (size_t)entry_node * D;
             for (int d = 0; d < D; d++) dot += qf[d] * vv[d];
         } else {
             const int* vv = (const int*)vectors + (size_t)entry_node * D4;
@@ -279,7 +284,12 @@ void apgc_search_kernel(
                 float dot = 0.0f;
                 const float* vv = vec_f32 + (size_t)node * D;
                 const float* qf = query_f32 + (size_t)qid * D;
-                for (int d = tid; d < D; d += threads) dot += qf[d] * vv[d];
+                // Each thread owns its candidate `c` (outer loop), so it must
+                // sum ALL D dims itself — NOT stride by `threads`. The old
+                // `d = tid; d < D; d += threads` made each score a partial dot
+                // over one strided dim (≈ qf[tid]*vv[tid]), wrecking ranking
+                // whenever the f32 corpus is resident.
+                for (int d = 0; d < D; d++) dot += qf[d] * vv[d];
                 buf_dot[c] = __float2int_rn(dot * 127.0f);
             } else {
                 int dot = 0;

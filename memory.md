@@ -1,7 +1,210 @@
 # DB-Strike — Working Memory
 
 **Master state file. Update on every code change.**
-Last updated: 2026-08-05 · 22 commits ahead of `origin/main`, **none pushed**
+Last updated: 2026-08-05 · GPU batch Recall@128 0.39→0.992 (f32-scoring fix, §9)
+
+---
+
+## 8. Bottleneck investigation — three real bugs (write-up of the fix session)
+
+Three independent sub-agent audits (GPU / CPU+RAM / DB code) converged on the
+same verdict: **hardware is not the problem** (RTX 4060 ~15 TFLOPS / 272 GB/s /
+24 SMs; Ryzen 7700 at 5.4 GHz with AVX-512 VNNI active; governor=performance;
+DDR5 ~47 GB/s measured). The DB has **two dead-code/algorithm bugs** and the
+benchmark inflates its own result. All findings verified by reading the source
+at the exact lines below.
+
+### VERIFIED LIVE over RESP (2026-08-05, server 127.0.0.1:6380, scale_384_100000.fbin, GPU.MODE turbo)
+
+Before trusting the sub-agent write-ups, I tested the running server directly via
+`redis-cli`/redis-py over the wire:
+
+| path | RESp command | recall@128 | notes |
+|---|---|---|---|
+| CPU single | `VSEARCH k <384 floats>` | **0.9992** | correct |
+| **GPU batch** | `VSEARCH.MANY k dim <NQ×384 floats>` | **0.3906** | **garbage — BUG 1 CONFIRMED LIVE** |
+
+- `VSEARCH.MANY` returns exactly **`batch-size NQ` hits per query** (NQ=16 → 16,
+  NQ=50 → 50, NQ=100 → 100), not k=128. The same query returns wildly different
+  recall run-to-run (0.1562 → 0.4688 → 0.3906) on a deterministic index — the
+  signature of stale/uninitialised GPU output buffers.
+- It can also **panic the whole server**: `thread '<unnamed>' panicked at
+  crates/views/src/vector.rs:1991:42: copy_from_slice: source slice length (64)
+  does not match destination slice length (384)` — a quantize/dim desync reached
+  through the batch path. The server died mid-test on that run.
+- So the sub-agents were **wrong** that the batch path "silently falls back to
+  CPU." It returns corrupt data and can crash. The `1.93× batch beats CPU` line in
+  the README/memory.md table (commit `1d0a36f`) measured this broken path.
+- **The GPU kernel really can't launch** (135,104 B smem vs 101,376 B opt-in
+  ceiling measured on AD107). The whole `search_many` GPU path is dead code that
+  publishes garbage instead of failing loudly.
+
+### Bug 1 — the APGC GPU search kernel can never launch (fatal, silent)
+
+- `apgc_search_smem` (crates/gpu/src/lib.rs:1825–1844) sizes dynamic shared
+  memory for `apgc_search_kernel`. For the benchmark workload (itopk=512,
+  beam=64 default, `index.degree`=64) it computes **135,104 B**:
+  BUF = next_pow2(512 + 64·64) = **8192**; 3·BUF + SR_HASH(8192) + D4(96) +
+  16 + rerank(384 + next_pow2(GPU_TOPK_MAX=512)=896) = 33,776 ints · 4 = 135,104.
+- RTX 4060 is **compute capability 8.9 (AD107)**. Verified empirically:
+  default dynamic-smem limit = **48 KB (49,152 B)**, opt-in ceiling =
+  **101,376 B (99 KB)**, per-SM = **102,400 B**. The kernel needs 135 KB — it
+  can NEVER launch, opt-in or not.
+- The opt-in call **`cuFuncSetAttribute(... MAX_DYNAMIC_SHARED_SIZE_BYTES)`
+  is never made anywhere** in the codebase (grep-verified). So even a request
+  between 48 KB and 99 KB would be rejected.
+- Consequence: `cuLaunchKernel` returns non-zero at
+  crates/gpu/src/lib.rs:2161, `gpu_search_batched` **silently falls through**
+  to the fused brute-force scan (2178) → two-kernel brute-force (2216) →
+  `None` → caller falls back to CPU HNSW. `gpu_search`/`search_many`/fused
+  batch (crates/views/src/vector.rs:5179, 5324) all end up CPU. **Every "GPU
+  batch" number on record was CPU-path or a brute-force scan, not APGC.**
+- Why the graph is 64-wide: `gpu_degree = degree.min(64)` (vector.rs:4652).
+  **Degree cannot be trimmed** — all_kernels.cu:110–112 measures that
+  clamping 64→32 drops recall@10 from 0.996 to 0.948 (graph adjacency is not
+  quality-ordered; truncation is never free). Trim must come from `beam`,
+  `SR_HASH`, or `itopk`.
+- `search_many` also over-fetches: `itopk = fetch_k.max(rerank_k).max(128)`
+  with `fetch_k = max(k*4, 64)` = 512 at k=128 (vector.rs:5312, 5320), which
+  is what forces itopk=512 into the sizer.
+
+### Bug 2 — CPU search frontier is unbounded (3–5× too many distance evals)
+
+- `search_layer` (crates/views/src/vector.rs:2311–2328) pushes **every
+  unvisited neighbor** onto the candidate heap ("Always extend the frontier",
+  2316). hnswlib inserts into the ef-set first and only pushes if the neighbor
+  made it in. Result measured: **avg 16,418 node visits/query** at ef=512
+  (p50 16,786, max 23,659) vs ~4–6k for a tuned HNSW. The `ef*2` capacity
+  hint at 2288 is not a bound — the heap grows to 10⁴+.
+- This is pure over-work: distance evals dominate QPS. Bounding it should lift
+  single- and multi-thread QPS ~3× with zero recall change (the same ef-set is
+  kept; only hopeless frontier candidates stop being expanded).
+
+### Bug 3 — the segment-bridge build pass is single-threaded (81% of build)
+
+- `merge_segments` Phase 2 (vector.rs:3382–3399): for each of `total` nodes, a
+  serial `search_local` graph walk into the nearest other segment to add
+  cross-shard edges. 16 shards × 6,250 nodes = the whole pass runs on one
+  core while 15 sit idle. Measured 6.38 s build → ~4.1 s is this bridge.
+
+### Benchmark inflation — the "QPS collapse" was a metric change, not a graph
+
+- `s_gpu_bench` calls `search_ef(q, 128, 128)` (crates/bench/src/main.rs:2802)
+  but `rerank_k = (k*4).max(64)` (vector.rs:5213) inflates the traversal to
+  **ef=512** at k=128 (vector.rs:5214). Old 27,894 QPS was k=10/ef=128;
+  27,894/4 ≈ 6,970 ≈ measured 6,734. Not a graph regression, but the headline
+  was silently measuring a 4×-harder workload. M=32 / M_max0=64 are unchanged
+  (vector.rs:1860–1861).
+
+### Fix plan (decided, ordered)
+
+1. **Make APGC launch**: add `cuFuncSetAttribute` opt-in AND trim smem to
+   ≤ ~96 KB. Trim levers (degree fixed at 64):
+   - `SR_HASH` 8192 → 4096 (dedup set; kernel + host sizer both, they MUST
+     stay in sync — the 9958fb0 bug proved the corruption that follows a
+     mismatch).
+   - `beam` default 64 → 32 (BUF = next_pow2(itopk + beam·degree): with beam 32,
+     BUF = next_pow2(512+2048) = 4096 → 3·4096 + 4096 + 96 + 16 + 896 =
+     18,688 ints · 4 = **74,752 B**, fits). Beam is per-iteration expansion,
+     not the list width; recall impact to be verified empirically, fall back to
+     beam 48 (85,952 B) if recall drops.
+   - Verify recall ≥ 0.976 with the unit test `test_apgc_gpu_search` + bench.
+2. **Bound the CPU frontier** (Bug 2): push a neighbor only when it either
+   improves the ef-set or the ef-set is not full; keep the greedy `> worst`
+   break. Expected ~3× QPS at identical recall.
+3. **Parallelize the bridge** (Bug 3): chunk `total` across threads for Phase 2
+   (Phase 1 is already GPU/vectorized). Segments' `search_local` is read-only.
+4. **Kill the benchmark inflation**: document that `search_ef(q,k)` traverses at
+   `max(ef, k*4)`; or make bench report the true ef. Keep behavior (recall
+   needs the over-fetch) but stop presenting it as a smaller workload.
+5. Re-run `--gpu-bench` + wire verify; confirm batch path is **real APGC graph
+   search, not brute-force**; update README table; commit.
+
+**Hard rule from user: no brute-force search — the fused/brute fallback must
+not be what produces benchmark numbers. GPU batch must run the APGC graph
+kernel.**
+
+---
+
+## 9. GPU batch recall 0.39 → 0.992 — the f32 scoring desync (FIXED)
+
+**Symptom (verified live over RESP, 2026-08-05):** `VSEARCH.MANY` (GPU batch,
+Turbo mode, 100k×384d) returned **0.3906 Recall@128** — garbage IDs that
+changed run-to-run, with `hits/query == NQ` (only NQ hits, not k=128). The
+single-query CPU path measured 0.9992 at the same time, so the graph itself was
+fine. The bug was **entirely inside the GPU kernel's f32 candidate-scoring path.**
+
+### Root cause — `crates/gpu/kernels/all_kernels.cu`
+
+In `apgc_search_kernel`, the per-iteration candidate-scoring loop had this bug:
+
+```c
+// BUG: thread `tid` owns candidate `c` (outer loop), but this inner loop
+// strided dimensions by `threads` starting at `tid`. Each candidate's score
+// was a PARTIAL dot over ONE strided dimension, not the full dot product.
+for (int c = itopk + tid; c < itopk + nc; c += threads) {
+    ...
+    for (int d = tid; d < D; d += threads) dot += qf[d] * vv[d];  // ✗
+    buf_dot[c] = __float2int_rn(dot * 127.0f);
+}
+```
+
+With `threads=512, D=384`, each thread's `dot` covered only `d ∈ {tid, tid+512,
+…}` — i.e. **one or two dimensions**, not the full 384. Candidate scores were
+therefore ~random, the bitonic sort ranked noise, and the walk lost its way.
+The int8 fallback branch below it summed `d4=0..D4` fully and was correct —
+that's why the 3 GPU unit tests (int8-only) passed while the live f32-rerank
+batch path returned garbage.
+
+Fix: each owning thread sums ALL `D` dims serially:
+
+```c
+for (int c = itopk + tid; c < itopk + nc; c += threads) {
+    ...
+    for (int d = 0; d < D; d++) dot += qf[d] * vv[d];  // ✓ full dot
+    buf_dot[c] = __float2int_rn(dot * 127.0f);
+}
+```
+
+### Second bug — entry-node seed score read the int8 buffer as float
+
+At the top of the kernel, the entry-node score did:
+
+```c
+const float* vv = (const float*)vectors + (size_t)entry_node * D;  // ✗
+```
+
+`vectors` is the **int8 corpus** (`const char*`); casting it to `float*` reads
+four packed bytes as one float and seeds the walk with garbage. With the f32
+corpus live it must read `vec_f32` instead. Fixed.
+
+### Why the kernel output looked "scrambled" after the fix
+
+After fixing, batch recall jumped to **0.992** and query-0 top-8 matched ground
+truth exactly — yet a debug read of the raw kernel output showed ids like
+`[27841, 36403, …]` with the *correct* distances `[0.0, 0.177, 0.187, …]`.
+
+**Not a bug.** The APGC kernel walks hnsw **position** space; `search_many`
+maps position→external id through `g.nodes` (crates/views/src/vector.rs:5346).
+The kernel's distances matched truth to the last digit; the id mismatch was just
+position-vs-id addressing. The debug pairs were the smoking gun that the rerank
+was now correct.
+
+### Verification
+
+- `NQ=1000, K=128, random queries`: **Recall@128 = 0.9920** (min 0.8906) vs the
+  CPU path's 0.9992 — the ~0.7% gap is beam/candidate-set tuning
+  (`fetch_k=512`, beam 56), not correctness.
+- `VSEARCH.MANY` NQ=8/16/32/64, K=128: all hit counts = 128, q0 exact.
+- Kernel launch `r=0, sync=0, c1=0, c2=0`; nvalid = out_count every time.
+
+### Debug lines removed
+
+The temporary `[GPU-DEBUG]` / `[SEARCH-DEBUG]` eprintlns from the investigation
+were removed. A single sanity guard remains: if a batch returns fewer valid
+hits than `out_count`, it logs `[GPU] apgc search: only n/… valid hits`.
+
+---
 
 Companion: `early-dev.md` holds longer-form findings. This file is the index —
 what is done, what is open, what is broken, and what will mislead you.
@@ -106,6 +309,9 @@ one) and **batch Recall@128** (fused GPU query path).
   clean at 6 pages.
 - Docs reconciled: README, `docs/apgc.md`, `docs/vugva.md`, `index.html`,
   `docs/index.html`.
+- **GPU batch Recall@128 = 0.9920** live over RESP (was 0.39 garbage) after
+  fixing the f32 candidate-scoring desync in `apgc_search_kernel` (§9).
+  `VSEARCH.MANY` NQ=8/16/32/64 @ K=128 returns full k=128 hits, q0 exact.
 
 ### Bugs fixed (all were silent — none threw)
 
@@ -120,6 +326,8 @@ one) and **batch Recall@128** (fused GPU query path).
 | `gpu_check_capacity` returned VRAM cached at init | over-reported free memory |
 | SelKV gate: `0.1f < 1.0f-0.9f` is **true** in binary32 | every zero-in-degree node silently unreachable |
 | `upload_to_gpu` degree from node 0 alone | every other row truncated |
+| APGC f32 candidate score summed `d = tid; d < D; d += threads` | each score a partial dot over ~1 dim → Recall@128 0.39 garbage on f32 rerank batch (§9) |
+| APGC entry-node seed read int8 `vectors` as `float*` | walk seeded with garbage f32 dot when corpus live (§9) |
 | Server re-parsed partial frames from byte zero | 96 MB command ≈ 72 GB of parsing (fix REVERTED — see below) |
 | **My parse backoff waited for bytes never coming** | any multi-read command hung the connection |
 | `GPU.MODE turbo` probed availability before setting mode | GPU unreachable over RESP entirely |

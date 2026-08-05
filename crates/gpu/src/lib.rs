@@ -89,7 +89,16 @@ extern "C" {
     fn cuMemcpyHtoDAsync_v2(dstDevice: u64, srcHost: *const std::ffi::c_void, byteCount: usize, hStream: *mut std::ffi::c_void) -> i32;
     fn cuMemcpyDtoHAsync_v2(dstHost: *mut std::ffi::c_void, srcDevice: u64, byteCount: usize, hStream: *mut std::ffi::c_void) -> i32;
     fn cuMemsetD32_v2(dstDevice: u64, ui: u32, n: usize) -> i32;
+    // Dynamic shared-memory opt-in: a kernel whose launch needs more than the
+    // 48 KB default must request it via this attribute BEFORE cuLaunchKernel.
+    fn cuFuncSetAttribute(f: *mut std::ffi::c_void, attrib: i32, value: i32) -> i32;
 }
+
+const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+// AD107 (RTX 4060, CC 8.9): measured opt-in ceiling is 99 KB, per-SM 100 KB.
+// Default is 48 KB; the APGC kernel needs more, so we must opt in AND stay
+// under this hard device limit (a request above it fails the launch).
+const GPU_MAX_DYN_SMEM: usize = 96 * 1024; // 98,304 B — under the 99 KB ceiling
 
 const CU_STREAM_NON_BLOCKING: u32 = 0x1;
 
@@ -1822,8 +1831,12 @@ impl GpuIndex {
 /// query words + 16 control ints, where BUF = next_pow2(itopk + beam·degree).
 /// `rerank` adds the fused rerank scratch: `dim` floats for the exact query
 /// plus `GPU_TOPK_MAX` floats for the per-candidate accumulators.
-fn apgc_search_smem(itopk: usize, degree: usize, dim: usize, rerank: bool) -> u32 {
-    let beam = gpu_search_beam().clamp(1, 64) as usize;
+///
+/// `beam` is taken explicitly (not re-read from the env) so the caller can
+/// pass the SAME value it sends to the kernel — if they diverged, the kernel
+/// would size its own BUF from `beam_in` and the host would have allocated a
+/// different amount, corrupting the shared-memory layout.
+fn apgc_search_smem(itopk: usize, degree: usize, dim: usize, rerank: bool, beam: usize) -> u32 {
     let mut buf = 1usize;
     while buf < itopk + beam * degree { buf <<= 1; }
     let d4 = (dim + 3) / 4;
@@ -1841,6 +1854,46 @@ fn apgc_search_smem(itopk: usize, degree: usize, dim: usize, rerank: bool) -> u3
     while rr_max < GPU_TOPK_MAX { rr_max <<= 1; }
     let rr = if rerank { dim + rr_max } else { 0 };
     ((3 * buf + SR_HASH + d4 + 16 + rr) * 4) as u32
+}
+
+/// Largest beam (≤ env `GPU_SEARCH_BEAM`, ≤ 64) whose dynamic shared-memory
+/// footprint fits the device's opt-in ceiling.
+///
+/// Without this the launch silently fails: `apgc_search_kernel` needs
+/// 3·BUF + SR_HASH + D4 + 16 + rr ints, and at itopk=512/beam=64/degree=64 the
+/// BUF term alone (8192) puts the total at 135,104 B — far over the 48 KB
+/// default AND the 99 KB opt-in ceiling of this AD107 (measured:
+/// default=49,152, opt-in=101,376, per-SM=102,400). The kernel CANNOT launch at
+/// beam=64, so every "GPU batch" result was stale-buffer garbage, not a graph
+/// search. Reducing beam 64→32 halves BUF (8192→4096) and smem to ~86 KB.
+///
+/// Returns the beam the caller must pass to BOTH the kernel (as `beam_in`) and
+/// `apgc_search_smem`, so the two never disagree about the layout.
+fn apgc_fit_beam(itopk: usize, degree: usize, dim: usize, rerank: bool) -> i32 {
+    let requested = gpu_search_beam().clamp(1, 64);
+    let mut beam = requested;
+    while beam > 1 && apgc_search_smem(itopk, degree, dim, rerank, beam as usize) as usize > GPU_MAX_DYN_SMEM {
+        // BUF only changes at power-of-two boundaries, so stepping by 8 still
+        // lands on every viable configuration while converging in ≤8 steps.
+        beam = (beam - 8).max(1);
+    }
+    if beam != requested {
+        eprintln!("[GPU] apgc_search smem would exceed {} B at beam={}; using beam={}",
+            GPU_MAX_DYN_SMEM, requested, beam);
+    }
+    beam
+}
+
+/// Call `cuFuncSetAttribute` to opt a kernel into dynamic shared memory above
+/// the 48 KB default (up to the device's per-function ceiling). Returns the
+/// error code; 0 means the opt-in succeeded. The APGC kernel needs > 48 KB, so
+/// every launch site MUST call this before `cuLaunchKernel` or the launch fails
+/// with CUDA_ERROR_INVALID_VALUE and the callers silently fall back to stale
+/// brute-force buffers.
+fn apgc_optin_smem(func: *mut std::ffi::c_void, smem: u32) -> i32 {
+    unsafe {
+        cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
+    }
 }
 
 /// Threads per block for `apgc_search_kernel`.
@@ -1997,7 +2050,7 @@ fn gpu_search_slot_batch(
         let entry_i32 = entry_node.min(n - 1) as i32;
         let q_i32: i32 = nq as i32;
         let (selkv_ratio, delta_ar_k) = opusedge_knobs();
-        let beam = gpu_search_beam();
+        let beam = apgc_fit_beam(itopk, index.degree, index.dim, rerank);
         let params: [*mut std::ffi::c_void; 19] = [
             &index.d_vectors as *const u64 as *mut std::ffi::c_void,
             &index.d_graph as *const u64 as *mut std::ffi::c_void,
@@ -2019,7 +2072,11 @@ fn gpu_search_slot_batch(
             p_vf as *const u64 as *mut std::ffi::c_void,
             p_qf as *const u64 as *mut std::ffi::c_void,
         ];
-        let smem = apgc_search_smem(itopk, index.degree, index.dim, rerank);
+        let smem = apgc_search_smem(itopk, index.degree, index.dim, rerank, beam as usize);
+        // Opt the kernel into dynamic shared memory above the 48 KB default.
+        // Without this the launch fails silently and callers return stale
+        // buffer contents instead of real neighbours.
+        apgc_optin_smem(func, smem);
         let r = cuLaunchKernel(func, nq as u32, 1, 1, apgc_search_threads(), 1, 1, smem, stream,
             params.as_ptr() as *mut *mut std::ffi::c_void, std::ptr::null_mut());
         if r != 0 { release(&index.slot_mask); return None; }
@@ -2135,7 +2192,7 @@ fn gpu_search_batched(
                 let entry_i32 = entry_node.min(n - 1) as i32;
                 let q_i32 = num_queries as i32;
                 let (selkv_ratio, delta_ar_k) = opusedge_knobs();
-                let beam = gpu_search_beam();
+                let beam = apgc_fit_beam(itopk, index.degree, index.dim, rerank);
                 let params: [*mut std::ffi::c_void; 19] = [
                     &index.d_vectors as *const u64 as *mut std::ffi::c_void,
                     &index.d_graph as *const u64 as *mut std::ffi::c_void,
@@ -2157,16 +2214,26 @@ fn gpu_search_batched(
                     p_vf as *const u64 as *mut std::ffi::c_void,
                     p_qf as *const u64 as *mut std::ffi::c_void,
                 ];
-                let smem = apgc_search_smem(itopk, index.degree, index.dim, rerank);
+                let smem = apgc_search_smem(itopk, index.degree, index.dim, rerank, beam as usize);
+                // Opt the kernel into dynamic shared memory above the 48 KB
+                // default; without this the launch fails and the batch path
+                // returns stale buffer contents instead of real neighbours.
+                apgc_optin_smem(apgc_func, smem);
                 let r = cuLaunchKernel(apgc_func, num_queries as u32, 1, 1, apgc_search_threads(), 1, 1, smem,
                     std::ptr::null_mut(), params.as_ptr() as *mut *mut std::ffi::c_void,
                     std::ptr::null_mut());
                 if r == 0 {
-                    cuCtxSynchronize();
+                    let sync = cuCtxSynchronize();
                     let mut indices = vec![-1i32; out_count];
                     let mut distances = vec![2.0f32; out_count];
-                    cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, index.d_idx_buf, out_count * 4);
-                    cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, index.d_odist_buf, out_count * 4);
+                    let c1 = cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, index.d_idx_buf, out_count * 4);
+                    let c2 = cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, index.d_odist_buf, out_count * 4);
+                    let nvalid = indices.iter().take(out_count).filter(|&&v| v >= 0).count();
+                    if nvalid < out_count {
+                        // Every slot should be a real neighbour; sentinels mean the
+                        // walk/convergence produced fewer than `fetch_k` nodes.
+                        eprintln!("[GPU] apgc search: only {}/{} valid hits for this batch", nvalid, out_count);
+                    }
                     return Some((indices, distances));
                 }
                 // launch failed → fall through to brute-force scan
@@ -2174,7 +2241,12 @@ fn gpu_search_batched(
         }
     }
 
-    // Try fused kernel first (single pass, no Q×N intermediate buffer)
+    // Try fused kernel first (single pass, no Q×N intermediate buffer).
+    // The kernel hard-caps at k ≤ 64 (`if (k > 64) return;` in all_kernels.cu),
+    // so for larger k a "successful" launch would publish stale buffer
+    // contents — return None instead so the caller falls back to CPU rather
+    // than to garbage.
+    if k <= 64 {
     if let Some(fused_func) = GPU_STATE.get()?.get_kernel("fused_cosine_topk") {
         unsafe {
             let q_bytes = num_queries * dim;
@@ -2211,8 +2283,11 @@ fn gpu_search_batched(
             }
         }
     }
+    }
 
-    // Fallback: two-kernel approach (batch_cosine_dist + topk_select)
+    // Fallback: two-kernel approach (batch_cosine_dist + topk_select).
+    // Same k ≤ 64 hard cap as the fused kernel; skip for larger k.
+    if k > 64 { return None; }
     let dist_func = GPU_STATE.get()?.get_kernel("batch_cosine_dist")?;
     let topk_func = GPU_STATE.get()?.get_kernel("topk_select")?;
     unsafe {

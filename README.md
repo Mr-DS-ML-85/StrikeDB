@@ -400,6 +400,19 @@ scenario, where the headline metric is QPS, not per-request p99.
 > search beam, and a single-threaded CPU baseline) and is retracted. Every row
 > below comes from `--gpu-bench` at a matched beam on the hardware named.
 
+**The batch path was broken for months and is now fixed.** `VSEARCH.MANY`
+(GPU batch, Turbo) silently returned **Recall@128 ≈ 0.39** — garbage IDs that
+changed run-to-run — while every unit test and the single-query CPU path looked
+fine. The root cause was a single bug in `apgc_search_kernel`'s f32
+candidate-scoring loop: it summed dimensions with `for (int d = tid; d < D;
+d += threads)` when each thread owns a whole candidate, so every score was a
+partial dot over ~1 of 384 dims and the bitonic sort ranked noise. The int8
+fallback path was correct, which is exactly why the int8 unit tests passed and
+the live f32-rerank batch path returned garbage. Fixed in §9 of `memory.md`;
+the wire path now measures **Recall@128 = 0.992** on 1000 random queries over
+RESP, with query-0 top-8 matching brute-force ground truth exactly. The residual
+gap to the CPU's 0.999 is candidate-set/beam tuning, not correctness.
+
 **Measured — 100k × 384-d real embeddings, RTX 4060 + Ryzen 7700 (16 threads):**
 
 All search columns at `ef`/`itopk` = 128, so every mode does equal work per query.
@@ -414,7 +427,9 @@ high). **Recall@128** is single-query; **batch** is the fused GPU query path.
 
 **Over RESP** (`VSEARCH`, `GPU.MODE turbo`, 100k×384-d, brute-force GT):
 **Recall@128 = 0.9993**, p50 3.5 ms; Recall@10 = 1.0000 @ 0.73 ms. The wire
-path matches the fused batch figure.
+path matches the fused batch figure. **`VSEARCH.MANY` (fused GPU batch path):
+Recall@128 = 0.992** over 1000 random queries (was 0.39 before the f32-scoring
+fix).
 
 **Build: ~1.4× now (was 2.98×).** 4.57 s against 6.38 s. Raising NN-descent
 `rev_cap` 16→48 and `ND_CAND_MAX` 1024→2048 (done to restore recall) doubled
