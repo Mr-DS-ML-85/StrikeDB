@@ -88,9 +88,34 @@ struct ConsensusStore {
 }
 
 fn main() -> std::io::Result<()> {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:6380".to_string());
+    let mut args: Vec<String> = std::env::args().collect();
+    let addr = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:6380".to_string());
+    let mut log_path: Option<String> = None;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--log" => {
+                i += 1;
+                log_path = Some(args.get(i).cloned().unwrap_or_else(|| "--log requires a path".to_string()));
+            }
+            other => {
+                eprintln!("unknown arg: {other} (usage: dbstrike <addr> [--log <path>])");
+                return Ok(());
+            }
+        }
+        i += 1;
+    }
     let data_path = std::env::var("DBSTRIKE_WAL").unwrap_or_else(|_| "dbstrike.wal".to_string());
     let requirepass = std::env::var("DBSTRIKE_PASS").ok();
+    let log_file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> = log_path.as_ref().map(|p| {
+        std::sync::Arc::new(std::sync::Mutex::new(
+            std::fs::OpenOptions::new().create(true).append(true).open(p).expect("cannot open log file"),
+        ))
+    });
+    if let Some(ref lf) = log_file {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let _ = writeln!(lf.lock().unwrap(), "[{ts}] DB-Strike starting on {addr}");
+    }
 
     let engine = Engine::open(&data_path)?;
     let reactive = Reactive::attach(&engine);
@@ -138,37 +163,40 @@ fn main() -> std::io::Result<()> {
     // (ulimit -n), which must be raised on the host for very high -c.
     let _ = listener.set_nonblocking(false);
     let auth_msg = if requirepass.is_some() { " (AUTH required)" } else { "" };
-    println!("DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}");
-    println!("One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug");
-    println!("Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE");
+    let startup = format!(
+        "DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}\n\
+         One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug\n\
+         Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
+    );
+    println!("{startup}");
+    if let Some(ref lf) = log_file {
+        let _ = writeln!(lf.lock().unwrap(), "{startup}");
+    }
 
     // Rate-limit accept-error logging: under EMFILE the accept loop would
     // otherwise spew thousands of identical lines per second. Print at most
     // once per second, keeping the last error for the periodic line.
     let mut last_accept_err: Option<String> = None;
     let mut last_log = std::time::Instant::now();
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let db = Arc::clone(&db);
-                std::thread::spawn(move || {
-                    if let Err(e) = handle(s, db) {
-                        // These are normal when a client hangs up: don't spam
-                        // the console. Real errors (parse failures on OTHER
-                        // still-connected sockets, disk errors, etc.) still
-                        // print.
-                        if !is_benign_disconnect(&e) {
-                            eprintln!("connection error: {e}");
-                        }
-                    }
-                });
-            }
+for stream in listener.incoming() {
+         match stream {
+             Ok(s) => {
+                 let db = Arc::clone(&db);
+                 let lf = log_file.clone();
+                 std::thread::spawn(move || {
+                     if let Err(e) = handle(s, db, &lf) {
+                         if !is_benign_disconnect(&e) {
+                             log_msg(&lf, &format!("connection error: {e}"));
+                         }
+                     }
+                 });
+             }
             Err(e) => {
                 let msg = e.to_string();
                 let now = std::time::Instant::now();
                 let repeat = last_accept_err.as_deref() == Some(msg.as_str());
                 if !repeat || now.duration_since(last_log) >= std::time::Duration::from_secs(1) {
-                    eprintln!("accept error: {msg} (raise ulimit -n for higher -c; sleeping 10ms to shed load)");
+                    log_msg(&log_file, &format!("accept error: {msg} (raise ulimit -n for higher -c; sleeping 10ms to shed load)"));
                     last_accept_err = Some(msg);
                     last_log = now;
                 }
@@ -181,7 +209,7 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
+fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>) -> std::io::Result<()> {
     // TCP_NODELAY: disable Nagle so per-batch flushes actually go on the wire
     // immediately (matters for latency-sensitive workloads like signaling).
     let _ = stream.set_nodelay(true);
@@ -405,6 +433,9 @@ fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
                 let elapsed_ms = t_start.elapsed().as_micros() as f64 / 1000.0;
                 // Redacts passwords — see `redact_cmd`.
                 eprintln!("[CMD] {:>6.1}ms {}", elapsed_ms, redact_cmd(&name, args));
+                if let Some(ref lf) = log_file {
+                    let _ = writeln!(lf.lock().unwrap(), "[CMD] {:>6.1}ms {}", elapsed_ms, redact_cmd(&name, args));
+                }
                 resp
             } else {
                 dispatch(&db, &name, args)
@@ -496,6 +527,14 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Write a line to stderr and, if a log file is configured, to it too.
+fn log_msg(log_file: &Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>, msg: &str) {
+    eprint!("{msg}");
+    if let Some(ref lf) = log_file {
+        let _ = writeln!(lf.lock().unwrap(), "{msg}");
+    }
 }
 
 /// Namespace a reducer target key into the Kv surface (`kv:<key>`). The KV

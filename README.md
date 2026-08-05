@@ -77,6 +77,9 @@ ulimit -n 100000
 # start the server on the RESP wire (talk to it with any Redis client)
 DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380
 
+# optional: write all stderr output to a log file
+DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380 --log dbstrike.log
+
 # optional: enable password auth (no auth by default)
 DBSTRIKE_PASS=mypassword DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380
 ```
