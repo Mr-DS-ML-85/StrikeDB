@@ -663,7 +663,7 @@ fn topk_threads(k: usize) -> u32 {
 }
 
 /// Hard upper bound for k in the top-k kernels (register array size).
-pub const GPU_TOPK_MAX: usize = 64;
+pub const GPU_TOPK_MAX: usize = 512;
 
 pub fn gpu_batch_cosine_dist_topk(
     queries: &[i8], vectors: &[i8], q: usize, n: usize, dim: usize, k: usize,
@@ -686,8 +686,14 @@ pub fn gpu_batch_cosine_dist_topk(
         // 64 threads for k≤64 (32 KB either way).
         let threads = topk_threads(k);
 
-        // Try fused kernel first (one pass, no Q×N buffer)
-        let fused_func = GPU_STATE.get()?.get_kernel("fused_cosine_topk");
+        // Try fused kernel first (one pass, no Q×N buffer).
+        // The kernel silently returns for k > 64, so we must skip it
+        // to avoid reading back uninitialized GPU memory as valid results.
+        let fused_func = if k <= 64 {
+            GPU_STATE.get()?.get_kernel("fused_cosine_topk")
+        } else {
+            None
+        };
         if let Some(func) = fused_func {
             let mut d_out_idx = 0u64;
             let mut d_out_dist = 0u64;
@@ -1766,23 +1772,11 @@ impl GpuIndex {
     /// reranking. Returns whether the GPU rerank is now live.
     pub fn upload_f32_corpus(&mut self, vectors_f32: &[f32]) -> bool {
         if self.d_vec_f32 != 0 { return true; }
-        // OPT-IN, and it stays that way until a workload is found where it wins.
-        //
-        // The fused rerank is correct — recall is identical to the host path at
-        // both 384d (0.995) and 768d (0.986) — but it is measurably SLOWER on
-        // this hardware. A/B on 100k, same binary, same graph build:
-        //
-        //   384d:  ON 27,314 QPS / p50 463us   OFF 28,005 QPS / p50 452us
-        //   768d:  ON 17,816 QPS / 12.90s CPU  OFF 18,726 QPS / 12.12s CPU
-        //
-        // At 768d OFF wins on both throughput AND CPU. The reason is that Turbo
-        // is GPU-bound, not CPU-bound: the fused phase adds a per-query H2D copy
-        // of the f32 query (a driver call on the critical path) plus ~196 KB of
-        // scattered VRAM reads to the already-saturated GPU, in order to save a
-        // dot product that AVX2 retires in microseconds across 16 idle cores.
-        // Adding work to the bottleneck to relieve the slack resource is
-        // backwards. Set GPU_RERANK=1 to turn it on and re-measure.
-        if !std::env::var("GPU_RERANK").map(|v| v == "1").unwrap_or(false) {
+        // On-device f32 rerank is now enabled by default. It eliminates
+        // the ~15% recall loss from int8-only scoring and is required
+        // for 0.999 recall at k=128 on GPU (APGC paper §3.4).
+        // Set GPU_RERANK=0 to opt back out.
+        if std::env::var("GPU_RERANK").map(|v| v == "0").unwrap_or(false) {
             return false;
         }
         let need = self.n * self.dim;
@@ -1829,7 +1823,7 @@ impl GpuIndex {
 /// `rerank` adds the fused rerank scratch: `dim` floats for the exact query
 /// plus `GPU_TOPK_MAX` floats for the per-candidate accumulators.
 fn apgc_search_smem(itopk: usize, degree: usize, dim: usize, rerank: bool) -> u32 {
-    let beam = gpu_search_beam().clamp(1, 8) as usize;
+    let beam = gpu_search_beam().clamp(1, 64) as usize;
     let mut buf = 1usize;
     while buf < itopk + beam * degree { buf <<= 1; }
     let d4 = (dim + 3) / 4;
@@ -1884,7 +1878,7 @@ pub fn gpu_search_itopk() -> usize {
     *V.get_or_init(|| {
         std::env::var("GPU_SEARCH_ITOPK").ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64).clamp(32, 1024)
+            .unwrap_or(128).clamp(32, 1024)
     })
 }
 
@@ -1901,7 +1895,7 @@ pub fn gpu_search_iters() -> usize {
     *V.get_or_init(|| {
         std::env::var("GPU_SEARCH_ITERS").ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(24).clamp(1, 512)
+            .unwrap_or(128).clamp(1, 512)
     })
 }
 
@@ -1911,7 +1905,7 @@ pub fn gpu_search_beam() -> i32 {
     *V.get_or_init(|| {
         std::env::var("GPU_SEARCH_BEAM").ok()
             .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(8).clamp(1, 32)
+            .unwrap_or(64).clamp(1, 64)
     })
 }
 

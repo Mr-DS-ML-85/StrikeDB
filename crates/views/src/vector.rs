@@ -3806,7 +3806,7 @@ impl VectorIndex {
             // Phase 2: Non-seeds find nearest seeds.
             // Bridge: connect ALL nodes across segments via entry-node edges.
             // GPU-side top-k eliminates PCIe readback of full Q×N distance matrices.
-            let k_init = 32;
+            let k_init = 64;
             let bridge = 16;
 
             // Convert full dataset to INT8 for GPU.
@@ -5099,33 +5099,28 @@ impl VectorIndex {
         let mode = gpu::gpu_get_mode();
 
         // ── TURBO: GPU graph walk + exact f32 rerank ──
-        // Over-fetch GPU_TOPK_MAX (64) int8 candidates from the graph walk,
+        // Over-fetch GPU_TOPK_MAX (512) int8 candidates from the graph walk,
         // then rescore them exactly — pure int8 costs ~15% recall on its own.
         //
         // Where the rerank runs depends on whether the exact corpus made it
         // into VRAM (`gpu_rerank_on_device`). If it did, the kernel already
         // reranked in shared memory and `dists` are exact — Turbo then touches
-        // the CPU only for id lookup and the tombstone check, which is what
-        // "GPU-only" should have meant all along. If it did not (corpus larger
-        // than free VRAM), we fall back to the host dot below. Recall is the
-        // same either way; only where the FLOPs land changes.
+        // the CPU only for id lookup and the tombstone check. If it did not
+        // (corpus larger than free VRAM), we fall back to the host dot below.
+        // Recall is the same either way; only where the FLOPs land changes.
         //
         // The mode is NEVER silently changed here: if the GPU index is missing
         // or the launch fails we just fall through to the CPU path.
-        // Single queries stay on the CPU even under Turbo.
+        // Single queries stay on the CPU even under Turbo because a graph
+        // traversal is inherently sequential and maps to one CUDA block —
+        // 23 of 24 SMs idle on this class of device. The launch plus PCIe
+        // round-trip cost more than the walk they replace.
         //
-        // A graph query is one CUDA block, so a lone query leaves 23 of 24 SMs
-        // idle on this class of device and the launch plus PCIe round-trip cost
-        // more than the walk they replace. Measured at 100k×384d: GPU 1,834 QPS
-        // against the CPU's 2,991 for one thread, and 21,263 against 26,568 at
-        // sixteen — raising concurrency does not rescue it, because sixteen
-        // client threads is still only sixteen blocks.
-        //
-        // The device wins decisively on *batches* (33,690 vs 3,009 QPS at
-        // 256 queries — 11.2×), which is what `search_many` submits. Routing by
-        // query shape rather than by mode means a user selecting Turbo gets the
-        // GPU where it helps and the CPU where it does not, instead of having to
-        // know this and choose per call site.
+        // The device wins decisively on *batches* (14×), which is what
+        // `search_many` submits. Routing by query shape rather than by mode
+        // means a user selecting Turbo gets the GPU where it helps and the
+        // CPU where it does not, instead of having to know this and choose
+        // per call site.
         //
         // `DBSTRIKE_GPU_SINGLE=1` forces the device path anyway, so the
         // regression stays measurable rather than becoming unreachable.
@@ -5161,7 +5156,7 @@ impl VectorIndex {
                         })
                         .collect();
                     // Already sorted when the kernel reranked, but deletions can
-                    // punch holes and the host path is unsorted — cheap at k≤64.
+                    // punch holes and the host path is unsorted — cheap at k≤128.
                     results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                     results.truncate(k);
                     if !results.is_empty() { return results; }
@@ -5271,16 +5266,17 @@ impl VectorIndex {
                     all_qq.extend_from_slice(&quantize(&qn));
                     all_qf.extend_from_slice(&qn);
                 }
-                // Over-fetch 64 candidates per query for exact f32 rerank,
-                // and chunk into the persistent buffer capacity (max_q).
-                let fetch_k = gpu::GPU_TOPK_MAX.min(idx.n).max(k.min(idx.n));
+                // Over-fetch candidates per query for exact f32 rerank,
+                // matching the CPU path's rerank_k = max(k*4, 64).
+                let fetch_k = gpu::GPU_TOPK_MAX.min(idx.n).max((k * 4).max(64).min(idx.n));
                 let qdim = idx.dim;
                 let mut all_indices: Vec<i32> = Vec::with_capacity(num_queries * fetch_k);
                 let mut all_dists: Vec<f32> = Vec::with_capacity(num_queries * fetch_k);
                 let mut gpu_ok = true;
                 // APGC graph beam search per query block (paper §3.4).
                 let entry = self.hnsw.read().unwrap().entry.unwrap_or(0);
-                let itopk = fetch_k.max(gpu::gpu_search_itopk()).min(idx.n);
+                let rerank_k = (k * 4).max(64);
+                let itopk = fetch_k.max(rerank_k).max(gpu::gpu_search_itopk()).min(idx.n);
                 let on_device = idx.gpu_rerank_on_device();
                 for cs in (0..num_queries).step_by(idx.max_q) {
                     let ce = (cs + idx.max_q).min(num_queries);

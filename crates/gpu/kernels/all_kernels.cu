@@ -136,9 +136,9 @@ void apgc_search_kernel(
     int threads = blockDim.x;
 
     // ── Shared layout ────────────────────────────────────────────────────
-    const int SR_HASH = 1024;
+    const int SR_HASH = 8192;
     const int SR_HMASK = SR_HASH - 1;
-    int BEAM = (beam_in > 0 && beam_in <= 8) ? beam_in : 8;
+    int BEAM = (beam_in > 0 && beam_in <= 64) ? beam_in : 64;
     int BUF = 1; while (BUF < itopk + BEAM * degree) BUF <<= 1;
     int D4 = (D + 3) >> 2;
 
@@ -171,17 +171,22 @@ void apgc_search_kernel(
 
     const char* qbytes = (const char*)qcache;
 
-    // Entry node distance (parallel dp4a reduction would be overkill for one
-    // vector; thread 0 is fine here since it happens once).
+    // Entry node distance in FP32 — the APGC paper specifies FP32 for
+    // entry nodes because error there propagates into every query.
+    // INT8 entry scoring misdirects the entire walk on difficult queries.
     if (tid == 0) {
-        int dot = 0;
-        if ((D & 3) == 0) {
-            const int* vv = (const int*)vectors + (size_t)entry_node * D4;
-            for (int d4 = 0; d4 < D4; d4++) dot = dp4a_i8(__ldg(&vv[d4]), qcache[d4], dot);
+        float dot = 0.0f;
+        if (query_f32 != nullptr) {
+            const float* qf = query_f32 + (size_t)qid * D;
+            const float* vv = (const float*)vectors + (size_t)entry_node * D;
+            for (int d = 0; d < D; d++) dot += qf[d] * vv[d];
         } else {
-            for (int d = 0; d < D; d++) dot += (int)qbytes[d] * (int)vectors[(size_t)entry_node * D + d];
+            const int* vv = (const int*)vectors + (size_t)entry_node * D4;
+            for (int d4 = 0; d4 < D4; d4++) dot += (float)dp4a_i8(__ldg(&vv[d4]), qcache[d4], 0);
         }
-        buf_dot[0] = dot; buf_idx[0] = entry_node; buf_exp[0] = 0;
+        buf_dot[0] = __float2int_rn(dot * 127.0f);
+        buf_idx[0] = entry_node;
+        buf_exp[0] = 0;
     }
     __syncthreads();
 
@@ -265,18 +270,28 @@ void apgc_search_kernel(
         __syncthreads();
         int nc = s_ctl[0]; if (nc > cand_cap) nc = cand_cap;
 
-        // ── Parallel dp4a scoring of the staged candidates ───────────────
+        // ── Parallel scoring of the staged candidates ──────────
+        // Use FP32 dot product when the exact corpus is available
+        // (f32 rerank is live). Otherwise fall back to INT8 dp4a.
         for (int c = itopk + tid; c < itopk + nc; c += threads) {
             int node = buf_idx[c];
-            int dot = 0;
-            if ((D & 3) == 0) {
-                const int* vv = (const int*)vectors + (size_t)node * D4;
-                #pragma unroll 8
-                for (int d4 = 0; d4 < D4; d4++) dot = dp4a_i8(__ldg(&vv[d4]), qcache[d4], dot);
+            if (vec_f32 != nullptr && query_f32 != nullptr) {
+                float dot = 0.0f;
+                const float* vv = vec_f32 + (size_t)node * D;
+                const float* qf = query_f32 + (size_t)qid * D;
+                for (int d = tid; d < D; d += threads) dot += qf[d] * vv[d];
+                buf_dot[c] = __float2int_rn(dot * 127.0f);
             } else {
-                for (int d = 0; d < D; d++) dot += (int)qbytes[d] * (int)vectors[(size_t)node * D + d];
+                int dot = 0;
+                if ((D & 3) == 0) {
+                    const int* vv = (const int*)vectors + (size_t)node * D4;
+                    #pragma unroll 8
+                    for (int d4 = 0; d4 < D4; d4++) dot = dp4a_i8(__ldg(&vv[d4]), qcache[d4], dot);
+                } else {
+                    for (int d = 0; d < D; d++) dot += (int)qbytes[d] * (int)vectors[(size_t)node * D + d];
+                }
+                buf_dot[c] = dot;
             }
-            buf_dot[c] = dot;
         }
         // Pad the unused tail so the sort keeps it below everything real.
         for (int c = itopk + nc + tid; c < BUF; c += threads) {

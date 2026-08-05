@@ -2740,7 +2740,7 @@ fn main() {
 /// minutes to observe and buried the one comparison that matters.
 ///
 /// Each mode is measured in a fresh process-level state and reported as build
-/// rate, Recall@10 against brute-force ground truth, and single-thread query
+/// rate, Recall@128 against brute-force ground truth, and single-thread query
 /// throughput, so the three are directly comparable on one dataset.
 fn s_gpu_bench(path: &str) {
     let (n, dim, _data, norm) = load_fbin(path);
@@ -2769,7 +2769,7 @@ fn s_gpu_bench(path: &str) {
             scored.push((i as u64, (1.0 - dot).max(0.0).min(2.0)));
         }
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        gt.push(scored.iter().take(10).map(|(id, _)| *id).collect());
+        gt.push(scored.iter().take(128).map(|(id, _)| *id).collect());
     }
     println!("  ground truth in {:.1}s", t_gt.elapsed().as_secs_f64());
 
@@ -2799,10 +2799,10 @@ fn s_gpu_bench(path: &str) {
         let mut hits = 0usize;
         for qi in 0..nq {
             let q = &norm[qi * dim..(qi + 1) * dim];
-            let res = idx.search_ef(q, 10, 128);
-            hits += res.iter().take(10).filter(|(id, _)| gt[qi].contains(id)).count();
+            let res = idx.search_ef(q, 128, 128);
+            hits += res.iter().take(128).filter(|(id, _)| gt[qi].contains(id)).count();
         }
-        let recall = hits as f32 / (nq * 10) as f32;
+        let recall = hits as f32 / (nq * 128) as f32;
 
         // Two throughput numbers, because they answer different questions and
         // conflating them is how benchmarks mislead.
@@ -2815,7 +2815,7 @@ fn s_gpu_bench(path: &str) {
         let t_q = Instant::now();
         for qi in 0..probes {
             let q = &norm[qi * dim..(qi + 1) * dim];
-            std::hint::black_box(idx.search_ef(q, 10, 128));
+            std::hint::black_box(idx.search_ef(q, 128, 128));
         }
         let qps1 = probes as f64 / t_q.elapsed().as_secs_f64().max(1e-9);
 
@@ -2831,7 +2831,7 @@ fn s_gpu_bench(path: &str) {
                     for _ in 0..rounds {
                         for qi in 0..probes {
                             let q = &norm_ref[qi * dim..(qi + 1) * dim];
-                            std::hint::black_box(idx_ref.search_ef(q, 10, 128));
+                            std::hint::black_box(idx_ref.search_ef(q, 128, 128));
                         }
                     }
                 });
@@ -2860,22 +2860,22 @@ fn s_gpu_bench(path: &str) {
         // neighbours would have shown up as a throughput win, which is the most
         // dangerous shape a bug can take here.
         let batch_hits: usize = idx
-            .search_many(&qs, 10)
+            .search_many(&qs, 128)
             .iter()
             .enumerate()
-            .map(|(qi, res)| res.iter().take(10).filter(|(id, _)| gt[qi].contains(id)).count())
+            .map(|(qi, res)| res.iter().take(128).filter(|(id, _)| gt[qi].contains(id)).count())
             .sum();
-        let recall_b = batch_hits as f32 / (batch * 10) as f32;
+        let recall_b = batch_hits as f32 / (batch * 128) as f32;
 
         let batch_rounds = 20usize;
         let t_b = Instant::now();
         for _ in 0..batch_rounds {
-            std::hint::black_box(idx.search_many(&qs, 10));
+            std::hint::black_box(idx.search_many(&qs, 128));
         }
         let qps_b = (batch_rounds * batch) as f64 / t_b.elapsed().as_secs_f64().max(1e-9);
 
         println!(
-            "  [{label}] build {build_dt:.2}s ({rate:.0} vec/s) · Recall@10 {recall:.3} · \
+            "  [{label}] build {build_dt:.2}s ({rate:.0} vec/s) · Recall@128 {recall:.3} · \
              {qps1:.0} 1t · {qps_c:.0} {cores}t · {qps_b:.0} batch{batch} \
              (batch recall {recall_b:.3})"
         );
@@ -2883,7 +2883,7 @@ fn s_gpu_bench(path: &str) {
     }
 
     println!("\n\x1b[1m  summary — {n} × {dim}d\x1b[0m");
-    println!("  | mode | build | vec/s | Recall@10 | QPS (1t) | QPS ({cores}t) | QPS (batch) |");
+    println!("  | mode | build | vec/s | Recall@128 | QPS (1t) | QPS ({cores}t) | QPS (batch) |");
     println!("  |---|---:|---:|---:|---:|---:|---:|");
     for (label, dt, rate, recall, qps1, qpsc, qpsb) in &rows {
         println!("  | {label} | {dt:.2}s | {rate:.0} | {recall:.3} | {qps1:.0} | {qpsc:.0} | {qpsb:.0} |");
@@ -3064,7 +3064,7 @@ fn s24_learned_ef(path: &str) {
                 scored.push((i, (1.0 - dot).max(0.0).min(2.0)));
             }
             scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            gt.push(scored.iter().take(10).map(|(id, _)| *id).collect());
+gt.push(scored.iter().take(128).map(|(id, _)| *id).collect());
         }
         gt
     };
