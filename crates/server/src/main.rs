@@ -1407,6 +1407,45 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             Resp::Simple("OK".into())
         }
 
+        // VFITQUANTNS <namespace> dim n id0 f0..f{dim-1} ...  -> OK
+        // Like VFITQUANT but fits TurboQuant / Product-Quantization
+        // parameters on a namespace-scoped index.
+        "VFITQUANTNS" => {
+            if args.len() < 4 {
+                return err("VFITQUANTNS requires namespace dim n id f1 f2 ...");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let dim: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("dim is not an integer"),
+            };
+            let n: usize = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("n is not an integer"),
+            };
+            if args.len() != 3 + n * (dim + 1) {
+                return err("VFITQUANTNS float count mismatch");
+            }
+            if db.router.vectors_ns(&namespace).len() > 0 {
+                return err("VFITQUANTNS requires an empty index (flush/restart first)");
+            }
+            let mut sample: Vec<Vec<f32>> = Vec::with_capacity(n);
+            let mut ok = true;
+            for t in 0..n {
+                let base = 3 + t * (dim + 1);
+                let v = match parse_floats(&args[base + 1..base + 1 + dim]) {
+                    Some(v) => v,
+                    None => { ok = false; break; }
+                };
+                sample.push(v);
+            }
+            if !ok {
+                return err("bad float in VFITQUANTNS sample");
+            }
+            db.router.vectors_ns(&namespace).fit_quant(&sample);
+            Resp::Simple("OK".into())
+        }
+
         // VCALIBRATE dim nq k q_f0..q_f{dim-1}(×nq) tgt0_0..tgt0_{k-1}(×nq)
         //   → calibrate the MODULE 3 learned beam-width model from inlined
         //     calibration queries + their ground-truth top-k ids, store it in
