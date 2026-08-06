@@ -166,7 +166,7 @@ fn main() -> std::io::Result<()> {
     let startup = format!(
         "DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}\n\
          One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug\n\
-         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
+         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · VBULKLOAD/VBULKLOADNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
     );
     println!("{startup}");
     if let Some(ref lf) = log_file {
@@ -1152,6 +1152,26 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             match vi.bulk_load_fbin(path, num_cores()) {
                 Ok((n, dim)) => Resp::Simple(format!("loaded {n} vectors x {dim}d")),
                 Err(e) => err(&format!("VBULKLOAD failed: {e}")),
+            }
+        }
+
+        // VBULKLOADNS <namespace> <path-to-.fbin>  -> OK
+        // Like VBULKLOAD but loads into a namespace-scoped index.
+        // The .fbin file must contain vectors of the same dim as the
+        // namespace index (or the namespace must be empty).
+        "VBULKLOADNS" => {
+            if args.len() != 2 {
+                return err("VBULKLOADNS requires namespace path-to-.fbin");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let path = match std::str::from_utf8(&args[1]) {
+                Ok(p) => p,
+                Err(_) => return err("VBULKLOADNS path is not valid UTF-8"),
+            };
+            let vi = db.router.vectors_ns(&namespace);
+            match vi.bulk_load_fbin(path, num_cores()) {
+                Ok((n, dim)) => Resp::Simple(format!("loaded {n} vectors x {dim}d into {namespace}")),
+                Err(e) => err(&format!("VBULKLOADNS failed: {e}")),
             }
         }
 
