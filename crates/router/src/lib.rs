@@ -9,7 +9,9 @@
 
 pub mod tiered;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use storage::Engine;
 use views::{Tables, VectorIndex};
 
@@ -26,7 +28,8 @@ pub enum AnnPlan {
 pub struct Router {
     engine: Arc<Engine>,
     tables: Tables,
-    vectors: VectorIndex,
+    vectors_default: Arc<VectorIndex>,
+    vectors_ns: RwLock<HashMap<String, Arc<VectorIndex>>>,
 }
 
 /// A planned RAG hit: the row id, its cosine distance, and the joined row.
@@ -40,15 +43,24 @@ pub struct RagHit {
 impl Router {
     pub fn new(engine: Arc<Engine>) -> Self {
         let tables = Tables::new(Arc::clone(&engine));
-        let vectors = VectorIndex::open(Arc::clone(&engine));
-        Self { engine, tables, vectors }
+        let vectors_default = Arc::new(VectorIndex::open(Arc::clone(&engine)));
+        Self { engine, tables, vectors_default, vectors_ns: RwLock::new(HashMap::new()) }
     }
 
     pub fn tables(&self) -> &Tables {
         &self.tables
     }
-    pub fn vectors(&self) -> &VectorIndex {
-        &self.vectors
+    pub fn vectors(&self) -> Arc<VectorIndex> {
+        Arc::clone(&self.vectors_default)
+    }
+    /// Return (or create) the VectorIndex for a specific namespace.
+    /// Each namespace gets its own HNSW graph and dim, so different
+    /// namespaces can hold vectors of different dimensionalities.
+    pub fn vectors_ns(&self, name: &str) -> Arc<VectorIndex> {
+        let mut ns = self.vectors_ns.write().unwrap();
+        ns.entry(name.to_string())
+            .or_insert_with(|| Arc::new(VectorIndex::open_ns(Arc::clone(&self.engine), name.to_string())))
+            .clone()
     }
 
     /// Cost model: choose a plan from estimated selectivity (fraction passing filter).
@@ -86,7 +98,7 @@ impl Router {
                     .into_iter()
                     .filter_map(|(pk, row)| {
                         let id: u64 = pk.parse().ok()?;
-                        let v = self.vectors.get_vector(id)?;
+                        let v = self.vectors().get_vector(id)?;
                         let d = cosine_dist(query, &v);
                         Some(RagHit { id, distance: d, row })
                     })
@@ -101,7 +113,7 @@ impl Router {
                     .iter()
                     .filter_map(|(pk, _)| pk.parse::<u64>().ok())
                     .collect();
-                self.vectors
+                self.vectors()
                     .search_filtered(query, k, |id| allowed.contains(&id))
                     .into_iter()
                     .filter_map(|(id, d)| {

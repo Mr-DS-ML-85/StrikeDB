@@ -1050,10 +1050,10 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
         // VADDNS <namespace> <id> f1 f2 ...  -> OK
-        // Like VADD but tags the vector with a namespace string so
-        // VSEARCHNS can restrict results to that namespace. Enables
-        // separate ANN indexes (e.g. 512-dim faces vs 384-dim general)
-        // in a single StrikeDB process without dimension conflicts.
+        // Like VADD but stores the vector in a namespace-scoped index.
+        // Each namespace gets its own HNSW graph and dim, so different
+        // namespaces can hold vectors of different dimensionalities
+        // (e.g. 512-dim faces vs 64-dim pHash) in a single StrikeDB process.
         "VADDNS" => {
             if args.len() < 3 {
                 return err("VADDNS requires namespace id f1 f2 ...");
@@ -1067,14 +1067,13 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in vector"),
             };
-            let vi = db.router.vectors();
+            let vi = db.router.vectors_ns(&namespace);
             let qd = vi.quant_dim();
             if qd != 0 && vec.len() != qd {
                 return err(&format!("VADDNS dim {} != turbo index dim {}", vec.len(), qd));
             }
             let (attr, sparse) = derive_attr_and_sparse(&vec, 8, 8);
-            let vi = db.router.vectors();
-            vi.insert_graph_only_attr_ns(id, vec.clone(), attr, namespace);
+            vi.insert_graph_only_attr(id, vec.clone(), attr);
             if let Err(e) = vi.insert(id, vec.clone()) {
                 return err(&e.to_string());
             }
@@ -1418,10 +1417,10 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
         // VSEARCHNS <namespace> k f1 f2 ...  -> array of (id, dist)
-        // Like VSEARCH but restricts results to vectors stored under
-        // the given namespace (via VADDNS). Enables separate ANN
-        // indexes — e.g. a 512-dim face namespace and a 384-dim
-        // general namespace — in a single StrikeDB process.
+        // Like VSEARCH but searches only the vectors stored in the
+        // given namespace. Each namespace has its own HNSW graph and
+        // dim, so different namespaces can hold vectors of different
+        // dimensionalities (e.g. 512-dim face namespace vs 64-dim pHash).
         "VSEARCHNS" => {
             if args.len() < 3 {
                 return err("VSEARCHNS requires namespace k f1 f2 ...");
@@ -1435,16 +1434,12 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
-            let vi = db.router.vectors();
+            let vi = db.router.vectors_ns(&namespace);
             let hits = vi.search_unified(&q, k, 128, None, None, None, 50);
             let mut out = Vec::new();
             for (id, dist) in hits {
-                if let Some(ns) = vi.namespace_for_id(id) {
-                    if ns == namespace {
-                        out.push(Resp::Int(id as i64));
-                        out.push(Resp::Bulk(format!("{dist:.6}").into_bytes()));
-                    }
-                }
+                out.push(Resp::Int(id as i64));
+                out.push(Resp::Bulk(format!("{dist:.6}").into_bytes()));
             }
             Resp::Array(out)
         }

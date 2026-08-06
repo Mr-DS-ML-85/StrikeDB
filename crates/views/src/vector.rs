@@ -455,12 +455,6 @@ macro_rules! mitm_log {
     };
 }
 
-fn vec_key(id: u64) -> Vec<u8> {
-    let mut b = b"vec:".to_vec();
-    b.extend_from_slice(&id.to_be_bytes());
-    b
-}
-
 thread_local! {
     static DEBUG_DOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -3940,7 +3934,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert(i as u64, v);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
+            return Self { engine: Engine::open_for_build(), prefix: String::new(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -4272,6 +4266,7 @@ impl VectorIndex {
             let _ = k_init;
             return Self {
                 engine: Engine::open_for_build(),
+                prefix: String::new(),
                 hnsw: RwLock::new(merged),
                 sparse: RwLock::new(SparseIndex::new()),
                 gpu_idx: RwLock::new(None),
@@ -4310,7 +4305,7 @@ impl VectorIndex {
             merged.f32_tier = Some(t);
             merged.all_f32 = Vec::new();
         }
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
+        Self { engine: Engine::open_for_build(), prefix: String::new(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// MODULE 4 constructor: build the graph in parallel like
@@ -4359,7 +4354,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert_attr(i as u64, v, attrs[i]);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
+            return Self { engine: Engine::open_for_build(), prefix: String::new(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -4391,7 +4386,7 @@ impl VectorIndex {
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let merged = Hnsw::merge_segments(segments, bridge, None);
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
+        Self { engine: Engine::open_for_build(), prefix: String::new(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// Like `build_parallel_attr`, but maps each row to an ARBITRARY client
@@ -4557,7 +4552,7 @@ impl VectorIndex {
                 let v: Vec<f32> = data[i * dim..(i + 1) * dim].to_vec();
                 h.insert_attr(ids[i], v, attrs[i]);
             }
-            return Self { engine: Engine::open_for_build(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
+            return Self { engine: Engine::open_for_build(), prefix: String::new(), hnsw: RwLock::new(h), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
         }
 
         let dim = dim;
@@ -4605,7 +4600,7 @@ impl VectorIndex {
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let merged = Hnsw::merge_segments(segments, bridge, None);
-        Self { engine: Engine::open_for_build(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
+        Self { engine: Engine::open_for_build(), prefix: String::new(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
     /// MODULE 5 constructor: build the dense HNSW in parallel (like
@@ -4777,6 +4772,7 @@ impl Ord for OrdCand {
 
 pub struct VectorIndex {
     engine: Arc<Engine>,
+    prefix: String,
     hnsw: RwLock<Hnsw>,
     /// MODULE 5: sparse / lexical index over the SAME doc ids as `hnsw`. None
     /// for pure-dense indexes. Hybrid queries fuse the two in-engine.
@@ -4786,6 +4782,16 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
+    fn vec_key(&self, id: u64) -> Vec<u8> {
+        let mut b = b"vec:".to_vec();
+        if !self.prefix.is_empty() {
+            b.extend_from_slice(self.prefix.as_bytes());
+            b.push(b':');
+        }
+        b.extend_from_slice(&id.to_be_bytes());
+        b
+    }
+
     /// Upload vectors + flat CSR graph to GPU for APGC-style GPU search.
     /// Uses VUGVA-style unified memory: GPU reads from RAM directly.
     /// No cuMemcpyHtoD — CUDA page migrator handles data transfer.
@@ -4892,23 +4898,46 @@ impl VectorIndex {
         }
     }
 
-    /// Open the index and rebuild the graph from any persisted raw f32 vectors.
-    /// Quantization is done here so the substrate stays f32-exact.
-    pub fn open(engine: Arc<Engine>) -> Self {
-        let mut hnsw = Hnsw::new();
-        for (key, val) in engine.scan_prefix(b"vec:", engine.snapshot()) {
-            if let Value::Vector(v) = val {
-                let id = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
-                hnsw.insert(id, v);
+/// Open the default (empty-prefix) index and rebuild the graph from
+/// any persisted raw f32 vectors. Quantization is done here so the
+/// substrate stays f32-exact. Only keys of the form `vec:<8-byte-id>`
+/// are loaded; namespaced keys (`vec:<ns>:<8-byte-id>`) are skipped.
+pub fn open(engine: Arc<Engine>) -> Self {
+    Self::open_ns(engine, String::new())
+}
+
+/// Open a namespace-scoped index. Only keys with the exact prefix
+/// `vec:<prefix>:` are loaded, so a "faces" namespace won't collide
+/// with a "phash" namespace or the default index.
+pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
+    let mut hnsw = Hnsw::new();
+    let search_prefix: Vec<u8> = if prefix.is_empty() {
+        b"vec:".to_vec()
+    } else {
+        let mut p = b"vec:".to_vec();
+        p.extend_from_slice(prefix.as_bytes());
+        p.push(b':');
+        p
+    };
+    for (key, val) in engine.scan_prefix(&search_prefix, engine.snapshot()) {
+        if let Value::Vector(v) = val {
+            // Default index: key must be exactly "vec:" + 8 bytes.
+            // Namespaced index: key must be "vec:<prefix>:" + 8 bytes.
+            let expected_len = if prefix.is_empty() { 12 } else { search_prefix.len() + 8 };
+            if key.len() != expected_len {
+                continue;
             }
+            let id = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+            hnsw.insert(id, v);
         }
-        Self { engine, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
+    Self { engine, prefix, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
+}
 
     /// Insert/replace a vector: durable f32 write + graph update with a
     /// quantized (int8) copy in-memory.
     pub fn insert(&self, id: u64, vector: Vec<f32>) -> std::io::Result<()> {
-        self.engine.put(vec_key(id), Value::Vector(vector.clone()))?;
+        self.engine.put(self.vec_key(id), Value::Vector(vector.clone()))?;
         self.hnsw.write().unwrap().insert(id, vector);
         Ok(())
     }
@@ -4952,14 +4981,6 @@ impl VectorIndex {
     /// route by selectivity. Same durability caveat as `insert_graph_only`.
     pub fn insert_graph_only_attr(&self, id: u64, vector: Vec<f32>, attr: u32) {
         self.hnsw.write().unwrap().insert_attr(id, vector, attr);
-    }
-
-    /// Like `insert_graph_only_attr` but also tags the node with a
-    /// namespace string. VSEARCHNS filters by this namespace so a
-    /// 512-dim face index and a 384-dim general index can coexist
-    /// in the same graph without colliding.
-    pub fn insert_graph_only_attr_ns(&self, id: u64, vector: Vec<f32>, attr: u32, namespace: String) {
-        self.hnsw.write().unwrap().insert_attr_ns(id, vector, attr, namespace);
     }
 
     /// PARALLEL INGEST — the multi-core build path. Builds `vectors` (row-major
@@ -5008,7 +5029,7 @@ impl VectorIndex {
         // this saves seconds of fsync overhead.
         let mut kvs: Vec<(Vec<u8>, Value)> = Vec::with_capacity(n);
         for i in 0..n {
-            kvs.push((vec_key(ids[i]), Value::Vector(vectors[i * dim..(i + 1) * dim].to_vec())));
+            kvs.push((self.vec_key(ids[i]), Value::Vector(vectors[i * dim..(i + 1) * dim].to_vec())));
         }
         self.engine.put_batch(kvs)?;
         // Shard the batch into as-even ranges and build each in its own thread.
@@ -5224,7 +5245,7 @@ impl VectorIndex {
         // Durable substrate writes — batch into one put_batch for a single WAL flush.
         let mut kvs: Vec<(Vec<u8>, Value)> = Vec::with_capacity(n);
         for i in 0..n {
-            kvs.push((vec_key(ids[i]), Value::Vector(vectors[i * dim..(i + 1) * dim].to_vec())));
+            kvs.push((self.vec_key(ids[i]), Value::Vector(vectors[i * dim..(i + 1) * dim].to_vec())));
         }
         self.engine.put_batch(kvs)?;
         // Flat export, then append the batch in place.
@@ -5261,16 +5282,9 @@ impl VectorIndex {
         self.sparse.write().unwrap().add(id, terms);
     }
 
-    /// Access the Hnsw read lock. Used by VSEARCHNS to filter results
-    /// by namespace without exposing the internal lock to the caller.
+    /// Access the Hnsw read lock.
     pub fn hnsw_read(&self) -> std::sync::RwLockReadGuard<'_, Hnsw> {
         self.hnsw.read().unwrap()
-    }
-
-    /// Return the namespace string for a given vector id, if present.
-    pub fn namespace_for_id(&self, id: u64) -> Option<String> {
-        let g = self.hnsw.read().unwrap();
-        g.id_to_idx.get(&id).map(|&idx| g.nodes[idx].namespace.clone())
     }
 
     /// MODULE 6 — the UNIFIED query entry point. One method, every access path,
@@ -5612,7 +5626,7 @@ impl VectorIndex {
     }
 
     pub fn get_vector(&self, id: u64) -> Option<Vec<f32>> {
-        match self.engine.get(&vec_key(id)) {
+        match self.engine.get(&self.vec_key(id)) {
             Some(Value::Vector(v)) => Some(v),
             _ => None,
         }
@@ -5761,7 +5775,7 @@ impl VectorIndex {
     /// (search filters these in every path), remove it from the id→idx map, and
     /// purge its sparse/BM25 postings. Returns whether the id was present.
     pub fn forget(&self, id: u64) -> bool {
-        let _ = self.engine.delete(vec_key(id));
+        let _ = self.engine.delete(self.vec_key(id));
         let mut g = self.hnsw.write().unwrap();
         if let Some(&idx) = g.id_to_idx.get(&id) {
             g.nodes[idx].deleted = true;
