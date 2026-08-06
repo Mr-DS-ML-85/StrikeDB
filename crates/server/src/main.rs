@@ -1049,6 +1049,39 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             Resp::Simple("OK".into())
         }
 
+        // VADDNS <namespace> <id> f1 f2 ...  -> OK
+        // Like VADD but tags the vector with a namespace string so
+        // VSEARCHNS can restrict results to that namespace. Enables
+        // separate ANN indexes (e.g. 512-dim faces vs 384-dim general)
+        // in a single StrikeDB process without dimension conflicts.
+        "VADDNS" => {
+            if args.len() < 3 {
+                return err("VADDNS requires namespace id f1 f2 ...");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let id: u64 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("id is not a u64"),
+            };
+            let vec = match parse_floats(&args[2..]) {
+                Some(v) => v,
+                None => return err("bad float in vector"),
+            };
+            let vi = db.router.vectors();
+            let qd = vi.quant_dim();
+            if qd != 0 && vec.len() != qd {
+                return err(&format!("VADDNS dim {} != turbo index dim {}", vec.len(), qd));
+            }
+            let (attr, sparse) = derive_attr_and_sparse(&vec, 8, 8);
+            let vi = db.router.vectors();
+            vi.insert_graph_only_attr_ns(id, vec.clone(), attr, namespace);
+            if let Err(e) = vi.insert(id, vec.clone()) {
+                return err(&e.to_string());
+            }
+            vi.add_sparse(id, sparse);
+            Resp::Simple("OK".into())
+        }
+
         // VDEL id [id ...]  -> :<count>
         // Tombstone vectors by id: drops each durable KV, marks the HNSW node
         // deleted (every search path filters these), and purges each id's
@@ -1380,6 +1413,38 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             for (id, dist) in hits {
                 out.push(Resp::Int(id as i64));
                 out.push(Resp::Bulk(format!("{dist:.6}").into_bytes()));
+            }
+            Resp::Array(out)
+        }
+
+        // VSEARCHNS <namespace> k f1 f2 ...  -> array of (id, dist)
+        // Like VSEARCH but restricts results to vectors stored under
+        // the given namespace (via VADDNS). Enables separate ANN
+        // indexes — e.g. a 512-dim face namespace and a 384-dim
+        // general namespace — in a single StrikeDB process.
+        "VSEARCHNS" => {
+            if args.len() < 3 {
+                return err("VSEARCHNS requires namespace k f1 f2 ...");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("k is not an integer"),
+            };
+            let q = match parse_floats(&args[2..]) {
+                Some(v) => v,
+                None => return err("bad float in query vector"),
+            };
+            let vi = db.router.vectors();
+            let hits = vi.search_unified(&q, k, 128, None, None, None, 50);
+            let mut out = Vec::new();
+            for (id, dist) in hits {
+                if let Some(ns) = vi.namespace_for_id(id) {
+                    if ns == namespace {
+                        out.push(Resp::Int(id as i64));
+                        out.push(Resp::Bulk(format!("{dist:.6}").into_bytes()));
+                    }
+                }
             }
             Resp::Array(out)
         }

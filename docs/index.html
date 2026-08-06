@@ -612,7 +612,9 @@ DBSTRIKE_WAL=./dbstrike.wal ./target/release/dbstrike 127.0.0.1:6380</code></pre
       <pre><code>redis-cli -p 6380 PING            # -> PONG
 redis-cli -p 6380 SET user:1 ada
 redis-cli -p 6380 VADD 1 1.0 0.0 0.0
+redis-cli -p 6380 VADDNS face 2 1.0 0.0 0.0
 redis-cli -p 6380 VSEARCH 5 1.0 0.0 0.0          # dense k-NN (ef=128)
+redis-cli -p 6380 VSEARCHNS face 5 1.0 0.0 0.0   # namespace-scoped search
 redis-cli -p 6380 VDEL 1                          # :1 — remove a vector (correct wrong agent memory)
 redis-cli -p 6380 VSEARCH 5 F 3 1.0 0.0 0.0      # Module 4 filtered by category
 redis-cli -p 6380 VSEARCH 5 H 0 1.0 1.0 0.0 0.0  # Module 5 hybrid dense+sparse
@@ -665,6 +667,7 @@ python3 tests/test_dbstrike.py</code></pre>
       <div class="table-wrap"><table>
         <tr><th>Command</th><th>Args</th><th>Returns</th></tr>
         <tr><td><code>VADD</code></td><td>id f1 f2...</td><td>OK (writes dense + derived attr + sparse terms)</td></tr>
+        <tr><td><code>VADDNS</code></td><td>&lt;namespace&gt; id f1 f2...</td><td>OK (like VADD but tags the node with a namespace so VSEARCHNS can filter to it)</td></tr>
         <tr><td><code>VDEL</code></td><td>id [id...]</td><td>:n (tombstone vector ids — purged from every search path + sparse/BM25; re-add with <code>VADD</code> to correct a wrong agent-owned vector)</td></tr>
         <tr><td><code>VADDBATCH</code></td><td>[PAR] dim id f... [id f...]...</td><td>:n (default: parallel shards + serial bridge-merge; <code>PAR</code>: full-graph parallel rebuild, genuinely cores×)</td></tr>
         <tr><td><code>VSETQUANT</code></td><td>mode</td><td>OK (INT8/BINARY/BINARY2/BINARY15/TURBO1/15/2/4/PRODUCT; empty index only)</td></tr>
@@ -1174,7 +1177,7 @@ kill -9 $SVR; wait 2>/dev/null; true</code></pre>
 const DOCS = [
   {t:"Introduction — why StrikeDB exists", g:"intro", b:"unified storage substrate, zero external crates, pure rust, single license apache"},
   {t:"Quick Start — build and serve", g:"install", b:"cargo build, dbstrike binary, DBSTRIKE_WAL, DBSTRIKE_PASS, DBSTRIKE_SYNC, redis-cli, redis-benchmark, bench --tcp --ycsb --chaos, test_dbstrike.py"},
-  {t:"RESP Wire — 40+ Redis commands", g:"wire", b:"RESP PING SET GET DEL MSET MGET INCR KEYS DBSIZE VADD VSEARCH VSEARCHA VSEARCH.MANY VCALIBRATE TSADD TSRANGE TSRANGE.LATEST REDUCE CHECKPOINT SUBSCRIBE PUBLISH MEM RAG CACHE AUTH ACL"},
+  {t:"RESP Wire — 40+ Redis commands", g:"wire", b:"RESP PING SET GET DEL MSET MGET INCR KEYS DBSIZE VADD VADDNS VSEARCH VSEARCHNS VSEARCHA VSEARCH.MANY VCALIBRATE TSADD TSRANGE TSRANGE.LATEST REDUCE CHECKPOINT SUBSCRIBE PUBLISH MEM RAG CACHE AUTH ACL"},
   {t:"Unified Substrate — MVCC + WAL", g:"substrate", b:"MVCC, write ahead log, snapshot isolation, optimistic concurrency, 32 shards, hash-tag routing, group commit"},
   {t:"Views — KV, Table, Vector, Time-series", g:"views", b:"key value, relational, HNSW, INT8 quantization, f32 rerank, AVX2 SIMD, filtered ANN, TSRANGE.LATEST, hash-tag, TSADD.F"},
   {t:"Speed of Light — fix SpacetimeDB stall", g:"speed", b:"in-database logic, reducer stall, bulkhead, fuel metering, circuit breaker"},

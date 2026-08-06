@@ -1773,6 +1773,9 @@ struct Node {
     /// MODULE 4: per-node filter attribute (e.g. category id). Lets a single
     /// HNSW serve filtered queries without a second index.
     attr: u32,
+    /// ANN namespace. VADDNS/VSEARCHNS partition the graph so a 512-dim face
+    /// index and a 384-dim general index can coexist without colliding.
+    namespace: String,
 }
 
 // SAFETY: `Hnsw` owns no interior-mutable state. Search methods take `&self`
@@ -2070,6 +2073,7 @@ impl Hnsw {
             neighbors: vec![Vec::new(); level + 1],
             deleted: false,
             attr,
+            namespace: String::new(),
         });
         self.id_to_idx.insert(id, idx);
         // MODULE 4: maintain per-kind count + a representative entry node.
@@ -2200,6 +2204,132 @@ impl Hnsw {
                     self.max_level,
                     self.avg_neighbors_l0(),
                 );
+            }
+        }
+    }
+
+    /// Same as `insert_attr` but tags the node with `namespace` so
+    /// `VSEARCHNS` can filter results to a specific ANN namespace
+    /// (e.g. "faces" for 512-dim face embeddings vs a general 384-dim index).
+    fn insert_attr_ns(&mut self, id: u64, mut vector: Vec<f32>, attr: u32, namespace: String) {
+        // Update-in-place path: namespace is immutable once set.
+        if let Some(&idx) = self.id_to_idx.get(&id) {
+            self.nodes[idx].attr = attr;
+            // ... same vector update as insert_attr
+            l2_normalize(&mut vector);
+            quantize_into(&vector, &mut self.qbuf);
+            let o = idx * self.dim;
+            self.all_i8[o..o + self.dim].copy_from_slice(&self.qbuf);
+            if self.quant != QuantMode::Int8 {
+                let bytes = pack_current(self.quant, self.turbo.as_deref(), self.pq.as_deref(), &vector, &self.qbuf, &mut self.bin_scratch, &mut self.turbo_rot, &mut self.turbo_idx, &mut self.turbo_deq, &mut self.turbo_r, &mut self.turbo_qjl);
+                if bytes > 0 {
+                    let bo = idx * bytes;
+                    if self.all_bin.len() < bo + bytes {
+                        self.all_bin.resize(bo + bytes, 0);
+                    }
+                    self.all_bin[bo..bo + bytes].copy_from_slice(&self.bin_scratch);
+                }
+                if !self.all_norm.is_empty() {
+                    self.all_norm[idx] = vector_l2(&vector);
+                }
+            }
+            if let Some(t) = self.f32_tier.as_mut() {
+                t.as_mut_slice()[o..o + self.dim].copy_from_slice(&vector);
+            } else {
+                self.all_f32[o..o + self.dim].copy_from_slice(&vector);
+            }
+            return;
+        }
+        // First insert fixes the dim.
+        if self.dim == 0 {
+            self.dim = vector.len();
+        } else if vector.len() != self.dim {
+            return;
+        }
+        l2_normalize(&mut vector);
+        self.qbuf.clear();
+        self.qbuf.reserve(vector.len());
+        quantize_into(&vector, &mut self.qbuf);
+
+        let level = self.random_level();
+        let idx = self.nodes.len();
+        self.nodes.push(Node {
+            id,
+            neighbors: vec![Vec::new(); level + 1],
+            deleted: false,
+            attr,
+            namespace,
+        });
+        self.id_to_idx.insert(id, idx);
+        if (self.attr_kinds as u32) <= attr {
+            let new_kinds = (attr as usize) + 1;
+            self.attr_counts.resize(new_kinds, 0);
+            self.attr_entry.resize(new_kinds, None);
+            self.attr_kinds = new_kinds;
+        }
+        self.attr_counts[attr as usize] += 1;
+        if self.attr_entry[attr as usize].is_none() {
+            self.attr_entry[attr as usize] = Some(idx);
+        }
+        let q = &self.qbuf;
+        self.all_i8.extend_from_slice(q);
+        if self.quant != QuantMode::Int8 {
+            let bytes = pack_current(self.quant, self.turbo.as_deref(), self.pq.as_deref(), &vector, &self.qbuf, &mut self.bin_scratch, &mut self.turbo_rot, &mut self.turbo_idx, &mut self.turbo_deq, &mut self.turbo_r, &mut self.turbo_qjl);
+            if bytes > 0 {
+                self.all_bin.extend_from_slice(&self.bin_scratch);
+            }
+            if self.quant == QuantMode::Product {
+                self.all_norm.push(vector_l2(&vector));
+            }
+        }
+        if let Some(t) = self.f32_tier.as_mut() {
+            let o = idx * self.dim;
+            if o + self.dim <= t.as_slice().len() {
+                t.as_mut_slice()[o..o + self.dim].copy_from_slice(&vector);
+            }
+        } else {
+            self.all_f32.extend_from_slice(&vector);
+        }
+
+        let entry = match self.entry {
+            None => {
+                self.entry = Some(idx);
+                self.max_level = level;
+                return;
+            }
+            Some(e) => e,
+        };
+
+        let need = self.nodes.len();
+        let epoch = unsafe { self.ensure_visited(need) };
+        let visited_ptr = self.visited_ptr();
+
+        let mut cur = entry;
+        let top = self.max_level;
+        for lvl in (level + 1..=top).rev() {
+            let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
+            if let Some(best) = found
+                .into_iter()
+                .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap())
+            {
+                cur = best.idx;
+            }
+        }
+        let start_lvl = level.min(top);
+        for lvl in (0..=start_lvl).rev() {
+            let mut found =
+                Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, self.ef_construction, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
+            found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+            let selected: Vec<usize> = self.select_neighbors_heuristic(idx, &found, self.m, lvl);
+            for &nb in &selected {
+                self.nodes[idx].neighbors[lvl].push(nb);
+                self.nodes[nb].neighbors[lvl].push(idx);
+                if self.nodes[idx].neighbors[lvl].len() > self.m {
+                    self.nodes[idx].neighbors[lvl] = selected.clone();
+                }
+                if mitm().noprune {
+                    continue;
+                }
             }
         }
     }
@@ -3287,7 +3417,7 @@ impl Hnsw {
                     let rmap: Vec<usize> = lvl.iter().map(|&x| offsets[si] + x).collect();
                     neigh.push(rmap);
                 }
-                merged.nodes.push(Node { id: node.id, neighbors: neigh, deleted: node.deleted, attr: node.attr });
+                merged.nodes.push(Node { id: node.id, neighbors: neigh, deleted: node.deleted, attr: node.attr, namespace: node.namespace.clone() });
                 let o = li * dim;
                 merged.all_i8.extend_from_slice(&seg.all_i8[o..o + dim]);
                 let go = gidx * dim;
@@ -3470,7 +3600,7 @@ impl Hnsw {
                     let rmap: Vec<usize> = lvl.iter().map(|&x| offset + x).collect();
                     neigh.push(rmap);
                 }
-                self.nodes.push(Node { id: node.id, neighbors: neigh, deleted: node.deleted, attr: node.attr });
+                self.nodes.push(Node { id: node.id, neighbors: neigh, deleted: node.deleted, attr: node.attr, namespace: node.namespace.clone() });
                 let o = li * dim;
                 self.all_i8.extend_from_slice(&seg.all_i8[o..o + dim]);
                 if let Some(t) = self.f32_tier.as_mut() {
@@ -3981,6 +4111,7 @@ impl VectorIndex {
                     id: true_row as u64,
                     neighbors: vec![Vec::new(); h.max_level + 1],
                     deleted: false, attr: 0,
+                    namespace: String::new(),
                 });
                 h.id_to_idx.insert(true_row as u64, i);
             }
@@ -4823,6 +4954,14 @@ impl VectorIndex {
         self.hnsw.write().unwrap().insert_attr(id, vector, attr);
     }
 
+    /// Like `insert_graph_only_attr` but also tags the node with a
+    /// namespace string. VSEARCHNS filters by this namespace so a
+    /// 512-dim face index and a 384-dim general index can coexist
+    /// in the same graph without colliding.
+    pub fn insert_graph_only_attr_ns(&self, id: u64, vector: Vec<f32>, attr: u32, namespace: String) {
+        self.hnsw.write().unwrap().insert_attr_ns(id, vector, attr, namespace);
+    }
+
     /// PARALLEL INGEST — the multi-core build path. Builds `vectors` (row-major
     /// `n×dim`, already L2-normalized) as `n_shards` independent HNSW segments
     /// in parallel (one OS thread per shard, respecting the repo's no-external-
@@ -5120,6 +5259,18 @@ impl VectorIndex {
     /// been inserted densely first.
     pub fn add_sparse(&self, id: u64, terms: Vec<(u32, f32)>) {
         self.sparse.write().unwrap().add(id, terms);
+    }
+
+    /// Access the Hnsw read lock. Used by VSEARCHNS to filter results
+    /// by namespace without exposing the internal lock to the caller.
+    pub fn hnsw_read(&self) -> std::sync::RwLockReadGuard<'_, Hnsw> {
+        self.hnsw.read().unwrap()
+    }
+
+    /// Return the namespace string for a given vector id, if present.
+    pub fn namespace_for_id(&self, id: u64) -> Option<String> {
+        let g = self.hnsw.read().unwrap();
+        g.id_to_idx.get(&id).map(|&idx| g.nodes[idx].namespace.clone())
     }
 
     /// MODULE 6 — the UNIFIED query entry point. One method, every access path,
