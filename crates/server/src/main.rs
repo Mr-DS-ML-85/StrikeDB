@@ -166,7 +166,7 @@ fn main() -> std::io::Result<()> {
     let startup = format!(
         "DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}\n\
          One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug\n\
-         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS/VQUANTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · VBULKLOAD/VBULKLOADNS · VSEARCH/VSEARCHNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
+         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS/VQUANTNS · VLISTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · VBULKLOAD/VBULKLOADNS · VSEARCH/VSEARCHNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
     );
     println!("{startup}");
     if let Some(ref lf) = log_file {
@@ -1367,6 +1367,19 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let namespace = String::from_utf8_lossy(&args[0]).to_string();
             let m = db.router.vectors_ns(&namespace).quant_mode();
             Resp::Bulk(format!("{m:?}").into_bytes())
+        }
+
+        // VLISTNS  -> array of (name, element_count) for every open namespace
+        "VLISTNS" => {
+            if !args.is_empty() {
+                return err("VLISTNS takes no arguments");
+            }
+            let mut out = Vec::new();
+            for (name, len) in db.router.namespaces() {
+                out.push(Resp::Bulk(name.into_bytes()));
+                out.push(Resp::Int(len as i64));
+            }
+            Resp::Array(out)
         }
 
         // VSETQUANT mode  -> OK   (Module 2 quantization selector)

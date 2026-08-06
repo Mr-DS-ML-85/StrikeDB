@@ -688,7 +688,7 @@ regression vs the `-P64` number (5.71M/s) and a **~261×** regression vs the
 `PING · SET · GET · MSET · MGET · DEL · INCR · INCRBY · KEYS · DBSIZE ·
 SELECT · COMMAND · FLUSHALL · FLUSHDB · SUBSCRIBE · PUBLISH · QUIT ·
 AUTH · ACL`
- plus StrikeDB-native: `VADD · VADDNS · VDEL · VDELNS · VADDBATCH · VADDBATCHNS · VBULKLOAD · VBULKLOADNS · VSETQUANT · VSETQUANTNS · VFITQUANT · VFITQUANTNS · VQUANT · VQUANTNS ·
+ plus StrikeDB-native: `VADD · VADDNS · VDEL · VDELNS · VADDBATCH · VADDBATCHNS · VBULKLOAD · VBULKLOADNS · VSETQUANT · VSETQUANTNS · VFITQUANT · VFITQUANTNS · VQUANT · VQUANTNS · VLISTNS ·
 VSEARCH · VSEARCHNS · VSEARCHA · VSEARCH.MANY · VCALIBRATE · TABLE.* · TSADD · TSADD.F ·
 TSRANGE · TSAVG · TSRANGE.LATEST · CDCLEN · CRDT.* · HLC.* · REDUCE ·
 REDUCE.PROGRAM · MEM.* · RAG.* · RAG.CONTEXT · CACHE.* · GETAT · SCAN ·
@@ -741,6 +741,7 @@ access path through optional trailing flags — no per-module command sprawl:
 - `VBULKLOADNS <namespace> <path-to-.fbin>` — like VBULKLOAD but loads into a namespace-scoped index.
 - `VQUANT` — report the current quantization mode
 - `VQUANTNS <namespace>` — report the quantization mode for a namespace-scoped index
+- `VLISTNS` — enumerate every open namespace as `(name, element_count)` pairs
 - `VSEARCH k f1 f2 …` — plain dense k-NN (server fixed ef=128, rerank=50)
 - `VSEARCH k F <cat> f1 f2 …` — Module 4 filtered ANN (attribute = `cat`)
 - `VSEARCH k L f1 f2 …` — Module 3 learned-adaptive beam width (needs `VCALIBRATE` first)

@@ -63,6 +63,19 @@ impl Router {
             .clone()
     }
 
+    /// Enumerate all open namespaces as `(name, element_count)` pairs.
+    /// The default (non-namespaced) index only appears once it has been
+    /// opened; namespaces created via `vectors_ns` are always listed.
+    pub fn namespaces(&self) -> Vec<(String, usize)> {
+        let ns = self.vectors_ns.read().unwrap();
+        let mut out: Vec<(String, usize)> = ns
+            .iter()
+            .map(|(k, v)| (k.clone(), v.len()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Cost model: choose a plan from estimated selectivity (fraction passing filter).
     /// Very selective predicate => pre-filter is cheaper (few candidates to rank).
     /// Loose predicate => let the ANN index prune, then post-filter.
