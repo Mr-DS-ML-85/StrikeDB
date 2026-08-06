@@ -166,7 +166,7 @@ fn main() -> std::io::Result<()> {
     let startup = format!(
         "DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}\n\
          One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug\n\
-         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT · VADDBATCH/VADDBATCHNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
+         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
     );
     println!("{startup}");
     if let Some(ref lf) = log_file {

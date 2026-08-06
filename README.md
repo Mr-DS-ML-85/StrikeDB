@@ -688,7 +688,7 @@ regression vs the `-P64` number (5.71M/s) and a **~261×** regression vs the
 `PING · SET · GET · MSET · MGET · DEL · INCR · INCRBY · KEYS · DBSIZE ·
 SELECT · COMMAND · FLUSHALL · FLUSHDB · SUBSCRIBE · PUBLISH · QUIT ·
 AUTH · ACL`
- plus StrikeDB-native: `VADD · VADDNS · VDEL · VDELNS · VADDBATCH · VADDBATCHNS · VSETQUANT · VSETQUANTNS · VFITQUANT · VQUANT ·
+ plus StrikeDB-native: `VADD · VADDNS · VDEL · VDELNS · VADDBATCH · VADDBATCHNS · VSETQUANT · VSETQUANTNS · VFITQUANT · VFITQUANTNS · VQUANT ·
 VSEARCH · VSEARCHNS · VSEARCHA · VSEARCH.MANY · VCALIBRATE · TABLE.* · TSADD · TSADD.F ·
 TSRANGE · TSAVG · TSRANGE.LATEST · CDCLEN · CRDT.* · HLC.* · REDUCE ·
 REDUCE.PROGRAM · MEM.* · RAG.* · RAG.CONTEXT · CACHE.* · GETAT · SCAN ·
@@ -734,6 +734,7 @@ access path through optional trailing flags — no per-module command sprawl:
   in 64-vector `PAR` batches measured 106 s against 17 s for plain append).
 - `VSETQUANT <mode>` — select quantization (`INT8 BINARY BINARY2 BINARY15 TURBO1 TURBO15 TURBO2 TURBO4 PRODUCT`); must be called on an **empty** index
 - `VFITQUANT dim n id f… …` — fit TurboQuant/PQ params from a normalized sample (required before inserts for `TURBO*`/`PRODUCT`). **The `dim` here pins the turbo rotation; inserting a different-dim vector returns a clean `ERR VADD dim N != turbo index dim M` instead of crashing the server.**
+- `VFITQUANTNS <namespace> dim n id f… …` — like VFITQUANT but fits params on a namespace-scoped index.
 - `VQUANT` — report the current quantization mode
 - `VSEARCH k f1 f2 …` — plain dense k-NN (server fixed ef=128, rerank=50)
 - `VSEARCH k F <cat> f1 f2 …` — Module 4 filtered ANN (attribute = `cat`)
