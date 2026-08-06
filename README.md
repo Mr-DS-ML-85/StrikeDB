@@ -689,7 +689,7 @@ regression vs the `-P64` number (5.71M/s) and a **~261×** regression vs the
 SELECT · COMMAND · FLUSHALL · FLUSHDB · SUBSCRIBE · PUBLISH · QUIT ·
 AUTH · ACL`
 plus StrikeDB-native: `VADD · VADDNS · VDEL · VADDBATCH · VSETQUANT · VFITQUANT · VQUANT ·
-VSEARCH · VSEARCHA · VSEARCH.MANY · VCALIBRATE · TABLE.* · TSADD · TSADD.F ·
+VSEARCH · VSEARCHNS · VSEARCHA · VSEARCH.MANY · VCALIBRATE · TABLE.* · TSADD · TSADD.F ·
 TSRANGE · TSAVG · TSRANGE.LATEST · CDCLEN · CRDT.* · HLC.* · REDUCE ·
 REDUCE.PROGRAM · MEM.* · RAG.* · RAG.CONTEXT · CACHE.* · GETAT · SCAN ·
 CHECKPOINT`.
@@ -704,7 +704,8 @@ attribute + sparse/BM25 terms in a single command; one `VSEARCH` serves every
 access path through optional trailing flags — no per-module command sprawl:
 
 - `VADD <id> f1 f2 …` — store vector `id`; attr buckets + sparse/BM25 terms derived from coords
-- `VADDNS <namespace> <id> f1 f2 …` — same as VADD but tags the node with `namespace`. Enables separate ANN indexes (e.g. 512-dim faces vs 384-dim general) in one process. `VSEARCHNS <namespace> k …` filters to that namespace.
+- `VADDNS <namespace> <id> f1 f2 …` — same as VADD but tags the node with `namespace`. Enables separate ANN indexes (e.g. 512-dim faces vs 384-dim general) in one process.
+- `VSEARCHNS <namespace> k f1 f2 …` — like VSEARCH but restricts results to vectors stored under `namespace`. Use this to query a specific ANN index without cross-namespace leakage.
 - `VDEL <id> [id …]` — tombstone vector(s) by id; returns the count that were present.
   Marks the HNSW node deleted (filtered from every search path — CPU, GPU, filtered,
   hybrid), drops the durable KV, and purges the sparse/BM25 postings. Vital for
