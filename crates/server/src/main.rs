@@ -166,7 +166,7 @@ fn main() -> std::io::Result<()> {
     let startup = format!(
         "DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}\n\
          One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug\n\
-         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · VBULKLOAD/VBULKLOADNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
+         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS/VQUANTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · VBULKLOAD/VBULKLOADNS · VSEARCH/VSEARCHNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
     );
     println!("{startup}");
     if let Some(ref lf) = log_file {
@@ -1359,6 +1359,16 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             Resp::Simple("OK".into())
         }
 
+        // VQUANTNS <namespace>  -> bulk (namespace's current quantization mode)
+        "VQUANTNS" => {
+            if args.len() != 1 {
+                return err("VQUANTNS requires namespace");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let m = db.router.vectors_ns(&namespace).quant_mode();
+            Resp::Bulk(format!("{m:?}").into_bytes())
+        }
+
         // VSETQUANT mode  -> OK   (Module 2 quantization selector)
         // Selects the quantization mode for subsequent inserts. Must be called
         // on an EMPTY index (the underlying HNSW asserts on a non-empty graph).
@@ -1596,26 +1606,81 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             Resp::Array(out)
         }
 
-        // VSEARCHNS <namespace> k f1 f2 ...  -> array of (id, dist)
+        // VSEARCHNS <namespace> k [F cat | L | H t w ...] f1 f2 ...  -> array of (id, dist)
         // Like VSEARCH but searches only the vectors stored in the
         // given namespace. Each namespace has its own HNSW graph and
         // dim, so different namespaces can hold vectors of different
         // dimensionalities (e.g. 512-dim face namespace vs 64-dim pHash).
+        // Supports the same access-path flags as VSEARCH: F (filtered ANN),
+        // L (learned-adaptive beam), H (hybrid sparse).
         "VSEARCHNS" => {
             if args.len() < 3 {
-                return err("VSEARCHNS requires namespace k f1 f2 ...");
+                return err("VSEARCHNS requires namespace k [F cat | L | H t w ...] f1 f2 ...");
             }
             let namespace = String::from_utf8_lossy(&args[0]).to_string();
             let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
-            let q = match parse_floats(&args[2..]) {
+            // Parse optional access-path flags, then the float vector.
+            let mut i = 2usize;
+            let mut filter: Option<Filter> = None;
+            let mut use_learned = false;
+            let mut sparse: Option<Vec<(u32, f32)>> = None;
+            while i < args.len() {
+                let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if tok == "F" {
+                    if i + 1 >= args.len() {
+                        return err("F requires a category");
+                    }
+                    let cat: u32 = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse().ok()) {
+                        Some(n) => n,
+                        None => return err("F category is not an integer"),
+                    };
+                    filter = Some(Filter::Eq(cat));
+                    i += 2;
+                } else if tok == "L" {
+                    use_learned = true;
+                    i += 1;
+                } else if tok == "H" {
+                    let mut terms = Vec::new();
+                    i += 1;
+                    while i + 1 < args.len() {
+                        let t: u32 = match std::str::from_utf8(&args[i]).ok().and_then(|s| s.parse().ok()) {
+                            Some(n) => n,
+                            None => break,
+                        };
+                        let w: f32 = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse().ok()) {
+                            Some(n) => n,
+                            None => break,
+                        };
+                        terms.push((t, w));
+                        i += 2;
+                    }
+                    if terms.is_empty() {
+                        return err("H requires at least one t w pair");
+                    }
+                    sparse = Some(terms);
+                } else {
+                    break; // first float → end of flags
+                }
+            }
+            let q = match parse_floats(&args[i..]) {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
             let vi = db.router.vectors_ns(&namespace);
-            let hits = vi.search_unified(&q, k, 128, None, None, None, 50);
+            let learned = if use_learned {
+                db.learned.lock().unwrap().clone()
+            } else {
+                None
+            };
+            if use_learned && learned.is_none() {
+                return err("learned search requires VCALIBRATE first");
+            }
+            let hits = vi.search_unified(
+                &q, k, 128, filter.as_ref(), learned.as_ref(), sparse.as_deref(), 50,
+            );
             let mut out = Vec::new();
             for (id, dist) in hits {
                 out.push(Resp::Int(id as i64));

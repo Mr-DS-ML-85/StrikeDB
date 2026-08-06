@@ -688,7 +688,7 @@ regression vs the `-P64` number (5.71M/s) and a **~261×** regression vs the
 `PING · SET · GET · MSET · MGET · DEL · INCR · INCRBY · KEYS · DBSIZE ·
 SELECT · COMMAND · FLUSHALL · FLUSHDB · SUBSCRIBE · PUBLISH · QUIT ·
 AUTH · ACL`
- plus StrikeDB-native: `VADD · VADDNS · VDEL · VDELNS · VADDBATCH · VADDBATCHNS · VBULKLOAD · VBULKLOADNS · VSETQUANT · VSETQUANTNS · VFITQUANT · VFITQUANTNS · VQUANT ·
+ plus StrikeDB-native: `VADD · VADDNS · VDEL · VDELNS · VADDBATCH · VADDBATCHNS · VBULKLOAD · VBULKLOADNS · VSETQUANT · VSETQUANTNS · VFITQUANT · VFITQUANTNS · VQUANT · VQUANTNS ·
 VSEARCH · VSEARCHNS · VSEARCHA · VSEARCH.MANY · VCALIBRATE · TABLE.* · TSADD · TSADD.F ·
 TSRANGE · TSAVG · TSRANGE.LATEST · CDCLEN · CRDT.* · HLC.* · REDUCE ·
 REDUCE.PROGRAM · MEM.* · RAG.* · RAG.CONTEXT · CACHE.* · GETAT · SCAN ·
@@ -708,9 +708,11 @@ access path through optional trailing flags — no per-module command sprawl:
   namespace-scoped index. Each namespace gets its own HNSW graph and dim, so
   different namespaces can hold vectors of different dimensionalities (e.g.
   512-dim faces vs 64-dim pHash) in a single StrikeDB process.
-- `VSEARCHNS <namespace> k f1 f2 …` — like VSEARCH but restricts results to
-  vectors stored under `namespace`. Use this to query a specific ANN index
-  without cross-namespace leakage.
+- `VSEARCHNS <namespace> k [F cat | L | H t w …] f1 f2 …` — like VSEARCH but
+  restricts results to vectors stored under `namespace`. Use this to query a
+  specific ANN index without cross-namespace leakage. Supports the same
+  access-path flags as VSEARCH (`F` filtered ANN, `L` learned-adaptive beam,
+  `H` hybrid sparse).
 - `VDELNS <namespace> id [id …]` — like VDEL but operates on a namespace-scoped
   index. Tombstone vectors by id within the given namespace only.
 - `VADDBATCHNS <namespace> dim id f… [id f…]…` — like VADDBATCH but stores
@@ -738,6 +740,7 @@ access path through optional trailing flags — no per-module command sprawl:
 - `VBULKLOAD <path-to-.fbin>` — bulk-ingest from an fbin file (`[n:u32-le][dim:u32-le][n×dim f32-le]`, ids `0..n`). Data never crosses the wire; the server reads the file and builds the index **once** via the same parallel/GPU builder. **Replaces** the current index rather than appending. Vectors are L2-normalized on load.
 - `VBULKLOADNS <namespace> <path-to-.fbin>` — like VBULKLOAD but loads into a namespace-scoped index.
 - `VQUANT` — report the current quantization mode
+- `VQUANTNS <namespace>` — report the quantization mode for a namespace-scoped index
 - `VSEARCH k f1 f2 …` — plain dense k-NN (server fixed ef=128, rerank=50)
 - `VSEARCH k F <cat> f1 f2 …` — Module 4 filtered ANN (attribute = `cat`)
 - `VSEARCH k L f1 f2 …` — Module 3 learned-adaptive beam width (needs `VCALIBRATE` first)
