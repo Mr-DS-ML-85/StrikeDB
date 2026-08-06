@@ -166,7 +166,7 @@ fn main() -> std::io::Result<()> {
     let startup = format!(
         "DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}\n\
          One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug\n\
-         Wired: VSETQUANT/VFITQUANT · VADDBATCH · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
+         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT · VADDBATCH/VADDBATCHNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
     );
     println!("{startup}");
     if let Some(ref lf) = log_file {
@@ -1317,6 +1317,26 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 }
                 Err(e) => err(&e.to_string()),
             }
+        }
+
+// VSETQUANTNS <namespace> mode  -> OK
+        // Like VSETQUANT but sets the quantization mode for a namespace-scoped
+        // index. Each namespace can have its own quantization mode.
+        "VSETQUANTNS" => {
+            if args.len() != 2 {
+                return err("VSETQUANTNS requires namespace mode");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let m = match quant_mode_from_str(&String::from_utf8_lossy(&args[1]).to_uppercase()) {
+                Some(m) => m,
+                None => return err("unknown quant mode (INT8 BINARY BINARY2 BINARY15 TURBO1 TURBO15 TURBO2 TURBO4 PRODUCT)"),
+            };
+            let vi = db.router.vectors_ns(&namespace);
+            if vi.len() > 0 {
+                return err("VSETQUANTNS requires an empty index (flush/restart first)");
+            }
+            vi.set_quant_mode(m);
+            Resp::Simple("OK".into())
         }
 
         // VSETQUANT mode  -> OK   (Module 2 quantization selector)
