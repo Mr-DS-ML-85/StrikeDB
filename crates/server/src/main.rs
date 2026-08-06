@@ -1240,6 +1240,85 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
         }
 
+        // VADDBATCHNS <namespace> [PAR] dim id0 f0..f{dim-1} ...  -> :n
+        // Like VADDBATCH but stores vectors in a namespace-scoped index.
+        // Each namespace gets its own HNSW graph and dim.
+        "VADDBATCHNS" => {
+            if args.len() < 3 {
+                return err("VADDBATCHNS requires namespace [PAR] dim id f1 f2 ...");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let (parallel, rest) = if String::from_utf8_lossy(&args[1]).eq_ignore_ascii_case("PAR") {
+                (true, &args[2..])
+            } else {
+                (false, &args[1..])
+            };
+            if rest.len() < 1 {
+                return err("VADDBATCHNS requires dim id f1 f2 ...");
+            }
+            let dim: usize = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("dim is not an integer"),
+            };
+            if dim == 0 {
+                return err("dim must be > 0");
+            }
+            if (rest.len() - 1) % (dim + 1) != 0 {
+                return err("VADDBATCHNS float count must be whole number of (id + dim) tuples");
+            }
+            let tuples = (rest.len() - 1) / (dim + 1);
+            let mut ids: Vec<u64> = Vec::with_capacity(tuples);
+            let mut flat: Vec<f32> = Vec::with_capacity(tuples * dim);
+            let mut ok = true;
+            let mut errmsg = String::new();
+            for t in 0..tuples {
+                let base = 1 + t * (dim + 1);
+                let id: u64 = match std::str::from_utf8(&rest[base]).ok().and_then(|s| s.parse().ok()) {
+                    Some(n) => n,
+                    None => { ok = false; errmsg = "id is not a u64".into(); break; }
+                };
+                let v = match parse_floats(&rest[base + 1..base + 1 + dim]) {
+                    Some(v) => v,
+                    None => { ok = false; errmsg = "bad float in vector".into(); break; }
+                };
+                ids.push(id);
+                flat.extend_from_slice(&v);
+            }
+            if !ok {
+                return err(&errmsg);
+            }
+            let vi = db.router.vectors_ns(&namespace);
+            if vi.len() > 0 && vi.dim() != dim {
+                return err(&format!("VADDBATCHNS dim {} != existing index dim {}", dim, vi.dim()));
+            }
+            let qd = vi.quant_dim();
+            if qd != 0 && dim != qd {
+                return err(&format!("VADDBATCHNS dim {} != turbo index dim {}", dim, qd));
+            }
+            let mut attrs: Vec<u32> = Vec::with_capacity(tuples);
+            let mut sparses: Vec<Vec<(u32, f32)>> = Vec::with_capacity(tuples);
+            for i in 0..tuples {
+                let vslice = &flat[i * dim..i * dim + dim];
+                let (attr, sparse) = derive_attr_and_sparse(vslice, 8, 8);
+                attrs.push(attr);
+                sparses.push(sparse);
+            }
+            let res = if parallel {
+                vi.insert_many_parallel_rebuild(&ids, &flat, dim, num_cores(), &attrs)
+            } else {
+                vi.insert_many_parallel(&ids, &flat, dim, num_cores(), &attrs)
+            };
+            match res {
+                Ok(_) => {
+                    for (i, &id) in ids.iter().enumerate() {
+                        vi.add_sparse(id, sparses[i].clone());
+                    }
+                    Resp::Int(tuples as i64)
+                }
+                Err(e) => err(&e.to_string()),
+            }
+        }
+
         // VSETQUANT mode  -> OK   (Module 2 quantization selector)
         // Selects the quantization mode for subsequent inserts. Must be called
         // on an EMPTY index (the underlying HNSW asserts on a non-empty graph).
