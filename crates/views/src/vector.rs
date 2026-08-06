@@ -4470,6 +4470,23 @@ impl VectorIndex {
             *g = built.hnsw.into_inner().unwrap();
         }
         self.upload_to_gpu_if_enabled();
+
+        // Durability. A bulk load replaces the live graph, so it must also
+        // own the durable state: otherwise restarting the server would replay
+        // the OLD namespace (or nothing) and silently lose the load. Persist
+        // in ONE atomic batch:
+        //   * tombstone every stale key under our prefix (the "replace" half),
+        //   * write each loaded vector as a fresh Value::Vector (the "load").
+        // Sweeping the prefix also makes re-running a load onto the same
+        // namespace idempotent rather than additive.
+        let mut kvs: Vec<(Vec<u8>, Value)> = Vec::with_capacity(n + 1);
+        for (key, _) in self.engine.scan_prefix(&self.prefix_bytes(), self.engine.snapshot()) {
+            kvs.push((key, Value::Tombstone));
+        }
+        for (i, row) in data.chunks(dim).enumerate() {
+            kvs.push((self.vec_key(i as u64), Value::Vector(row.to_vec())));
+        }
+        self.engine.put_batch(kvs)?;
         Ok((n, dim))
     }
 
@@ -4790,6 +4807,20 @@ impl VectorIndex {
         }
         b.extend_from_slice(&id.to_be_bytes());
         b
+    }
+
+    /// Search prefix for our namespace: `vec:` (default) or `vec:<prefix>:`.
+    /// Matches `open_ns`, so a scan here touches exactly the keys this index
+    /// owns (and would reload on reopen).
+    fn prefix_bytes(&self) -> Vec<u8> {
+        if self.prefix.is_empty() {
+            b"vec:".to_vec()
+        } else {
+            let mut p = b"vec:".to_vec();
+            p.extend_from_slice(self.prefix.as_bytes());
+            p.push(b':');
+            p
+        }
     }
 
     /// Upload vectors + flat CSR graph to GPU for APGC-style GPU search.

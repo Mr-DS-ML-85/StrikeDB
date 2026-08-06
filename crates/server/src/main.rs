@@ -166,7 +166,7 @@ fn main() -> std::io::Result<()> {
     let startup = format!(
         "DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}\n\
          One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug\n\
-         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS/VQUANTNS · VLISTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · VBULKLOAD/VBULKLOADNS · VSEARCH/VSEARCHNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
+         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS/VQUANTNS · VLISTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · VBULKLOAD/VBULKLOADNS · VSEARCH/VSEARCHNS/VSEARCHA/VSEARCHANS/VSEARCH.MANY/VSEARCH.MANYNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
     );
     println!("{startup}");
     if let Some(ref lf) = log_file {
@@ -1730,6 +1730,30 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             Resp::Array(out)
         }
 
+        // VSEARCHANS <namespace> k f1 f2 ...  -> array of (id, dist)
+        // Like VSEARCHA (query-adaptive beam) but searches only a namespace.
+        "VSEARCHANS" => {
+            if args.len() < 3 {
+                return err("VSEARCHANS requires namespace k f1 f2 ...");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("k is not an integer"),
+            };
+            let q = match parse_floats(&args[2..]) {
+                Some(v) => v,
+                None => return err("bad float in query"),
+            };
+            let hits = db.router.vectors_ns(&namespace).search_adaptive(&q, k, 16, 32, 256);
+            let mut out = Vec::new();
+            for (id, dist) in hits {
+                out.push(Resp::Int(id as i64));
+                out.push(Resp::Bulk(format!("{dist:.6}").into_bytes()));
+            }
+            Resp::Array(out)
+        }
+
         // VSEARCH.MANY k dim q1_f0 ... q1_f{dim-1} q2_f0 ... qN_f{dim-1}
         // Returns Array of N Arrays, each Array being (id, dist) pairs.
         // Single round trip + one HNSW read-lock — amortizes protocol + lock.
@@ -1758,6 +1782,47 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let queries: Vec<Vec<f32>> =
                 floats.chunks(dim).map(|c| c.to_vec()).collect();
             let batch = db.router.vectors().search_many(&queries, k);
+            let mut out = Vec::with_capacity(batch.len());
+            for hits in batch {
+                let mut inner = Vec::with_capacity(hits.len() * 2);
+                for (id, dist) in hits {
+                    inner.push(Resp::Int(id as i64));
+                    inner.push(Resp::Bulk(format!("{dist:.6}").into_bytes()));
+                }
+                out.push(Resp::Array(inner));
+            }
+            Resp::Array(out)
+        }
+
+        // VSEARCH.MANYNS <namespace> k dim q1_f0 ...  -> Array of N Arrays
+        // Like VSEARCH.MANY (batched multi-query ANN) but searches only a
+        // namespace-scoped index.
+        "VSEARCH.MANYNS" => {
+            if args.len() < 4 {
+                return err("VSEARCH.MANYNS requires namespace k dim f1 f2 ...");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("k is not an integer"),
+            };
+            let dim: usize = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return err("dim is not an integer"),
+            };
+            if dim == 0 {
+                return err("dim must be > 0");
+            }
+            let floats = match parse_floats(&args[3..]) {
+                Some(v) => v,
+                None => return err("bad float in queries"),
+            };
+            if floats.len() % dim != 0 {
+                return err("float count not divisible by dim");
+            }
+            let queries: Vec<Vec<f32>> =
+                floats.chunks(dim).map(|c| c.to_vec()).collect();
+            let batch = db.router.vectors_ns(&namespace).search_many(&queries, k);
             let mut out = Vec::with_capacity(batch.len());
             for hits in batch {
                 let mut inner = Vec::with_capacity(hits.len() * 2);
