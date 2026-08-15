@@ -4962,7 +4962,9 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
             hnsw.insert(id, v);
         }
     }
-    Self { engine, prefix, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
+    let idx = Self { engine, prefix, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
+    idx.upload_to_gpu_if_enabled();
+    idx
 }
 
     /// Insert/replace a vector: durable f32 write + graph update with a

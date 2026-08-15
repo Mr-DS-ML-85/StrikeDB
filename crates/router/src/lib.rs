@@ -76,6 +76,18 @@ impl Router {
         out
     }
 
+    /// Push every open namespace (and the default index) to the device.
+    /// Called when compute mode switches to a GPU mode, so indexes that were
+    /// opened while `CpuOnly` — e.g. restored from WAL at startup — get a
+    /// GPU copy without a rebuild.
+    pub fn upload_all_to_gpu(&self) {
+        self.vectors_default.upload_to_gpu();
+        let ns = self.vectors_ns.read().unwrap();
+        for v in ns.values() {
+            v.upload_to_gpu();
+        }
+    }
+
     /// Cost model: choose a plan from estimated selectivity (fraction passing filter).
     /// Very selective predicate => pre-filter is cheaper (few candidates to rank).
     /// Loose predicate => let the ANN index prune, then post-filter.

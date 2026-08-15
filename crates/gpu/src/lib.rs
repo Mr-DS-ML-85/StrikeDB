@@ -86,6 +86,7 @@ extern "C" {
     fn cuStreamCreate(phStream: *mut *mut std::ffi::c_void, flags: u32) -> i32;
     fn cuStreamDestroy_v2(hStream: *mut std::ffi::c_void) -> i32;
     fn cuStreamSynchronize(hStream: *mut std::ffi::c_void) -> i32;
+    fn cuStreamQuery(hStream: *mut std::ffi::c_void) -> i32;
     fn cuMemcpyHtoDAsync_v2(dstDevice: u64, srcHost: *const std::ffi::c_void, byteCount: usize, hStream: *mut std::ffi::c_void) -> i32;
     fn cuMemcpyDtoHAsync_v2(dstHost: *mut std::ffi::c_void, srcDevice: u64, byteCount: usize, hStream: *mut std::ffi::c_void) -> i32;
     fn cuMemsetD32_v2(dstDevice: u64, ui: u32, n: usize) -> i32;
@@ -320,6 +321,17 @@ pub fn gpu_load_kernel(name: &str) -> bool {
         Some(s) => s,
         None => return false,
     };
+    // `all` loads every kernel: compile the whole module, then report success
+    // if any kernel is resident (the module compiles all 18 at once).
+    if name.eq_ignore_ascii_case("all") {
+        if KERNELS_COMPILED.load(Ordering::Acquire) {
+            return true;
+        }
+        let state_ptr = state as *const GpuState as *mut GpuState;
+        unsafe { (*state_ptr).ensure_kernels(); }
+        return KERNELS_COMPILED.load(Ordering::Acquire)
+            && GPU_STATE.get().map(|s| !s.kernels.is_empty()).unwrap_or(false);
+    }
     // Check if already loaded
     if state.get_kernel(name).is_some() { return true; }
     // Need to compile — force via raw pointer (safe: GpuState is Sync, single-threaded init).
@@ -598,8 +610,7 @@ pub fn gpu_cosine_dist(query: &[i8], vectors: &[i8], n: usize, dim: usize) -> Op
             cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
             return None;
         }
-        let sync_r = cuCtxSynchronize();
-        if sync_r != 0 { return None; }
+        if !sync_stream_with_watchdog(std::ptr::null_mut()) { return None; }
 
         let mut dists = vec![0.0f32; n];
         cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, d_bytes);
@@ -649,7 +660,10 @@ pub fn gpu_batch_cosine_dist(queries: &[i8], vectors: &[i8], q: usize, n: usize,
             cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
             return None;
         }
-        cuCtxSynchronize();
+        if !sync_stream_with_watchdog(std::ptr::null_mut()) {
+            cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
+            return None;
+        }
         let mut dists = vec![0.0f32; q * n];
         cuMemcpyDtoH_v2(dists.as_mut_ptr() as *mut std::ffi::c_void, d_d, out_bytes);
         cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d);
@@ -731,7 +745,10 @@ pub fn gpu_batch_cosine_dist_topk(
                 std::ptr::null_mut(), fused_params.as_ptr() as *mut *mut std::ffi::c_void,
                 std::ptr::null_mut());
             if r != 0 { cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_out_idx); cuMemFree_v2(d_out_dist); return None; }
-            cuCtxSynchronize();
+            if !sync_stream_with_watchdog(std::ptr::null_mut()) {
+                cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_out_idx); cuMemFree_v2(d_out_dist);
+                return None;
+            }
 
             let mut indices = vec![0i32; q * k];
             let mut distances = vec![0.0f32; q * k];
@@ -784,7 +801,10 @@ pub fn gpu_batch_cosine_dist_topk(
         cuLaunchKernel(topk_func, q as u32, 1, 1, threads, 1, 1, smem,
             std::ptr::null_mut(), topk_params.as_ptr() as *mut *mut std::ffi::c_void,
             std::ptr::null_mut());
-        cuCtxSynchronize();
+        if !sync_stream_with_watchdog(std::ptr::null_mut()) {
+            cuMemFree_v2(d_q); cuMemFree_v2(d_v); cuMemFree_v2(d_d); cuMemFree_v2(d_out_idx); cuMemFree_v2(d_out_dist);
+            return None;
+        }
 
         // Read back only Q×k results (tiny: 8 KB vs 128 MB for Q×N)
         let mut indices = vec![0i32; q * k];
@@ -860,7 +880,7 @@ impl GpuBuildBuffers {
         // caller maps index 0 to a real node, every vector's nearest neighbour
         // became node 0 — a build that reports success and prints its usual
         // timing line while producing a useless graph.
-        if cuCtxSynchronize() != 0 { return None; }
+        if !sync_stream_with_watchdog(std::ptr::null_mut()) { return None; }
         // Sentinel-initialised, not zero: index 0 and distance 0.0 are both
         // *valid* results, so a partial copy would be indistinguishable from a
         // genuine answer. -1 is filtered by every consumer.
@@ -922,8 +942,14 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
         // Two thirds, not all: the refine phase below allocates its own graph
         // buffers, and a build that fits by a hair here would fail there.
         let one_shot = full_bytes.saturating_mul(3) / 2 < vram_free;
+        // A single launch whose grid is `n` blocks keeps the whole display GPU
+        // busy for the entire build (the kernel is one block per query). Cap
+        // the per-launch grid so a large corpus never parks the desktop for
+        // minutes at a time; corpora above the cap simply take the batched
+        // path below.
+        const MAX_ONE_SHOT_Q: usize = 65536;
 
-        let (max_batch_q, bufs) = match one_shot
+        let (max_batch_q, bufs) = match (one_shot && n <= MAX_ONE_SHOT_Q)
             .then(|| GpuBuildBuffers::new(n, n.max(seed_count), dim, k))
             .flatten()
         {
@@ -1136,7 +1162,7 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
                     std::ptr::null_mut()) != 0 { ok = false; break; }
                 std::mem::swap(&mut cur_in, &mut cur_out);
             }
-            if cuCtxSynchronize() != 0 { ok = false; }
+            if !sync_stream_with_watchdog(std::ptr::null_mut()) { ok = false; }
             if ok {
                 cuMemcpyDtoH_v2(flat.as_mut_ptr() as *mut std::ffi::c_void, cur_in, g_bytes);
             }
@@ -1260,7 +1286,10 @@ pub fn gpu_matmul(a: &[i8], b: &[i8], m: usize, k: usize, n: usize) -> Option<Ve
         cuLaunchKernel(func, bx, by, 1, threads, threads, 1, 0,
                       std::ptr::null_mut(), matmul_params.as_ptr() as *mut *mut std::ffi::c_void,
                       std::ptr::null_mut());
-        cuCtxSynchronize();
+        if !sync_stream_with_watchdog(std::ptr::null_mut()) {
+            cuMemFree_v2(d_a); cuMemFree_v2(d_b); cuMemFree_v2(d_c);
+            return None;
+        }
         let mut c = vec![0i32; m * n];
         cuMemcpyDtoH_v2(c.as_mut_ptr() as *mut std::ffi::c_void, d_c, c_bytes);
         cuMemFree_v2(d_a); cuMemFree_v2(d_b); cuMemFree_v2(d_c);
@@ -1281,6 +1310,45 @@ pub fn gpu_unload() {
                 GPU_DESTROYED.store(true, Ordering::Relaxed);
             }
         }
+    }
+}
+
+/// CUDA error code returned by `cuStreamQuery` while a kernel is still running.
+const CUDA_ERROR_NOT_READY: i32 = 600;
+/// Maximum time any single kernel may hold the GPU before the watchdog force-
+/// resets the context. Long enough for real ingest/search on a 200k corpus,
+/// short enough that a hung kernel cannot freeze the display indefinitely.
+const GPU_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Synchronize a stream with a watchdog deadline. `cuCtxSynchronize` under
+/// `CU_CTX_SCHED_BLOCKING_SYNC` blocks the calling thread forever if a kernel
+/// wedges — and on a display-driving GPU that freezes the whole desktop. So we
+/// poll `cuStreamQuery` (non-blocking) instead, and if the kernel has not
+/// finished within `GPU_SYNC_TIMEOUT` we destroy the CUDA context, which
+/// force-kills the stuck kernel and returns the device to the OS. Every
+/// subsequent GPU call sees `GPU_DESTROYED` and falls back to CPU.
+///
+/// Returns `true` if the stream drained within the deadline.
+pub fn sync_stream_with_watchdog(stream: *mut std::ffi::c_void) -> bool {
+    let deadline = std::time::Instant::now() + GPU_SYNC_TIMEOUT;
+    loop {
+        let r = unsafe { cuStreamQuery(stream) };
+        if r == 0 {
+            return true;
+        }
+        if r != CUDA_ERROR_NOT_READY {
+            // Real launch/sync error (not merely "still running") — surface it.
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "[GPU] WATCHDOG: kernel exceeded {:?} — destroying CUDA context to recover",
+                GPU_SYNC_TIMEOUT
+            );
+            gpu_unload();
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -2085,7 +2153,7 @@ fn gpu_search_slot_batch(
         let mut distances = vec![2.0f32; out];
         let ok = cuMemcpyDtoHAsync_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, slot.d_idx, out * 4, stream) == 0
             && cuMemcpyDtoHAsync_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, slot.d_odist, out * 4, stream) == 0
-            && cuStreamSynchronize(stream) == 0;
+            && sync_stream_with_watchdog(stream);
         release(&index.slot_mask);
         if !ok { return None; }
         Some((indices, distances))
@@ -2223,7 +2291,9 @@ fn gpu_search_batched(
                     std::ptr::null_mut(), params.as_ptr() as *mut *mut std::ffi::c_void,
                     std::ptr::null_mut());
                 if r == 0 {
-                    let sync = cuCtxSynchronize();
+                    if !sync_stream_with_watchdog(std::ptr::null_mut()) {
+                        return None;
+                    }
                     let mut indices = vec![-1i32; out_count];
                     let mut distances = vec![2.0f32; out_count];
                     let c1 = cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, index.d_idx_buf, out_count * 4);
@@ -2274,7 +2344,9 @@ fn gpu_search_batched(
                 std::ptr::null_mut(), fused_params.as_ptr() as *mut *mut std::ffi::c_void,
                 std::ptr::null_mut());
             if r == 0 {
-                cuCtxSynchronize();
+                if !sync_stream_with_watchdog(std::ptr::null_mut()) {
+                    return None;
+                }
                 let mut indices = vec![0i32; out_count];
                 let mut distances = vec![0.0f32; out_count];
                 cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, index.d_idx_buf, out_count * 4);
@@ -2332,7 +2404,7 @@ fn gpu_search_batched(
             std::ptr::null_mut());
         if r2 != 0 { return None; }
 
-        cuCtxSynchronize();
+        if !sync_stream_with_watchdog(std::ptr::null_mut()) { return None; }
 
         let mut indices = vec![0i32; out_count];
         let mut distances = vec![0.0f32; out_count];

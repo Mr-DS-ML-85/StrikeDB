@@ -139,7 +139,17 @@ void apgc_search_kernel(
     const int SR_HASH = 8192;
     const int SR_HMASK = SR_HASH - 1;
     int BEAM = (beam_in > 0 && beam_in <= 64) ? beam_in : 64;
-    int BUF = 1; while (BUF < itopk + BEAM * degree) BUF <<= 1;
+    // Inputs are clamped against the host-side caps so the shared-memory
+    // sizing below can never overflow a 32-bit int and spin `BUF <<= 1` into
+    // INT_MIN → 0 (an infinite loop that freezes the display GPU). The host
+    // sizer (apgc_search_smem) applies the same caps, so smem stays consistent.
+    if (itopk > 1024) itopk = 1024;
+    if (degree > 64) degree = 64;
+    int BUF = 1;
+    while (BUF < itopk + BEAM * degree) {
+        if (BUF >= 1 << 29) { BUF = 1 << 29; break; } // cap, never overflow
+        BUF <<= 1;
+    }
     int D4 = (D + 3) >> 2;
 
     extern __shared__ int smem[];
@@ -310,7 +320,7 @@ void apgc_search_kernel(
         __syncthreads();
 
         // ── Bitonic sort, descending by dot, payloads travel along ───────
-        for (int size = 2; size <= BUF; size <<= 1) {
+        for (int size = 2; size <= BUF && size > 0; size <<= 1) {
             for (int stride = size >> 1; stride > 0; stride >>= 1) {
                 for (int i = tid; i < (BUF >> 1); i += threads) {
                     int j = ((i / stride) * (stride << 1)) + (i % stride);
@@ -342,7 +352,7 @@ void apgc_search_kernel(
     // RR = next_pow2(k) >= k, so we rescore slightly more than we emit and the
     // reordering can pull a true neighbour up from just outside the top k.
     if (vec_f32 != nullptr && query_f32 != nullptr && k > 0) {
-        int RR = 1; while (RR < k) RR <<= 1;
+        int RR = 1; while (RR < k) { if (RR >= 1 << 20) { RR = 1 << 20; break; } RR <<= 1; }
         // The bitonic network below needs a power of two, so shrink by halving
         // rather than clamping to `itopk` directly (itopk is arbitrary).
         while (RR > itopk) RR >>= 1;

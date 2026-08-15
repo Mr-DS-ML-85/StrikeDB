@@ -2009,6 +2009,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                             gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly);
                             return err("ERR no GPU detected");
                         }
+                        db.router.upload_all_to_gpu();
                         Resp::Simple("OK compute mode = Turbo (full GPU)".into())
                     }
                     "hybrid" => {
@@ -2017,6 +2018,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                             gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly);
                             return err("ERR no GPU detected");
                         }
+                        db.router.upload_all_to_gpu();
                         Resp::Simple("OK compute mode = Hybrid (GPU+RAM+CPU)".into())
                     }
                     "cpu" | "cpu_only" | "off" => {
