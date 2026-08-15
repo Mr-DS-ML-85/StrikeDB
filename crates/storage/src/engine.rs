@@ -722,11 +722,13 @@ fn spawn_flusher(core: Arc<FlushCore>) -> JoinHandle<()> {
         };
 
         // Durable step: one append + one fsync for the whole batch.
+        // Batch members are appended WITHOUT per-record fsync (`append_unsynced`);
+        // the single `sync()` below is the one fsync that makes them all durable.
         let flush_result: io::Result<()> = (|| {
             let mut wal = core.wal.lock().unwrap();
             for pw in &batch {
                 for m in &pw.muts {
-                    wal.append(&m.encode())?;
+                    wal.append_unsynced(&m.encode())?;
                 }
             }
             // single fsync amortised across the whole group
@@ -849,6 +851,12 @@ fn spawn_flusher(core: Arc<FlushCore>) -> JoinHandle<()> {
 
         let bytes = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
         Ok((n, bytes))
+    }
+
+    /// Current WAL size in bytes — callers use this to decide whether a
+    /// checkpoint (snapshot + truncate) is worth its cost.
+    pub fn wal_bytes(&self) -> u64 {
+        self.core.wal.lock().unwrap().len()
     }
 
     /// Atomic batch write: all `kvs` are made visible under ONE commit timestamp

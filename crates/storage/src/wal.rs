@@ -40,6 +40,21 @@ impl Wal {
         Ok(())
     }
 
+    /// Append one record WITHOUT fsync. The caller is responsible for an
+    /// eventual `sync()` — the group-commit flusher appends a whole batch
+    /// then fsyncs once. Per-record fsyncs here turn a 400k-record bulk load
+    /// into 400k fsyncs (minutes), which is why batch writers must use this.
+    pub fn append_unsynced(&mut self, payload: &[u8]) -> io::Result<()> {
+        let len = payload.len() as u32;
+        let crc = crc32(payload);
+        let mut hdr = [0u8; 8];
+        hdr[0..4].copy_from_slice(&len.to_le_bytes());
+        hdr[4..8].copy_from_slice(&crc.to_le_bytes());
+        self.file.write_all(&hdr)?;
+        self.file.write_all(payload)?;
+        Ok(())
+    }
+
     /// Flush all buffered data to durable storage (used by the group-commit
     /// flusher to amortise ONE fsync across a whole batch of records).
     pub fn sync(&mut self) -> io::Result<()> {
@@ -88,6 +103,11 @@ impl Wal {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.sync_data()
+    }
+
+    /// Current log size in bytes (used to decide whether a checkpoint is worth it).
+    pub fn len(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
     }
 }
 

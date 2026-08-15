@@ -4487,6 +4487,16 @@ impl VectorIndex {
             kvs.push((self.vec_key(i as u64), Value::Vector(row.to_vec())));
         }
         self.engine.put_batch(kvs)?;
+
+        // Compaction point. A bulk load can dwarf the existing WAL (50k × 384d
+        // ≈ 56 MB of records per load), and every re-run of the load grows the
+        // log again — the durable state is a single snapshot per key, so there
+        // is no reason to keep the whole rewrite history. Checkpoint only when
+        // the log is large enough to matter; the snapshot cost is one pass over
+        // live keys, which for small namespaces is not worth paying.
+        if self.engine.wal_bytes() > 8 * 1024 * 1024 {
+            self.engine.checkpoint()?;
+        }
         Ok((n, dim))
     }
 
