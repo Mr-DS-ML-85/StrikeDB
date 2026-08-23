@@ -7,11 +7,19 @@
 //! `from_utf8_lossy` corruption. The str-based wrappers remain for
 //! callers that already hold text keys (unit tests, internal helpers).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use storage::{Engine, Value, TxnError};
 
 pub struct Kv {
     engine: Arc<Engine>,
+    /// Serializes read-modify-write transactions (INCR/INCRBY). The engine's
+    /// OCC validates conflicts BEFORE the write is enqueued to the group
+    /// commit flusher, so N racing txns that read the same snapshot all pass
+    /// validation and then blind-overwrite each other — 8 clients × 250
+    /// INCRBYs collapsed to a final value of 250. Serializing RMW at this
+    /// level restores exact counter semantics (Redis INCR is serialized too);
+    /// plain SET/GET never take this lock.
+    txn_lock: Mutex<()>,
 }
 
 fn k(key: &[u8]) -> Vec<u8> {
@@ -22,7 +30,7 @@ fn k(key: &[u8]) -> Vec<u8> {
 
 impl Kv {
     pub fn new(engine: Arc<Engine>) -> Self {
-        Self { engine }
+        Self { engine, txn_lock: Mutex::new(()) }
     }
 
     // ── Byte-key API (raw RESP arg bytes) ────────────────────────────
@@ -47,6 +55,10 @@ impl Kv {
     /// INCRBY: key is a raw byte key (no UTF-8 assumption), but the
     /// *value* is still parsed as text (integers are text). Returns the new value.
     pub fn incr_by_lossy(&self, key: &[u8], by: i64) -> Result<i64, String> {
+        // Hold the RMW lock across read→write so concurrent counter ops
+        // cannot validate against the same snapshot and overwrite each other
+        // in the group-commit queue.
+        let _serial = self.txn_lock.lock().unwrap();
         let kkey = k(key);
         loop {
             let mut txn = self.engine.begin();

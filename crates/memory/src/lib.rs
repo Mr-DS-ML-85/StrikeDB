@@ -244,7 +244,15 @@ impl Memory {
     }
 
     pub fn open(engine: Arc<Engine>) -> Self {
-        let vectors = VectorIndex::open(Arc::clone(&engine));
+        // LTM embeddings live in a RESERVED namespace (`vec:__ltm__:`), never
+        // the user-facing default index. Sharing the default namespace meant
+        // two separate in-RAM graphs (Router's and Memory's) over the same
+        // `vec:` keys with independent dims — after a restart the rebuild
+        // merged them, the first-inserted dim won, and mismatched-dim vectors
+        // were silently dropped (a user VADD could vanish while a memory doc
+        // answered in its place). The reserved prefix gives memory its own
+        // graph, its own dim, and keeps VLISTNS clean.
+        let vectors = VectorIndex::open_ns(Arc::clone(&engine), "__ltm__".to_string());
         // resume id counter + live count + salience cache from persisted LTM
         let mut max = 0u64;
         let mut count = 0u64;
