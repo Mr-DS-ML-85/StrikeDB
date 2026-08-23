@@ -736,6 +736,22 @@ CHECKPOINT`.
 > internal RAG corpus-generation marker re-seeding, not surviving data.
 > Scoped portion-flushes are intentionally not exposed: this is full-flush
 > only.
+>
+> **Undo.** Unlike most Redis-compatible stores, a FLUSHALL here is
+> reversible: the backup is a complete durable world (WAL + snapshot twin),
+> and recovery is untouched — so swapping the backup back in restores every
+> pre-flush key, vector and memory exactly (proven by
+> `flushall_backs_up_wal_and_wipes_state`). Restore offline while the server
+> is stopped:
+>
+> ```bash
+> # after FLUSHALL, undo it:
+> mv dbstrike.wal dbstrike.wal.discarded          # keep or drop the empty world
+> mv -f dbstrike.wal.bak-<ms> dbstrike.wal
+> mv -f dbstrike.wal.bak-<ms>.snap dbstrike.wal.snap # only if a snapshot existed pre-flush
+> # restart — open() loads the restored snapshot + replays the restored WAL
+> ```
+>
 > `COMMAND` returns an empty array (benchmark compat).
 > `HELLO` is served pre-auth with RESP2/RESP3 negotiation: proto-2 clients get
 > the classic flat array, proto-3 clients get a real `%` map and subsequent

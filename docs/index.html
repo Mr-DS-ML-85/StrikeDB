@@ -664,7 +664,7 @@ python3 tests/test_dbstrike.py</code></pre>
         <tr><td><code>KEYS / DBSIZE</code></td><td>prefix / —</td><td>array / count</td></tr>
         <tr><td><code>SELECT / COMMAND</code></td><td>—</td><td>OK / empty array (compat)</td></tr>
         <tr><td><code>HELLO [proto]</code></td><td>[2|3]</td><td>handshake map — RESP2 &amp; RESP3 clients both connect</td></tr>
-        <tr><td><code>FLUSHALL / FLUSHDB</code></td><td>—</td><td>OK — real full wipe: WAL+snapshot backed up to <code>&lt;wal&gt;.bak-&lt;ms&gt;</code>, counters &amp; caches reset, crash-safe, zero-copy</td></tr>
+        <tr><td><code>FLUSHALL / FLUSHDB</code></td><td>—</td><td>OK — real full wipe: WAL+snapshot backed up to <code>&lt;wal&gt;.bak-&lt;ms&gt;</code> (restorable offline — undo a flush by swapping the backup back), counters &amp; caches reset, crash-safe, zero-copy</td></tr>
         <tr><td><code>QUIT</code></td><td>—</td><td>closes connection</td></tr>
       </table></div>
 
