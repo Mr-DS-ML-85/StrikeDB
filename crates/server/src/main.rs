@@ -1019,6 +1019,13 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         // wired here by design: this is the full-flush only.
         "FLUSHALL" | "FLUSHDB" => match db.router.flush_all_with_backup() {
             Ok(bak) => {
+                // The wipe removed every mem:* payload from the substrate;
+                // Memory's RAM mirrors (id allocator, live count, salience
+                // cache, semantic graph) and the RAG query cache must drop
+                // their ghost state too, or MEM.COUNT keeps reporting the
+                // wiped corpus and ids continue past deleted records.
+                db.rag.memory().reset_volatile();
+                db.rag.invalidate_query_cache();
                 eprintln!("[FLUSH] full wipe OK · pre-flush world backed up at {bak}");
                 Resp::Simple("OK".into())
             }

@@ -280,6 +280,20 @@ impl Memory {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Reset every in-RAM structure derived from durable LTM state: the id
+    /// allocator, live count, episodic seq counter, salience mirror and the
+    /// semantic HNSW graph. Called by FLUSHALL right after the engine wipe —
+    /// the `mem:*` payloads are already gone at that point, so these mirrors
+    /// must not keep reporting a ghost corpus (MEM.COUNT stuck at N, ids
+    /// continuing past wiped records).
+    pub fn reset_volatile(&self) {
+        self.next_id.store(1, std::sync::atomic::Ordering::SeqCst);
+        self.ep_seq.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.ltm_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.salience_cache.write().unwrap().clear();
+        self.vectors.reset_ram();
+    }
+
     // ── WORKING MEMORY (STM) ───────────────────────────────────────────────
     pub fn wm_set(
         &self,
@@ -977,6 +991,31 @@ mod tests {
         // Meta round-trips the owner through encode/decode (v3).
         let rec = m.ltm_get(a.iter().find(|h| h.text.contains("AKIA")).unwrap().id).unwrap();
         assert_eq!(rec.meta.owner, "alice");
+    }
+
+    /// FLUSHALL must reset Memory's RAM mirrors, not just the substrate:
+    /// MEM.COUNT must drop to 0 and the id allocator must restart at 1 —
+    /// otherwise the engine is empty but the API reports a ghost corpus.
+    #[test]
+    fn reset_volatile_after_flush_clears_mirrors() {
+        let e = eng();
+        let m = Memory::open(Arc::clone(&e));
+        let v = |s: &str| vec![s.len() as f32, 1.0, 0.5];
+        m.ltm_store("fact one about rust", v("rust"), "doc", 0.9, "t", "default").unwrap();
+        m.ltm_store("fact two about llvm", v("llvm"), "doc", 0.8, "t", "default").unwrap();
+        assert_eq!(m.ltm_count(), 2);
+        assert!(m.recall("rust", &v("rust"), 5).len() >= 1);
+
+        // Exactly what the server's FLUSHALL does: engine wipe + mirror reset.
+        e.flushall_with_backup().unwrap();
+        m.reset_volatile();
+
+        assert_eq!(m.ltm_count(), 0, "MEM.COUNT must be 0 after flush");
+        assert!(m.recall("rust", &v("rust"), 5).is_empty(), "no ghost hits");
+        // Id allocator restarts where a fresh engine starts: first id = 1.
+        let id = m.ltm_store("fresh after flush", v("fresh"), "doc", 0.5, "t", "default").unwrap();
+        assert_eq!(id, 1, "ids must restart at 1 after flush, got {id}");
+        assert_eq!(m.ltm_count(), 1);
     }
 
     /// Legacy v2 meta blobs (no owner) still decode after the version bump —

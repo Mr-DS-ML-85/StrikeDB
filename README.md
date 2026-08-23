@@ -724,12 +724,18 @@ CHECKPOINT`.
 > `FLUSHALL`/`FLUSHDB` perform a **real full wipe**: the live WAL (and its
 > `.snap` checkpoint) are atomically renamed to `<wal>.bak-<millis>` — an
 > instant zero-copy backup of the entire pre-flush world — then removed and a
-> fresh WAL is opened. Every shard map and vector graph is cleared; DBSIZE
-> drops to 0 immediately, nothing resurrects across restarts. The wipe runs
-> as one serialized step on the group-commit flusher thread, so it can never
-> interleave with an in-flight commit, and a crash mid-flush leaves either
-> the old world or the new one on disk — never a mixture. Scoped
-> portion-flushes are intentionally not exposed: this is full-flush only.
+> fresh WAL is opened. Every shard map, vector graph and agent-memory mirror
+> (`MEM.COUNT`, id allocator, salience cache, semantic recall graph) is
+> cleared; DBSIZE drops to 0 and ids restart at 1 immediately, nothing
+> resurrects across restarts. The wipe runs as one serialized step on the
+> group-commit flusher thread, so it can never interleave with an in-flight
+> commit, and a crash mid-flush leaves either the old world or the new one on
+> disk — never a mixture. The RAG query cache (RAM) is invalidated too, since
+> cached id lists would otherwise point at deleted memories; as a result
+> DBSIZE may read 1 immediately after the flush — that single key is the
+> internal RAG corpus-generation marker re-seeding, not surviving data.
+> Scoped portion-flushes are intentionally not exposed: this is full-flush
+> only.
 > `COMMAND` returns an empty array (benchmark compat).
 > `HELLO` is served pre-auth with RESP2/RESP3 negotiation: proto-2 clients get
 > the classic flat array, proto-3 clients get a real `%` map and subsequent

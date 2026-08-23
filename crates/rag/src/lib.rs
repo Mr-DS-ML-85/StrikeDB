@@ -77,6 +77,13 @@ impl Rag {
             .cache
             .source_set("rag:corpus_gen", (cur + 1).to_string().as_bytes());
     }
+
+    /// Invalidate every cached RAG query result. Called by FLUSHALL after the
+    /// substrate wipe: cached id lists would otherwise point at deleted
+    /// memories (and a gen-0 collision could even serve them as "cached").
+    pub fn invalidate_query_cache(&self) {
+        self.bump_corpus();
+    }
     fn corpus_gen(&self) -> u64 {
         // read straight from the source engine (authoritative, bypasses cache)
         self.cache

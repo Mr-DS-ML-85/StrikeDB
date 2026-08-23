@@ -489,6 +489,17 @@ other user's memories. A cross-tenant leak in the flagship feature.
 - Full suite: 180 passed / 0 failed.
 
 ### Same-day adjacent fixes
+- **FLUSHALL mirror-reset bug (found in external testing)**: the first FLUSHALL
+  implementation wiped the substrate but Memory's RAM mirrors survived —
+  `MEM.COUNT` stayed at 8186 and ids continued at 8187 over an empty engine.
+  Fixed with `Memory::reset_volatile()` (id allocator → 1, ltm_count → 0,
+  ep_seq → 0, salience cache cleared, semantic HNSW graph reset) plus
+  `Rag::invalidate_query_cache()` (the MITM query cache is RAM-backed, so its
+  id lists would survive a substrate wipe). Regression test:
+  `reset_volatile_after_flush_clears_mirrors`. Verified live: COUNT 3→0, next
+  id 1, scoped recalls empty. Note: DBSIZE may read 1 immediately after a
+  flush — that is the internal RAG corpus-generation marker re-seeding, not
+  surviving data.
 - **FLUSHALL/FLUSHDB is real now**: WAL + `.snap` atomically renamed to
   `<wal>.bak-<millis>` (zero-copy backup of the entire pre-flush world),
   fresh WAL opened, shard maps + vector graphs cleared. Runs serialized on
