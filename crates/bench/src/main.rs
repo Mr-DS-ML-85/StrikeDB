@@ -471,20 +471,20 @@ fn s7_memory() {
 
     // LTM store + recall
     let id_a = mem.ltm_store("Rust ownership prevents data races",
-                              deterministic_vec(1, 16), "doc:rust", 0.8, "seed").unwrap();
+                              deterministic_vec(1, 16), "doc:rust", 0.8, "seed", "default").unwrap();
     let _id_b = mem.ltm_store("Python has a global interpreter lock",
-                              deterministic_vec(2, 16), "doc:py", 0.6, "seed").unwrap();
+                              deterministic_vec(2, 16), "doc:py", 0.6, "seed", "default").unwrap();
     let hits = mem.recall("rust ownership", &deterministic_vec(1, 16), 3);
     check("LTM recall finds relevant doc",
           hits.iter().any(|h| h.text.contains("Rust")), &format!("hits={}", hits.len()));
 
     // Graph — link + traverse
     let alice = mem.ltm_store("Alice engineer",
-                               deterministic_vec(10, 16), "profile:a", 0.5, "seed").unwrap();
+                               deterministic_vec(10, 16), "profile:a", 0.5, "seed", "default").unwrap();
     let acme = mem.ltm_store("Acme corp",
-                              deterministic_vec(11, 16), "profile:acme", 0.5, "seed").unwrap();
+                              deterministic_vec(11, 16), "profile:acme", 0.5, "seed", "default").unwrap();
     let nyc = mem.ltm_store("New York City",
-                             deterministic_vec(12, 16), "profile:nyc", 0.5, "seed").unwrap();
+                             deterministic_vec(12, 16), "profile:nyc", 0.5, "seed", "default").unwrap();
     mem.link(alice, acme, "works_at", 0.9).unwrap();
     mem.link(acme, nyc, "located_in", 1.0).unwrap();
     let path = mem.traverse(alice, 2, "");
@@ -499,21 +499,21 @@ fn s7_memory() {
     let vec_cto = deterministic_vec(20, 16);
     let vec_ceo = deterministic_vec(21, 16);
     let cto_id = mem.ltm_store_temporal("Alice is CTO",
-        vec_cto.clone(), "hr", 0.9, "seed", 1000, 2000).unwrap();
+        vec_cto.clone(), "hr", 0.9, "seed", 1000, 2000, "default").unwrap();
     let ceo_id = mem.ltm_store_temporal("Alice is CEO",
-        vec_ceo.clone(), "hr", 0.9, "seed", 2000, 0).unwrap();
-    let past = mem.recall_as_of("title", &deterministic_vec(20, 16), 5, 1500);
+        vec_ceo.clone(), "hr", 0.9, "seed", 2000, 0, "default").unwrap();
+    let past = mem.recall_as_of("default", "title", &deterministic_vec(20, 16), 5, 1500);
     let past_ids: Vec<u64> = past.iter().map(|h| h.id).collect();
     check("as-of 1500 sees CTO fact",
           past_ids.contains(&cto_id) && !past_ids.contains(&ceo_id),
           &format!("ids={past_ids:?}"));
-    let now = mem.recall_as_of("title", &deterministic_vec(21, 16), 5, 3000);
+    let now = mem.recall_as_of("default", "title", &deterministic_vec(21, 16), 5, 3000);
     let now_ids: Vec<u64> = now.iter().map(|h| h.id).collect();
     check("as-of 3000 sees CEO fact",
           now_ids.contains(&ceo_id) && !now_ids.contains(&cto_id),
           &format!("ids={now_ids:?}"));
     mem.ltm_invalidate(ceo_id, 4000).unwrap();
-    let after = mem.recall_as_of("title", &deterministic_vec(21, 16), 5, 5000);
+    let after = mem.recall_as_of("default", "title", &deterministic_vec(21, 16), 5, 5000);
     let after_ids: Vec<u64> = after.iter().map(|h| h.id).collect();
     check("as-of 5000 excludes invalidated CEO fact",
           !after_ids.contains(&ceo_id), &format!("ids={after_ids:?}"));
@@ -555,9 +555,9 @@ fn s7b_memory_durability() {
     let dim = 16usize;
     // LTM + graph
     let rust_id = mem1.ltm_store("Rust ownership prevents data races",
-                                 deterministic_vec(1, dim), "doc:rust", 0.8, "seed").unwrap();
+                                 deterministic_vec(1, dim), "doc:rust", 0.8, "seed", "default").unwrap();
     let py_id = mem1.ltm_store("Python has a GIL",
-                               deterministic_vec(2, dim), "doc:py", 0.6, "seed").unwrap();
+                               deterministic_vec(2, dim), "doc:py", 0.6, "seed", "default").unwrap();
     mem1.link(rust_id, py_id, "related_to", 0.9).unwrap();
     // WM with TTL
     mem1.wm_set("agent-a", "task", b"write the report", 60_000, now_ms()).unwrap();
@@ -601,7 +601,7 @@ fn s7b_memory_durability() {
           &format!("count={pre_count}"));
     // ── id counter resumed (new store gets a higher id, no collision) ──
     let new_id = mem2.ltm_store("a third fact",
-                                deterministic_vec(3, dim), "doc:x", 0.5, "seed").unwrap();
+                                deterministic_vec(3, dim), "doc:x", 0.5, "seed", "default").unwrap();
     check("id counter resumed (no collision after reopen)",
           new_id > rust_id && new_id > py_id,
           &format!("new_id={new_id} rust={rust_id}"));
@@ -645,23 +645,23 @@ fn s8_rag() {
         v
     };
     rag.ingest("Rust ownership prevents data races at compile time",
-               embed("rust ownership races", 32), "doc:rust").unwrap();
+               embed("rust ownership races", 32), "doc:rust", "default").unwrap();
     rag.ingest("HNSW is a graph index for approximate nearest neighbor search",
-               embed("hnsw graph ann", 32), "doc:ann").unwrap();
+               embed("hnsw graph ann", 32), "doc:ann", "default").unwrap();
     rag.ingest("BM25 is the standard sparse retrieval scoring function",
-               embed("bm25 sparse retrieval", 32), "doc:bm25").unwrap();
+               embed("bm25 sparse retrieval", 32), "doc:bm25", "default").unwrap();
 
     let q = "nearest neighbor graph";
-    let (hits, cached) = rag.retrieve_cached(q, &embed(q, 32), 3);
+    let (hits, cached) = rag.retrieve_cached("default", q, &embed(q, 32), 3);
     check("first retrieve is FRESH (cache miss)", !cached, "");
     check("top hit is topically relevant",
           hits.first().map(|h| h.text.contains("HNSW")).unwrap_or(false),
           &format!("top={:?}", hits.first().map(|h| &h.text)));
-    let (_, cached2) = rag.retrieve_cached(q, &embed(q, 32), 3);
+    let (_, cached2) = rag.retrieve_cached("default", q, &embed(q, 32), 3);
     check("second retrieve is CACHED", cached2, "");
     rag.ingest("Approximate nearest neighbor benefits from quantization",
-               embed("ann quantization", 32), "doc:pq").unwrap();
-    let (_, cached3) = rag.retrieve_cached(q, &embed(q, 32), 3);
+               embed("ann quantization", 32), "doc:pq", "default").unwrap();
+    let (_, cached3) = rag.retrieve_cached("default", q, &embed(q, 32), 3);
     check("post-ingest retrieve is FRESH again (corpus gen bumped)",
           !cached3, "");
 }

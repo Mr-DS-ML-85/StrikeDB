@@ -453,3 +453,52 @@ is a vendored copy. **Edit canonical, then re-vendor:**
 ```bash
 rm -rf crates/vugva-core/src && cp -r /home/irfan/Desktop/VUGVA/vugva/src crates/vugva-core/src
 ```
+
+---
+
+## 8. Per-agent LTM recall scoping — the cross-tenant leak (FIXED, 2026-08-24)
+
+### The bug
+Working memory, episodic and procedural memory were always per-agent
+(`mem:wm:<agent>:…`, `mem:ep:<agent>:…`, `mem:proc:<agent>:…`), but **LTM —
+the semantic recall pool — was global**. `MEM.RECALL k query f1...` had no
+agent identity at all: any agent (or anonymous connection) could recall every
+other user's memories. A cross-tenant leak in the flagship feature.
+
+### The fix (meta v3)
+- `Meta.owner: String` added; meta format bumped to v3
+  (`[ver][src][ts][sal][vf][vt][owner_lp][lineage]`). v1/v2 blobs decode with
+  `owner = ""` so old WALs open unchanged.
+- `recall_scoped(scope, …)` filters hits by owner BEFORE top-k truncation,
+  with a 3× overfetch so scoped recall still fills k. Legacy records
+  (`owner == ""`) stay visible to every scope — documented migration
+  semantics for pre-scoping corpora.
+- Wire API — optional leading token pair, zero breaking changes:
+  `MEM.REMEMBER | MEM.REMEMBER.T | MEM.RECALL | MEM.RECALL.AS_OF |
+  RAG.INGEST | RAG.SEARCH | RAG.CONTEXT` all accept `[AGENT <name>]`.
+  No token → scope "default".
+- RAG query cache key now includes the scope
+  (`rag:q:{gen}:{scope}:{k}:{query}`) — agent A can never be served agent B's
+  cached retrieval.
+
+### Verification
+- Unit: `ltm_recall_is_agent_scoped` (alice/bob/default isolation +
+  legacy visibility + owner round-trip), `v2_meta_decodes_with_empty_owner`.
+- Live RESP: alice recalls only her vault code, bob only his; unscoped default
+  pool returns neither; isolation survives kill -9 restart.
+- Full suite: 180 passed / 0 failed.
+
+### Same-day adjacent fixes
+- **FLUSHALL/FLUSHDB is real now**: WAL + `.snap` atomically renamed to
+  `<wal>.bak-<millis>` (zero-copy backup of the entire pre-flush world),
+  fresh WAL opened, shard maps + vector graphs cleared. Runs serialized on
+  the group-commit flusher thread — cannot interleave with in-flight commits;
+  crash-safe either way. Storage tests cover restorability + concurrent-commit
+  serialization.
+- **HELLO + RESP3 negotiation**: redis-py ≥ 8 sends HELLO unconditionally and
+  defaults to RESP3. Server now serves HELLO pre-auth (handshake must not be
+  NOAUTH-gated), replies `%` map claiming proto 3 when asked, switches nulls
+  to `_` per connection (`write_resp_buf_as`). Embedded
+  `HELLO proto AUTH u p` honored via dispatch_auth.
+- **parse_floats accepts single-bulk vectors**: `VADD 11 "0.5 0.1 0.9"`
+  alongside one-float-per-arg form.

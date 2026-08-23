@@ -58,10 +58,11 @@ impl Rag {
         text: &str,
         embedding: Vec<f32>,
         source: &str,
+        owner: &str,
     ) -> std::io::Result<u64> {
         let id = self
             .memory
-            .ltm_store(text, embedding, source, 0.5, "rag:ingest")?;
+            .ltm_store(text, embedding, source, 0.5, "rag:ingest", owner)?;
         // any ingest invalidates the whole query cache generation
         self.bump_corpus();
         Ok(id)
@@ -85,13 +86,20 @@ impl Rag {
     }
 
     /// Hybrid retrieve with Reciprocal Rank Fusion over dense + sparse lists.
-    pub fn retrieve(&self, query: &str, query_vec: &[f32], k: usize) -> Vec<Retrieved> {
+    pub fn retrieve_scoped(
+        &self,
+        scope: &str,
+        query: &str,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Vec<Retrieved> {
         let pool = (k * 4).max(20);
 
         // Single blended pass — the previous version called `recall` twice with
         // identical args, doubling every ANN + keyword scan. We now derive both
-        // dense and sparse orderings from one pass.
-        let blended = self.memory.recall(query, query_vec, pool);
+        // dense and sparse orderings from one pass. Scoped to the requesting
+        // agent so cross-agent recall is impossible.
+        let blended = self.memory.recall_scoped(scope, query, query_vec, pool);
 
         // dense list (ANN) — semantic ranking (already in blended order by score)
         let dense: Vec<(u64, f32)> = blended
@@ -150,12 +158,15 @@ impl Rag {
     /// (results, served_from_cache).
     pub fn retrieve_cached(
         &self,
+        scope: &str,
         query: &str,
         query_vec: &[f32],
         k: usize,
     ) -> (Vec<Retrieved>, bool) {
         let gen = self.corpus_gen();
-        let ckey = format!("rag:q:{gen}:{k}:{query}");
+        // Scope is part of the cache key: agent A must never be served
+        // agent B's cached retrieval.
+        let ckey = format!("rag:q:{gen}:{scope}:{k}:{query}");
         let (cached, verdict) = self.cache.cache_get(&ckey);
         if let Some(bytes) = cached {
             if !verdict.is_bug() {
@@ -177,7 +188,7 @@ impl Rag {
                 }
             }
         }
-        let results = self.retrieve(query, query_vec, k);
+        let results = self.retrieve_scoped(scope, query, query_vec, k);
         // also register the cache-source value so staleness is detectable
         let payload = encode_ids(&results);
         let _ = self.cache.source_set(&ckey, &payload);
@@ -186,8 +197,8 @@ impl Rag {
     }
 
     /// Assemble a prompt-ready context block from the top-k chunks.
-    pub fn context_block(&self, query: &str, query_vec: &[f32], k: usize) -> String {
-        let hits = self.retrieve(query, query_vec, k);
+    pub fn context_block(&self, scope: &str, query: &str, query_vec: &[f32], k: usize) -> String {
+        let hits = self.retrieve_scoped(scope, query, query_vec, k);
         let mut s = String::new();
         for (i, h) in hits.iter().enumerate() {
             s.push_str(&format!("[{}] ({}) {}\n", i + 1, h.source, h.text));
@@ -248,12 +259,12 @@ mod tests {
     #[test]
     fn hybrid_retrieve_finds_relevant() {
         let r = Rag::open(eng());
-        r.ingest("Rust ownership prevents data races at compile time", emb("rust ownership data races"), "doc:rust").unwrap();
-        r.ingest("Python uses a global interpreter lock called the GIL", emb("python gil interpreter lock"), "doc:python").unwrap();
-        r.ingest("HNSW is a graph index for approximate nearest neighbor search", emb("hnsw graph index nearest neighbor"), "doc:ann").unwrap();
+        r.ingest("Rust ownership prevents data races at compile time", emb("rust ownership data races"), "doc:rust", "default").unwrap();
+        r.ingest("Python uses a global interpreter lock called the GIL", emb("python gil interpreter lock"), "doc:python", "default").unwrap();
+        r.ingest("HNSW is a graph index for approximate nearest neighbor search", emb("hnsw graph index nearest neighbor"), "doc:ann", "default").unwrap();
 
         let q = "nearest neighbor graph index";
-        let hits = r.retrieve(q, &emb(q), 3);
+        let hits = r.retrieve_scoped("default", q, &emb(q), 3);
         assert!(!hits.is_empty());
         assert_eq!(hits[0].source, "doc:ann");
     }
@@ -261,16 +272,16 @@ mod tests {
     #[test]
     fn cache_serves_then_invalidates_on_ingest() {
         let r = Rag::open(eng());
-        r.ingest("the sky is blue during the day", emb("sky blue day"), "doc:1").unwrap();
+        r.ingest("the sky is blue during the day", emb("sky blue day"), "doc:1", "default").unwrap();
         let q = "sky color";
-        let (_, cached1) = r.retrieve_cached(q, &emb(q), 2);
+        let (_, cached1) = r.retrieve_cached("default", q, &emb(q), 2);
         assert!(!cached1); // first call computes
-        let (_, cached2) = r.retrieve_cached(q, &emb(q), 2);
+        let (_, cached2) = r.retrieve_cached("default", q, &emb(q), 2);
         assert!(cached2); // second call served from cache
 
         // new ingest bumps corpus generation -> cache key changes -> recompute
-        r.ingest("the ocean is also blue", emb("ocean blue water"), "doc:2").unwrap();
-        let (_, cached3) = r.retrieve_cached(q, &emb(q), 2);
+        r.ingest("the ocean is also blue", emb("ocean blue water"), "doc:2", "default").unwrap();
+        let (_, cached3) = r.retrieve_cached("default", q, &emb(q), 2);
         assert!(!cached3);
     }
 }

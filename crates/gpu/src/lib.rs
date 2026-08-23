@@ -909,6 +909,17 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
     let _guard = gpu_lock_and_ensure()?;
     unsafe {
         let t_total = std::time::Instant::now();
+        // Cumulative GPU-build budget. The 30s watchdog bounds each sync site,
+        // but a *legitimate* 5M build runs ~1000s of near-continuous kernel
+        // work — on a display-driving GPU that parks the desktop for the whole
+        // run (feels like a crash). If the whole build exceeds this budget we
+        // abort the GPU path so the caller falls back to a CPU build, keeping
+        // the desktop responsive. Default 120s; override with GPU_BUILD_BUDGET_SECS.
+        let budget_secs: u64 = std::env::var("GPU_BUILD_BUDGET_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(120);
+        let budget = std::time::Duration::from_secs(budget_secs);
         let k = k_init;
         // Pivot count is CAPPED. The old code used n/50 pivots and scanned the
         // FULL corpus once per pivot — O(n²/50) work that took 160s at 1M.
@@ -994,7 +1005,16 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
             // ~3 MB memcpy per batch (8192 × 384 B), sitting on the critical
             // path between two kernel launches where it keeps the device idle.
             let q_buf = &vectors_i8[as_start * dim..as_end * dim];
-            if let Some((indices, distances)) = bufs.run(q_buf, q_count, seed_count) {
+            let Some((indices, distances)) = bufs.run(q_buf, q_count, seed_count) else {
+                // Watchdog abort or device failure mid-seeding. MUST NOT skip
+                // the batch and keep building: those nodes would keep a zero
+                // assignment and an empty graph, silently producing a garbage
+                // index that reports success. Abort the whole GPU build so the
+                // caller falls back to CPU cleanly.
+                bufs.free();
+                eprintln!("[GPU] APGC seeding aborted (watchdog/device) at batch {as_start}..{as_end} of {n} — CPU fallback");
+                return None;
+            };
                 for qi in 0..q_count {
                     let vid = as_start + qi;
                     let mut cands: Vec<(f32, i32, i32)> = (0..k).filter_map(|j| {
@@ -1011,7 +1031,6 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
                     }
                     graph[vid] = cands.into_iter().take(k).map(|(_, g, _)| g).collect();
                 }
-            }
         }
         eprintln!("[GPU] APGC pivot assign: {n} nodes vs {seed_count} pivots in {:.1}s", t_add.elapsed().as_secs_f64());
 
@@ -1094,7 +1113,14 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
         // Two passes: pass 1 pulls in seeds' true kNN (Phase 1 edges), pass 2
         // propagates neighbor-of-neighbor edges → a proper local kNN graph.
         let t_ref = std::time::Instant::now();
-        let nthreads = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(8);
+        // Budget gate before the expensive refine phase: seeding + locality
+        // already ran, so if we are past the budget here, skip GPU refine
+        // (which would otherwise run ~1000s on a 5M build) and fall back to CPU.
+        if t_total.elapsed() >= budget {
+            bufs.free();
+            eprintln!("[GPU] APGC refine skipped: GPU build budget {budget_secs}s reached at {:.1}s — CPU fallback", t_total.elapsed().as_secs_f64());
+            return None;
+        }
         // True NN-Descent (APGC paper §3.2): candidates come from BOTH forward
         // neighbors' lists AND reverse neighbors' lists. Forward-only expansion
         // converges too slowly at 100k+ (recall stalls ~0.82); reverse edges
@@ -1176,12 +1202,25 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
         if gpu_refined {
             eprintln!("[GPU] APGC refine: {passes} NN-descent passes ON GPU over {n} nodes in {:.1}s", t_ref.elapsed().as_secs_f64());
         } else {
+        // CPU NN-descent fallback. Two constraints matter on a desktop box:
+        //   * leave at least one core for the compositor/UI — a 12-thread
+        //     refine at 5M previously pegged every core for ~17 min and the
+        //     desktop froze solid (reported as a crash);
+        //   * reuse the reverse-adjacency buffers across passes — per-pass
+        //     `vec![Vec::new(); n]` allocates 60M small Vecs over 12 passes
+        //     at 5M, which dominates the scalar scoring cost.
+        let nthreads = std::thread::available_parallelism().map(|v| v.get().saturating_sub(1).max(1)).unwrap_or(4);
+        let mut rev: Vec<Vec<i32>> = Vec::with_capacity(n);
+        rev.resize_with(n, Vec::new);
+        let ids: Vec<usize> = (0..n).collect();
+        let chunk = (ids.len() + nthreads - 1) / nthreads.max(1);
         for pass in 0..passes {
             // Expand through the closest `expand` neighbors' edge lists.
             let expand = if pass == 0 { 4 } else { 10 };
             // Reverse adjacency (capped per node): who points at v?
+            // Reused across passes: clear in place, keep the allocated capacity.
             let rev_cap = 16usize;
-            let mut rev: Vec<Vec<i32>> = vec![Vec::new(); n];
+            for list in rev.iter_mut() { list.clear(); }
             for v in 0..n {
                 for &nb in &graph[v] {
                     let nu = nb as usize;
@@ -1190,9 +1229,6 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
             }
             let rev_ref: &Vec<Vec<i32>> = &rev;
             let prev: &Vec<Vec<i32>> = &graph;
-            let _ = pass;
-            let ids: Vec<usize> = (0..n).collect();
-            let chunk = (ids.len() + nthreads - 1) / nthreads.max(1);
             let refined: Vec<(usize, Vec<i32>)> = std::thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for c in ids.chunks(chunk.max(1)) {

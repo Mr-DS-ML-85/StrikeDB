@@ -211,7 +211,7 @@ end-to-end in the native Rust bench in `--tcp` mode.
 | Memory type | Primitive from | StrikeDB API | Key format |
 |---|---|---|---|
 | Working memory (STM) | Redis | `wm_set`/`wm_get` (TTL) | `mem:wm:<agent>:<k>` |
-| Long-term semantic | Mem0 | `MEM.REMEMBER` + `MEM.RECALL` | `mem:ltm:<id>` |
+| Long-term semantic | Mem0 | `MEM.REMEMBER` + `MEM.RECALL` (owner-scoped) | `mem:ltm:<id>` |
 | Episodic (event log) | Letta recall storage | `episode` / `episodes` | `mem:ep:<agent>:<seq>` |
 | Keyword (BM25) | inverted index | rolled into `MEM.RECALL` | `mem:kw:<tok>:<id>` |
 | **Graph (typed edges)** | **Mem0 GraphRAG** | **`MEM.LINK`, `MEM.NEIGH`, `MEM.TRAV`** | `mem:edge:<from>:<rel>:<to>` |
@@ -227,6 +227,33 @@ so important memories surface. `MEM.RECALL.AS_OF <t>` restricts to facts
 whose validity interval contains `t` — the Graphiti primitive for
 non-contradictory reasoning about evolving state ("what did we know at time
 T" instead of "what do we know now").
+
+### Per-agent recall scoping (security)
+
+LTM recall is **owner-scoped**: every memory is written with an owning agent
+scope, and `MEM.RECALL` only returns memories owned by the requesting scope.
+Without this, one agent could silently recall another user's memories — a
+cross-tenant leak. All MEM/RAG commands accept an optional leading
+`AGENT <name>` token pair:
+
+```
+MEM.REMEMBER  AGENT alice "alice vault code is 1111" agent:alice 0.9 0.9 0.1
+MEM.RECALL    AGENT alice 3 "vault code" 0.5 0.5     # → only alice's memories
+MEM.RECALL    AGENT bob   3 "vault code" 0.5 0.5     # → only bob's — never alice's
+MEM.RECALL            3 "vault code" 0.5 0.5         # → default pool only
+```
+
+Supported everywhere: `MEM.REMEMBER · MEM.REMEMBER.T · MEM.RECALL ·
+MEM.RECALL.AS_OF · RAG.INGEST · RAG.SEARCH · RAG.CONTEXT`. Semantics:
+
+- **Scoped writes are invisible to other scopes** — verified by regression
+  test (`ltm_recall_is_agent_scoped`) and durable across restarts.
+- **The unscoped/default pool never leaks agent memories** either direction.
+- The RAG query cache keys include the scope, so agent A can never be served
+  agent B's cached retrieval.
+- Records written before scoping shipped (`owner == ""`) are LEGACY: visible
+  to every scope so existing corpora keep working. New writes always carry an
+  owner; run `FLUSHALL` + reload to purge legacy data entirely.
 
 ---
 
@@ -694,8 +721,20 @@ VSEARCH · VSEARCHNS · VSEARCHA · VSEARCHANS · VSEARCH.MANY · VSEARCH.MANYNS
 REDUCE.PROGRAM · MEM.* · RAG.* · RAG.CONTEXT · CACHE.* · GETAT · SCAN ·
 CHECKPOINT`.
 
-> `FLUSHALL`/`FLUSHDB` are **no-ops** (return `+OK` but never wipe durable data) —
-> and `COMMAND` returns an empty array. Both are intentional.
+> `FLUSHALL`/`FLUSHDB` perform a **real full wipe**: the live WAL (and its
+> `.snap` checkpoint) are atomically renamed to `<wal>.bak-<millis>` — an
+> instant zero-copy backup of the entire pre-flush world — then removed and a
+> fresh WAL is opened. Every shard map and vector graph is cleared; DBSIZE
+> drops to 0 immediately, nothing resurrects across restarts. The wipe runs
+> as one serialized step on the group-commit flusher thread, so it can never
+> interleave with an in-flight commit, and a crash mid-flush leaves either
+> the old world or the new one on disk — never a mixture. Scoped
+> portion-flushes are intentionally not exposed: this is full-flush only.
+> `COMMAND` returns an empty array (benchmark compat).
+> `HELLO` is served pre-auth with RESP2/RESP3 negotiation: proto-2 clients get
+> the classic flat array, proto-3 clients get a real `%` map and subsequent
+> null replies switch to `_` — redis-py ≥ 8 (RESP3 default), go-redis and
+> jedis connect out of the box.
 > `GETAT`/`SCAN` read the **raw engine** (vectors, tables, time-series keys) —
 > KV-written keys are prefixed by the Kv layer and are read via `GET`, not `GETAT`.
 

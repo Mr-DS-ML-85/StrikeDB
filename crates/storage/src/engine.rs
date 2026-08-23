@@ -137,6 +137,68 @@ impl Mutation {
     }
 }
 
+// ── WAL record framing ────────────────────────────────────────────────
+// Tagged so a whole commit (a `put_batch`, e.g. a bulk load) is ONE WAL
+// frame. A frame is atomic: `Wal::replay` either gets the whole frame
+// (CRC valid → all mutations apply) or stops at a torn/corrupt frame and
+// drops it entirely — never a partial batch. Without this, a crash during
+// the append of a 400k-mutation load would replay the first N records and
+// leave a half-loaded namespace.
+const WAL_TAG_SINGLE: u8 = 0x01;
+const WAL_TAG_BATCH: u8 = 0x02;
+
+fn encode_single_record(m: &Mutation) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + m.encode().len());
+    out.push(WAL_TAG_SINGLE);
+    out.extend_from_slice(&m.encode());
+    out
+}
+
+fn encode_batch_record(muts: &[Mutation]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(WAL_TAG_BATCH);
+    out.extend_from_slice(&(muts.len() as u64).to_le_bytes());
+    for m in muts {
+        let enc = m.encode();
+        out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+        out.extend_from_slice(&enc);
+    }
+    out
+}
+
+/// Decode one WAL frame into zero or more mutations. Accepts the tagged
+/// single/batch frames written by the current flusher, plus legacy untagged
+/// records (which decode as a single mutation) so an older WAL still opens.
+fn decode_records(rec: &[u8]) -> Vec<Mutation> {
+    match rec.first() {
+        Some(&WAL_TAG_BATCH) => {
+            let mut out = Vec::new();
+            if rec.len() < 9 {
+                return out;
+            }
+            let count = u64::from_le_bytes(rec[1..9].try_into().unwrap()) as usize;
+            let mut p = 9usize;
+            for _ in 0..count {
+                if p + 4 > rec.len() {
+                    break;
+                }
+                let len = u32::from_le_bytes(rec[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                if p + len > rec.len() {
+                    break;
+                }
+                if let Some(m) = Mutation::decode(&rec[p..p + len]) {
+                    out.push(m);
+                }
+                p += len;
+            }
+            out
+        }
+        Some(&WAL_TAG_SINGLE) => Mutation::decode(&rec[1..]).into_iter().collect(),
+        _ => Mutation::decode(rec).into_iter().collect(),
+    }
+}
+
 /// Callback invoked for every committed mutation (used by the reactive layer).
 pub type Subscriber = Arc<dyn Fn(&Mutation) + Send + Sync>;
 
@@ -146,6 +208,15 @@ pub type Subscriber = Arc<dyn Fn(&Mutation) + Send + Sync>;
 /// trick Postgres/MySQL/Kafka use to scale durable writes across many cores).
 struct PendingWrite {
     muts: Vec<Mutation>,
+    /// Full-flush op (`FLUSHALL`): when `Some(backup_path)`, the flusher
+    /// fsyncs the live WAL, atomically renames it (plus its `.snap`) to the
+    /// backup path, reopens a fresh empty WAL and clears every shard map.
+    /// Routing the wipe through this queue serializes it against in-flight
+    /// commits on the single flusher thread — it can never interleave with
+    /// a batch that was drained before it, and later commits land on the
+    /// fresh WAL. `None` for ordinary commits (the overwhelmingly common
+    /// case), so the hot path is untouched.
+    flush_all: Option<String>,
     state: Mutex<WriteState>,
     cond: Condvar,
 }
@@ -203,6 +274,16 @@ fn write_snapshot(
     f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp_path, snap_path)?;
+
+    // Durability sandwich: the rename is a directory-entry change. If the
+    // power dies after the WAL is truncated but before this rename reaches
+    // disk, both the snapshot and the log would be gone. fsync the parent
+    // directory so the rename is as durable as the file it points at.
+    if let Some(parent) = snap_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -384,7 +465,7 @@ impl Engine {
         let mut wal = Wal::open(&wal_path)?;
         let records = wal.replay()?;
         for rec in records {
-            if let Some(m) = Mutation::decode(&rec) {
+            for m in decode_records(&rec) {
                 max_ts = max_ts.max(m.ts);
                 let s = shard_of(&m.key);
                 shard_data[s].entry(m.key).or_default().push(m.ts, m.value);
@@ -414,7 +495,7 @@ impl Engine {
         // shutdown, drains the whole queue in one WAL append + single fsync.
         // It gets an `Arc<FlushCore>` — deliberately NOT an `Arc<Engine>`, so
         // the engine's refcount is unaffected and `Drop` stays reachable.
-        let handle = Self::spawn_flusher(Arc::clone(&core));
+        let handle = Self::spawn_flusher(Arc::clone(&core), wal_path.clone());
 
         Ok(Arc::new(Self {
             core,
@@ -676,6 +757,7 @@ impl Engine {
 
         let pending = Arc::new(PendingWrite {
             muts,
+            flush_all: None,
             state: Mutex::new(WriteState { done: false, err: None }),
             cond: Condvar::new(),
         });
@@ -702,7 +784,7 @@ impl Engine {
 /// Background group-commit flusher: drains the write queue, appends every
 /// pending mutation in one WAL write, fsyncs ONCE, applies version chains, and
 /// wakes all waiters. Stops when `shutdown` is set.
-fn spawn_flusher(core: Arc<FlushCore>) -> JoinHandle<()> {
+fn spawn_flusher(core: Arc<FlushCore>, wal_path: PathBuf) -> JoinHandle<()> {
     thread::spawn(move || loop {
         // Collect the current batch of pending writes.
         let batch: Vec<Arc<PendingWrite>> = {
@@ -721,28 +803,57 @@ fn spawn_flusher(core: Arc<FlushCore>) -> JoinHandle<()> {
             q.drain(..).collect()
         };
 
-        // Durable step: one append + one fsync for the whole batch.
-        // Batch members are appended WITHOUT per-record fsync (`append_unsynced`);
-        // the single `sync()` below is the one fsync that makes them all durable.
+        // Durable step: one append + one fsync for the whole group.
+        // Each PendingWrite is ONE commit and is written as ONE atomic frame
+        // (single or batch-tagged) — so a crash mid-append can never replay a
+        // partial batch. The single `sync()` below makes the whole group durable.
         let flush_result: io::Result<()> = (|| {
             let mut wal = core.wal.lock().unwrap();
             for pw in &batch {
-                for m in &pw.muts {
-                    wal.append_unsynced(&m.encode())?;
+                if pw.flush_all.is_some() {
+                    continue; // the flush op carries no mutations
                 }
+                let frame = if pw.muts.len() == 1 {
+                    encode_single_record(&pw.muts[0])
+                } else {
+                    encode_batch_record(&pw.muts)
+                };
+                wal.append_unsynced(&frame)?;
             }
             // single fsync amortised across the whole group
             wal.sync()
         })();
 
+        // Full-flush op: runs AFTER every earlier commit in this drained
+        // group is already durable. Backs up + removes WAL/snapshot, reopens
+        // a fresh WAL and clears all shard maps (see `perform_flush_all`).
+        // When a wipe ran, the shard-apply phase below must NOT run — those
+        // same-batch commits were logically "before the FLUSHALL" and their
+        // keys belong to the backed-up world.
+        let mut flush_all_err: Option<String> = None;
+        let wipe_ran = batch.iter().any(|pw| pw.flush_all.is_some());
+        if wipe_ran {
+            if let Some(bak) = batch.iter().find_map(|pw| pw.flush_all.clone()) {
+                match Self::perform_flush_all(&core, &wal_path, &bak) {
+                    Ok(()) => eprintln!(
+                        "[FLUSH] full wipe OK · WAL+snap backed up at {}",
+                        bak
+                    ),
+                    Err(e) => flush_all_err = Some(e.to_string()),
+                }
+            }
+        }
+
         // Visibility + broadcast happen ONLY if the durable flush succeeded.
         // Otherwise the mutations were never made durable, and subscribers must
-        // not observe a "commit" that never happened.
+        // not observe a "commit" that never happened. After a full wipe the
+        // apply is skipped too: those same-batch keys belong to the pre-flush
+        // world and must not resurrect into the wiped shard maps.
         //
         // Sharded apply: group mutations by shard and take each shard's write
         // lock only when we have work for it. Writers touching disjoint shards
         // don't serialize on a global data lock any more.
-        if flush_result.is_ok() {
+        if flush_result.is_ok() && !wipe_ran {
             let mut per_shard: Vec<Vec<(Key, u64, Value)>> =
                 (0..SHARD_COUNT).map(|_| Vec::new()).collect();
             for pw in &batch {
@@ -775,10 +886,56 @@ fn spawn_flusher(core: Arc<FlushCore>) -> JoinHandle<()> {
             st.done = true;
             if let Err(e) = &flush_result {
                 st.err = Some(e.to_string());
+            } else if let Some(e) = &flush_all_err {
+                st.err = Some(e.clone());
             }
             pw.cond.notify_all();
         }
     })
+}
+
+/// Execute one full-flush op on behalf of the flusher thread. Caller ordering
+/// guarantees: every mutation committed before this op is already fsynced to
+/// the live WAL and applied to the shard maps.
+///
+/// Steps, crash-safe at every boundary:
+///   1. fsync the live WAL so the backup is a complete durable world.
+///   2. Rename WAL → `<bak>` (atomic; same filesystem). The open fd stays
+///      valid but we replace the `Wal` object right after.
+///   3. Rename `<wal>.snap` → `<bak>.snap` if present.
+///   4. Open a fresh WAL at the original path. On failure, roll the backups
+///      back so the engine keeps its pre-flush world.
+///   5. Clear every shard map — frees all key/chain memory for real.
+fn perform_flush_all(core: &FlushCore, wal_path: &Path, bak: &str) -> io::Result<()> {
+    let mut wal = core.wal.lock().unwrap();
+    wal.sync()?;
+    let snap = snap_path_for(wal_path);
+    let snap_bak = format!("{}.snap", bak);
+    std::fs::rename(wal_path, bak)?;
+    if snap.exists() {
+        if let Err(e) = std::fs::rename(&snap, &snap_bak) {
+            // Restore the live WAL so we don't strand the engine file-less.
+            let _ = std::fs::rename(bak, wal_path);
+            return Err(e);
+        }
+    }
+    match Wal::open(wal_path) {
+        Ok(fresh) => {
+            *wal = fresh;
+        }
+        Err(e) => {
+            let _ = std::fs::rename(bak, wal_path);
+            if snap.exists() {
+                let _ = std::fs::rename(&snap_bak, &snap);
+            }
+            return Err(e);
+        }
+    }
+    drop(wal);
+    for sh in &core.shards {
+        sh.write().unwrap().clear();
+    }
+    Ok(())
 }
 
     /// One-shot durable write outside an explicit transaction.
@@ -868,6 +1025,52 @@ fn spawn_flusher(core: Arc<FlushCore>) -> JoinHandle<()> {
             b.insert(k, v);
         }
         self.commit_batch(b)
+    }
+
+    /// **Full flush (`FLUSHALL`).** Backs up the live WAL — and the checkpoint
+    /// snapshot if one exists — with an instant zero-copy rename to
+    /// `<wal>.bak-<millis>` (snapshot twin: `<...>.snap`), deletes them from
+    /// the active path, reopens a fresh empty WAL and wipes every shard map.
+    ///
+    /// Why rename instead of tombstone-per-key: a durability engine keeps its
+    /// promises by making the destructive step atomic at the filesystem level.
+    /// A 7 GB WAL becomes its own backup in one syscall; a crash mid-flush
+    /// leaves either the old world or the new one on disk, never a mixture.
+    /// Recovery is untouched: `open` still loads `<wal>.snap` + replays the
+    /// WAL, both of which simply no longer exist post-flush.
+    ///
+    /// Serialized through the group-commit flusher: commits drained before
+    /// this op are durable AND applied before the wipe; anything enqueued
+    /// after lands on the fresh WAL. Returns the WAL backup path so callers
+    /// can log/report where the pre-flush world lives.
+    pub fn flushall_with_backup(&self) -> io::Result<String> {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let backup = format!("{}.bak-{}", self.wal_path.display(), millis);
+        let pending = Arc::new(PendingWrite {
+            muts: Vec::new(),
+            flush_all: Some(backup.clone()),
+            state: Mutex::new(WriteState { done: false, err: None }),
+            cond: Condvar::new(),
+        });
+        {
+            let mut q = self.core.write_queue.lock().unwrap();
+            q.push(Arc::clone(&pending));
+        }
+        self.core.queue_cv.notify_all();
+        let mut state = pending.state.lock().unwrap();
+        while !state.done {
+            state = pending
+                .cond
+                .wait(state)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "flush wait poisoned"))?;
+        }
+        match &state.err {
+            Some(e) => Err(io::Error::new(io::ErrorKind::Other, e.clone())),
+            None => Ok(backup),
+        }
     }
 }
 
@@ -1155,5 +1358,100 @@ mod tests {
         e.put(b"post:1".to_vec(), Value::Int(3)).unwrap();
         let got = e.scan_prefix(b"user:", e.snapshot());
         assert_eq!(got.len(), 2);
+    }
+
+    /// FLUSHALL must (1) wipe live state immediately, (2) leave a complete
+    /// restorable backup of the pre-flush world (WAL + checkpoint snapshot
+    /// twin), (3) NOT resurrect wiped keys on reopen, while (4) post-flush
+    /// writes survive restarts normally. Restoring both backup files and
+    /// reopening brings every pre-flush key back — proving the rename-based
+    /// backup is a real durable world, not a truncated stub.
+    #[test]
+    fn flushall_backs_up_wal_and_wipes_state() {
+        let p = tmp("flushall.wal");
+        let bak: String;
+        {
+            let e = Engine::open(&p).unwrap();
+            e.put(b"k1".to_vec(), Value::Int(1)).unwrap();
+            e.put(b"k2".to_vec(), Value::Int(2)).unwrap();
+            // Checkpoint so k1/k2 live in <wal>.snap; the flush must back up
+            // that snapshot too, or a later open would resurrect them.
+            e.checkpoint().unwrap();
+            e.put(b"k3".to_vec(), Value::Int(3)).unwrap();
+            assert_eq!(e.dbsize(), 3);
+
+            bak = e.flushall_with_backup().unwrap();
+
+            // Live state is empty right now.
+            assert_eq!(e.dbsize(), 0);
+            assert!(e.get(b"k1").is_none());
+            // Backups exist.
+            assert!(std::path::Path::new(&bak).exists(), "WAL backup missing");
+            assert!(
+                std::path::Path::new(&format!("{}.snap", bak)).exists(),
+                "snapshot backup twin missing"
+            );
+            // Live WAL is freshly reopened (exists, zero bytes).
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), 0);
+
+            // Post-flush writes land in the fresh world.
+            e.put(b"fresh".to_vec(), Value::Int(9)).unwrap();
+        }
+        {
+            // Reopen: no resurrection of pre-flush keys, fresh key survives.
+            let e = Engine::open(&p).unwrap();
+            assert_eq!(e.dbsize(), 1, "reopen must NOT resurrect pre-flush keys");
+            assert!(e.get(b"fresh").is_some());
+            assert!(e.get(b"k3").is_none());
+        }
+        {
+            // The backup is restorable: put both files back and open.
+            std::fs::remove_file(&p).unwrap();
+            std::fs::rename(&bak, &p).unwrap();
+            let live_snap = snap_path_for(&p);
+            let _ = std::fs::remove_file(&live_snap);
+            std::fs::rename(format!("{}.snap", bak), &live_snap).unwrap();
+
+            let e = Engine::open(&p).unwrap();
+            assert_eq!(e.dbsize(), 3, "restored backup must replay all pre-flush keys");
+            assert_eq!(e.get(b"k1"), Some(Value::Int(1)));
+            assert_eq!(e.get(b"k3"), Some(Value::Int(3)));
+            assert!(e.get(b"fresh").is_none());
+        }
+    }
+
+    /// A FLUSHALL racing ordinary commits through the group-commit queue must
+    /// serialize cleanly: commits drained before the wipe are visible before
+    /// it runs, commits enqueued after land on the fresh WAL and stay.
+    #[test]
+    fn flushall_serializes_with_concurrent_commits() {
+        let p = tmp("flushall_race.wal");
+        let e = Engine::open(&p).unwrap();
+        e.put(b"pre".to_vec(), Value::Int(1)).unwrap();
+
+        let e2 = Arc::clone(&e);
+        let writer = std::thread::spawn(move || {
+            for i in 0..200i64 {
+                e2.put(format!("post:{i}").into_bytes(), Value::Int(i)).unwrap();
+            }
+        });
+        // Interleave the wipe with the writer thread's commits.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        e.flushall_with_backup().unwrap();
+        writer.join().unwrap();
+
+        // Whatever survived must be exactly the fresh-world set: `post:*`
+        // keys committed after the wipe. `pre` may or may not have been wiped
+        // depending on interleaving, but NO key may come back once gone —
+        // checked implicitly by reopening: the WAL must replay consistently.
+        let count = e.scan_prefix(b"post:", e.snapshot()).len();
+        assert!(
+            count > 0 && count <= 200,
+            "post-wipe commits should partially or fully survive, got {count}"
+        );
+        drop(e);
+        let e = Engine::open(&p).unwrap();
+        let reopened = e.scan_prefix(b"post:", e.snapshot()).len();
+        assert_eq!(reopened, count, "WAL replay must match in-memory survivor set");
     }
 }

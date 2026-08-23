@@ -88,6 +88,26 @@ impl Router {
         }
     }
 
+    /// Full FLUSHALL: wipe durable engine state (WAL + snapshot backed up by
+    /// atomic rename first) and every in-RAM vector graph. Tables, timeseries
+    /// and agent memory are pure engine views over the same keyspace, so the
+    /// engine wipe covers them. Returns the WAL backup path for reporting.
+    pub fn flush_all_with_backup(&self) -> std::io::Result<String> {
+        let backup = self.engine.flushall_with_backup()?;
+        self.vectors_default.reset_ram();
+        {
+            let mut ns = self.vectors_ns.write().unwrap();
+            for v in ns.values() {
+                v.reset_ram();
+            }
+            // Drop the namespace entries entirely: the next VSEARCHNS/VADDNS on
+            // a name recreates an empty index via `vectors_ns`, which now scans
+            // an empty keyspace.
+            ns.clear();
+        }
+        Ok(backup)
+    }
+
     /// Cost model: choose a plan from estimated selectivity (fraction passing filter).
     /// Very selective predicate => pre-filter is cheaper (few candidates to rank).
     /// Loose predicate => let the ANN index prune, then post-filter.

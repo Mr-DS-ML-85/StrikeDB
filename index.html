@@ -488,6 +488,10 @@ redis-cli -p 6380 MEM.REMEMBER "user prefers Rust for speed" user 0.9 1.0 0.2 0.
 # blended semantic + keyword + salience recall
 redis-cli -p 6380 MEM.RECALL 5 "rust speed preference" 1.0 0.2 0.0
 
+# per-agent scoped recall — agents can never read each other's memories
+redis-cli -p 6380 MEM.REMEMBER AGENT alice "alice vault code is 1111" agent:alice 0.9 0.9 0.1
+redis-cli -p 6380 MEM.RECALL    AGENT alice 5 "vault code" 0.5 0.5
+
 # graph edges
 redis-cli -p 6380 MEM.LINK alice works_at acme 1.0
 redis-cli -p 6380 MEM.TRAV alice 3

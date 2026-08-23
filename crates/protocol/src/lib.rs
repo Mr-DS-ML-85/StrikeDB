@@ -13,6 +13,9 @@ pub enum Resp {
     Bulk(Vec<u8>),
     Nil,
     Array(Vec<Resp>),
+    /// RESP3 map (`%`) — flat k1 v1 k2 v2 ... Used only for HELLO when the
+    /// client negotiates protocol 3; everything else stays RESP2.
+    Map(Vec<Resp>),
 }
 
 impl Resp {
@@ -53,6 +56,21 @@ impl Resp {
             Resp::Array(items) => {
                 out.push(b'*');
                 out.extend_from_slice(items.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                for it in items {
+                    it.encode_into(out);
+                }
+            }
+            // RESP3 map type (`%`). Used ONLY by the HELLO handshake when the
+            // client negotiates protocol 3 (redis-py >= 8 defaults to 3 and
+            // requires a real map reply). The rest of the wire stays RESP2 —
+            // which is legal because RESP2 frames (+ - : $ *) are a strict
+            // subset of RESP3, so a client that switched parsers still reads
+            // every other reply we emit. `items` is flat: k1 v1 k2 v2 ...
+            Resp::Map(items) => {
+                let pairs = items.len() / 2;
+                out.push(b'%');
+                out.extend_from_slice(pairs.to_string().as_bytes());
                 out.extend_from_slice(b"\r\n");
                 for it in items {
                     it.encode_into(out);
@@ -138,6 +156,19 @@ pub fn try_parse(buf: &[u8]) -> io::Result<Option<(Vec<Vec<u8>>, usize)>> {
 /// many replies then call `flush` once — this alone gives a 5-10× throughput
 /// bump on pipelined workloads by cutting the per-reply syscall.
 pub fn write_resp_buf<W: Write>(w: &mut W, resp: &Resp) -> io::Result<()> {
+    w.write_all(&resp.encode())
+}
+
+/// RESP3-aware variant. Once a client negotiates protocol 3 via HELLO, null
+/// replies MUST be the RESP3 null (`_`), not the legacy RESP2 `$-1`: strict
+/// RESP3 parsers (e.g. redis-py >= 8) have no `$-1` case and block forever
+/// trying to read `-1` bulk bytes. Everything else encodes identically.
+pub fn write_resp_buf_as<W: Write>(w: &mut W, resp: &Resp, resp3: bool) -> io::Result<()> {
+    if resp3 {
+        if matches!(resp, Resp::Nil) {
+            return w.write_all(b"_\r\n");
+        }
+    }
     w.write_all(&resp.encode())
 }
 

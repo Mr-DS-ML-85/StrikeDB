@@ -45,7 +45,7 @@ use acl::{AclStore, command_category};
 use compute::{counter_reducer, vm::{Instr, Program}, ReducerResult, ReducerRuntime};
 use consensus::{hlc::Hlc, crdt::{GCounter, LwwRegister, PnCounter}};
 use mitm::CacheDebugger;
-use protocol::{try_parse, write_resp, write_resp_buf, Resp};
+use protocol::{try_parse, write_resp, write_resp_buf, write_resp_buf_as, Resp};
 use rag::Rag;
 use reactive::Reactive;
 use router::{Router, TieredMemory};
@@ -166,7 +166,7 @@ fn main() -> std::io::Result<()> {
     let startup = format!(
         "DB-Strike listening on {addr} (RESP wire), WAL={data_path}{auth_msg}\n\
          One engine: KV · vectors · tables · timeseries · reducers · pub/sub · CRDT · HLC · agent-memory · RAG · MITM cache-debug\n\
-         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS/VQUANTNS · VLISTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · VBULKLOAD/VBULKLOADNS · VSEARCH/VSEARCHNS/VSEARCHA/VSEARCHANS/VSEARCH.MANY/VSEARCH.MANYNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE"
+         Wired: VSETQUANT/VSETQUANTNS/VFITQUANT/VFITQUANTNS/VQUANTNS · VLISTNS · VADDBATCH/VADDBATCHNS · VDEL/VDELNS · VBULKLOAD/VBULKLOADNS · VSEARCH/VSEARCHNS/VSEARCHA/VSEARCHANS/VSEARCH.MANY/VSEARCH.MANYNS · TABLE.* · CRDT.* · HLC.* · REDUCE.PROGRAM · MEM.INCOMING/COUNT/GET/CONSOLIDATE/EPISODES_CLEAR · TSAVG · RAG.CONTEXT · GETAT/SCAN · AUTH · ACL · GPU.LOAD/INFO/UNLOAD/MODE · FLUSHALL/FLUSHDB (full wipe, WAL backed up as <wal>.bak-<ms>)"
     );
     println!("{startup}");
     if let Some(ref lf) = log_file {
@@ -238,6 +238,10 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
     } else {
         "default".to_string()
     };
+    // Wire dialect for THIS connection. RESP2 everywhere by default; flips to
+    // RESP3 nulls (`_`) the moment HELLO negotiates proto 3 — see
+    // `write_resp_buf_as`. Every reply below goes through it.
+    let mut resp3_conn = false;
 
     // NOTE: a geometric parse-retry backoff was tried here and REVERTED.
     //
@@ -286,7 +290,7 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                     // matched the message and suppressed the log, so the client
                     // saw an unexplained `ConnectionReset` and the server said
                     // nothing at all. Send the reason down the wire first.
-                    let _ = write_resp_buf(&mut out, &err(&format!("ERR Protocol error: {e}")));
+                    let _ = write_resp_buf_as(&mut out, &err(&format!("ERR Protocol error: {e}")), resp3_conn);
                     if let Ok(mut s) = stream.lock() {
                         let _ = s.write_all(&out);
                         let _ = s.flush();
@@ -317,14 +321,45 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
             // ── ACL: handle AUTH/ACL before permission check ──────────
             if name == "AUTH" {
                 let resp = dispatch_auth(&db, args, &mut current_user);
-                write_resp_buf(&mut out, &resp)?;
+                write_resp_buf_as(&mut out, &resp, resp3_conn)?;
                 if name == "QUIT" { quit = true; break; }
                 i += 1;
                 continue;
             }
             if name == "ACL" {
                 let resp = dispatch_acl(&db, args, &current_user);
-                write_resp_buf(&mut out, &resp)?;
+                write_resp_buf_as(&mut out, &resp, resp3_conn)?;
+                i += 1;
+                continue;
+            }
+            // HELLO is handshake: real Redis answers it BEFORE authentication
+            // so clients can discover the server and learn they need to AUTH.
+            // Gating it behind NOAUTH broke redis-py/go-redis connects on
+            // auth-enabled installs. Embedded `HELLO proto AUTH user pass`
+            // (what RESP3 clients send) is honored here via dispatch_auth —
+            // an auth failure surfaces as the reply; success falls through
+            // to the normal hello map.
+            if name == "HELLO" {
+                if let Some(ix) = args.iter().position(|a| a.eq_ignore_ascii_case(b"AUTH")) {
+                    let rest: &[Vec<u8>] = &args[ix + 1..];
+                    let r = dispatch_auth(&db, rest, &mut current_user);
+                    if matches!(r, Resp::Error(_)) {
+                        write_resp_buf_as(&mut out, &r, resp3_conn)?;
+                        i += 1;
+                        continue;
+                    }
+                }
+                // Negotiate the connection dialect from `HELLO <proto>`.
+                let asked = args
+                    .first()
+                    .and_then(|a| std::str::from_utf8(a).ok())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(2)
+                    .clamp(2, 3);
+                resp3_conn = asked == 3;
+                let resp = dispatch(&db, &name, args);
+                write_resp_buf_as(&mut out, &resp, resp3_conn)?;
+                if name == "QUIT" { quit = true; break; }
                 i += 1;
                 continue;
             }
@@ -335,14 +370,14 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
             // load. It only latches true once auth/restrictions are configured
             // (DBSTRIKE_PASS, ACL SETUSER/DELUSER, disabling a user).
             if db.acl.requires_auth() && current_user.is_empty() {
-                write_resp_buf(&mut out, &err("NOAUTH Authentication required"))?;
+                write_resp_buf_as(&mut out, &err("NOAUTH Authentication required"), resp3_conn)?;
                 i += 1;
                 continue;
             }
             if db.acl.needs_permission_check() {
                 let cat = command_category(&name);
                 if !db.acl.can_command(&current_user, &name, cat) {
-                    write_resp_buf(&mut out, &err("ERR permission denied"))?;
+                    write_resp_buf_as(&mut out, &err("ERR permission denied"), resp3_conn)?;
                     i += 1;
                     continue;
                 }
@@ -415,7 +450,7 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                     Err(e) => {
                         let e = err(&e.to_string());
                         for _ in 0..n {
-                            write_resp_buf(&mut out, &e)?;
+                            write_resp_buf_as(&mut out, &e, resp3_conn)?;
                         }
                     }
                 }
@@ -440,7 +475,7 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
             } else {
                 dispatch(&db, &name, args)
             };
-            write_resp_buf(&mut out, &resp)?;
+            write_resp_buf_as(&mut out, &resp, resp3_conn)?;
             if name == "QUIT" {
                 quit = true;
                 break;
@@ -579,16 +614,47 @@ fn format_ts_val(v: f64) -> String {
     }
 }
 
+/// Parse an optional leading `AGENT <name>` token pair from a MEM/RAG
+/// command. Returns (scope, remaining-args). Default scope is "default" so
+/// unscoped clients keep one shared pool; agents that identify themselves are
+/// hard-isolated from each other at recall time.
+fn parse_agent_scope(args: &[Vec<u8>]) -> (String, &[Vec<u8>]) {
+    if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"AGENT") {
+        (String::from_utf8_lossy(&args[1]).to_string(), &args[2..])
+    } else {
+        ("default".to_string(), args)
+    }
+}
+
 fn parse_floats(args: &[Vec<u8>]) -> Option<Vec<f32>> {
-    args.iter()
-        .map(|a| std::str::from_utf8(a).ok()?.parse::<f32>().ok())
-        .collect()
+    // Accept BOTH shapes clients actually send:
+    //   * one float per RESP arg   — VADD 11 0.5 0.1 0.9
+    //   * the whole vector as ONE bulk string — VADD 11 "0.5 0.1 0.9"
+    //     (redis-py execute_command, go-redis Args helpers and most language
+    //     wrappers do this). Tokens may be space- or comma-separated.
+    // Single-token args take the identical fast path as before.
+    let mut out = Vec::new();
+    for a in args {
+        let s = std::str::from_utf8(a).ok()?;
+        if s.contains(' ') || s.contains(',') {
+            for tok in s.split([' ', ',']).filter(|t| !t.is_empty()) {
+                out.push(tok.parse::<f32>().ok()?);
+            }
+        } else {
+            out.push(s.parse::<f32>().ok()?);
+        }
+    }
+    Some(out)
 }
 
 /// Number of hardware threads — used to size the parallel-ingest shard count.
 fn num_cores() -> usize {
+    // Leave at least one core for the desktop compositor/UI. A build that
+    // spawns one thread per core pegs every logical CPU, and on a display-
+    // driven machine that freezes the desktop for the duration of a large
+    // bulk load (reported as a crash). Reserve one core for the system.
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(|n| n.get().saturating_sub(1).max(1))
         .unwrap_or(8)
         .max(1)
 }
@@ -842,6 +908,43 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
     match name {
         "PING" => Resp::Simple("PONG".into()),
         "QUIT" => Resp::Simple("OK".into()),
+        // HELLO [protover [AUTH user pass] [SETNAME name]] — modern clients
+        // (redis-py >= 8 defaults to RESP3) send this during connection setup.
+        // The wire stays RESP2 for every other reply; when the client asks
+        // for proto 3 we answer with a real RESP3 map claiming proto 3 —
+        // safe because RESP2 frames are a strict subset of RESP3, so the
+        // client's switched parser reads all our subsequent replies fine.
+        // Proto-2 askers get the classic flat array. Embedded AUTH is handled
+        // by the connection loop BEFORE this arm runs (it owns auth state).
+        "HELLO" => {
+            let mut proto = 2i64;
+            if let Some(first) = args.first() {
+                if let Ok(p) = std::str::from_utf8(first).unwrap_or("").parse::<i64>() {
+                    proto = p.clamp(2, 3);
+                }
+            }
+            let fields = vec![
+                Resp::Bulk(b"server".to_vec()),
+                Resp::Bulk(b"dbstrike".to_vec()),
+                Resp::Bulk(b"version".to_vec()),
+                Resp::Bulk(b"1.0.0".to_vec()),
+                Resp::Bulk(b"proto".to_vec()),
+                Resp::Int(proto),
+                Resp::Bulk(b"id".to_vec()),
+                Resp::Int(1),
+                Resp::Bulk(b"mode".to_vec()),
+                Resp::Bulk(b"standalone".to_vec()),
+                Resp::Bulk(b"role".to_vec()),
+                Resp::Bulk(b"master".to_vec()),
+                Resp::Bulk(b"modules".to_vec()),
+                Resp::Array(Vec::new()),
+            ];
+            if proto == 3 {
+                Resp::Map(fields)
+            } else {
+                Resp::Array(fields)
+            }
+        }
         // CLIENT ... — redis-benchmark 8 (and redis-cli) send `CLIENT SETINFO
         // LIB-NAME/LIB-VER` at startup. Replying OK (no-op) keeps the pre-flight
         // clean so no spurious 0-sample "-nan" line appears in the summary.
@@ -905,11 +1008,22 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         // DBSIZE → :n live keys across every shard. redis-benchmark checks
         // this at startup to size the working set.
         "DBSIZE" => Resp::Int(db.engine.dbsize() as i64),
-        // FLUSHALL / FLUSHDB — reply OK without touching data. We don't
-        // implement destructive keyspace wipes over the wire (durability
-        // engine, not a cache); making these no-ops keeps benchmarks happy
-        // without letting a stray "-x" flag nuke the corpus.
-        "FLUSHALL" | "FLUSHDB" => Resp::Simple("OK".into()),
+        // FLUSHALL / FLUSHDB — REAL full wipe. Backs up the live WAL (and the
+        // checkpoint snapshot) with an instant zero-copy rename to
+        // `<wal>.bak-<millis>` (`.snap` twin alongside), removes them from the
+        // active path, wipes every shard map and vector graph, then replies OK.
+        // The wipe runs as one serialized step on the group-commit flusher
+        // thread, so it can never interleave with an in-flight commit, and a
+        // crash mid-flush leaves either the old world or the new one — the
+        // backups are complete either way. Scoped portion-flushes are NOT
+        // wired here by design: this is the full-flush only.
+        "FLUSHALL" | "FLUSHDB" => match db.router.flush_all_with_backup() {
+            Ok(bak) => {
+                eprintln!("[FLUSH] full wipe OK · pre-flush world backed up at {bak}");
+                Resp::Simple("OK".into())
+            }
+            Err(e) => err(&e.to_string()),
+        },
         // COMMAND / COMMAND DOCS — redis-benchmark sometimes probes this to
         // discover the arg-count of each op. A minimal empty-array reply is
         // enough to let it skip probing without erroring.
@@ -2078,40 +2192,46 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
 
         // ── AGENT MEMORY ────────────────────────────────────────────────
         // MEM.REMEMBER text source salience f1 f2 ...   -> :id
+        // MEM.REMEMBER [AGENT name] text source salience f1 f2 ...  -> :id
         "MEM.REMEMBER" => {
-            if args.len() < 4 {
-                return err("MEM.REMEMBER requires text source salience f1 f2 ...");
+            let (agent, rest) = parse_agent_scope(args);
+            if rest.len() < 4 {
+                return err("MEM.REMEMBER requires [AGENT name] text source salience f1 f2 ...");
             }
-            let text = String::from_utf8_lossy(&args[0]).to_string();
-            let source = String::from_utf8_lossy(&args[1]).to_string();
-            let sal: f32 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+            let text = String::from_utf8_lossy(&rest[0]).to_string();
+            let source = String::from_utf8_lossy(&rest[1]).to_string();
+            let sal: f32 = match std::str::from_utf8(&rest[2]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("salience is not a float"),
             };
-            let vec = match parse_floats(&args[3..]) {
+            let vec = match parse_floats(&rest[3..]) {
                 Some(v) => v,
                 None => return err("bad float in embedding"),
             };
-            match db.rag.memory().ltm_store(&text, vec, &source, sal, "cmd:remember") {
+            match db.rag.memory().ltm_store(&text, vec, &source, sal, "cmd:remember", &agent) {
                 Ok(id) => Resp::Int(id as i64),
                 Err(e) => err(&e.to_string()),
             }
         }
         // MEM.RECALL k query f1 f2 ...  -> array of (id, score, source, text)
+        // MEM.RECALL [AGENT name] k query f1 f2 ...  -> array of (id, score, source, text)
+        // Scoped: an agent only ever recalls its OWN memories (plus legacy
+        // owner-less records). Cross-agent recall is impossible.
         "MEM.RECALL" => {
-            if args.len() < 3 {
-                return err("MEM.RECALL requires k query f1 f2 ...");
+            let (agent, rest) = parse_agent_scope(args);
+            if rest.len() < 3 {
+                return err("MEM.RECALL requires [AGENT name] k query f1 f2 ...");
             }
-            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
-            let query = String::from_utf8_lossy(&args[1]).to_string();
-            let qvec = match parse_floats(&args[2..]) {
+            let query = String::from_utf8_lossy(&rest[1]).to_string();
+            let qvec = match parse_floats(&rest[2..]) {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
-            let hits = db.rag.memory().recall(&query, &qvec, k);
+            let hits = db.rag.memory().recall_scoped(&agent, &query, &qvec, k);
             let mut out = Vec::new();
             for h in hits {
                 out.push(Resp::Int(h.id as i64));
@@ -2222,21 +2342,22 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
         // ── BI-TEMPORAL RECALL ─────────────────────────────────────────
-        // MEM.REMEMBER.T text source sal valid_from valid_to f1 f2 ...  -> :id
+        // MEM.REMEMBER.T [AGENT name] text source sal valid_from valid_to f1 f2 ...  -> :id
         "MEM.REMEMBER.T" => {
-            if args.len() < 6 {
-                return err("MEM.REMEMBER.T requires text source sal valid_from valid_to f1 f2 ...");
+            let (agent, rest) = parse_agent_scope(args);
+            if rest.len() < 6 {
+                return err("MEM.REMEMBER.T requires [AGENT name] text source sal valid_from valid_to f1 f2 ...");
             }
-            let text = String::from_utf8_lossy(&args[0]).to_string();
-            let source = String::from_utf8_lossy(&args[1]).to_string();
-            let sal: f32 = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
-            let vf: u64 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let vt: u64 = std::str::from_utf8(&args[4]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let vec = match parse_floats(&args[5..]) {
+            let text = String::from_utf8_lossy(&rest[0]).to_string();
+            let source = String::from_utf8_lossy(&rest[1]).to_string();
+            let sal: f32 = std::str::from_utf8(&rest[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+            let vf: u64 = std::str::from_utf8(&rest[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let vt: u64 = std::str::from_utf8(&rest[4]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let vec = match parse_floats(&rest[5..]) {
                 Some(v) => v,
                 None => return err("bad float in embedding"),
             };
-            match db.rag.memory().ltm_store_temporal(&text, vec, &source, sal, "cmd:remember.t", vf, vt) {
+            match db.rag.memory().ltm_store_temporal(&text, vec, &source, sal, "cmd:remember.t", vf, vt, &agent) {
                 Ok(id) => Resp::Int(id as i64),
                 Err(e) => err(&e.to_string()),
             }
@@ -2259,25 +2380,26 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Err(e) => err(&e.to_string()),
             }
         }
-        // MEM.RECALL.AS_OF k query as_of f1 f2 ...  -> array of (id, score, source, text)
+        // MEM.RECALL.AS_OF [AGENT name] k query as_of f1 f2 ...  -> hits
         "MEM.RECALL.AS_OF" => {
-            if args.len() < 4 {
-                return err("MEM.RECALL.AS_OF requires k query as_of f1 f2 ...");
+            let (agent, rest) = parse_agent_scope(args);
+            if rest.len() < 4 {
+                return err("MEM.RECALL.AS_OF requires [AGENT name] k query as_of f1 f2 ...");
             }
-            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
-            let query = String::from_utf8_lossy(&args[1]).to_string();
-            let as_of: u64 = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+            let query = String::from_utf8_lossy(&rest[1]).to_string();
+            let as_of: u64 = match std::str::from_utf8(&rest[2]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("as_of is not a u64"),
             };
-            let qvec = match parse_floats(&args[3..]) {
+            let qvec = match parse_floats(&rest[3..]) {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
-            let hits = db.rag.memory().recall_as_of(&query, &qvec, k, as_of);
+            let hits = db.rag.memory().recall_as_of(&agent, &query, &qvec, k, as_of);
             let mut out = Vec::new();
             for h in hits {
                 out.push(Resp::Int(h.id as i64));
@@ -2416,18 +2538,19 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
         // ── RAG ─────────────────────────────────────────────────────────
-        // RAG.INGEST text source f1 f2 ...  -> :id
+        // RAG.INGEST [AGENT name] text source f1 f2 ...  -> :id
         "RAG.INGEST" => {
-            if args.len() < 3 {
-                return err("RAG.INGEST requires text source f1 f2 ...");
+            let (agent, rest) = parse_agent_scope(args);
+            if rest.len() < 3 {
+                return err("RAG.INGEST requires [AGENT name] text source f1 f2 ...");
             }
-            let text = String::from_utf8_lossy(&args[0]).to_string();
-            let source = String::from_utf8_lossy(&args[1]).to_string();
-            let vec = match parse_floats(&args[2..]) {
+            let text = String::from_utf8_lossy(&rest[0]).to_string();
+            let source = String::from_utf8_lossy(&rest[1]).to_string();
+            let vec = match parse_floats(&rest[2..]) {
                 Some(v) => v,
                 None => return err("bad float in embedding"),
             };
-            match db.rag.ingest(&text, vec, &source) {
+            match db.rag.ingest(&text, vec, &source, &agent) {
                 Ok(id) => Resp::Int(id as i64),
                 Err(e) => err(&e.to_string()),
             }
@@ -2446,7 +2569,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
-            let (hits, cached) = db.rag.retrieve_cached(&query, &qvec, k);
+            let (agent, _) = parse_agent_scope(args);
+            let (hits, cached) = db.rag.retrieve_cached(&agent, &query, &qvec, k);
             let mut out = Vec::new();
             out.push(Resp::Bulk(if cached { b"cached".to_vec() } else { b"fresh".to_vec() }));
             for h in hits {
@@ -2872,20 +2996,22 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
 
         // ── RAG CONTEXT BLOCK ────────────────────────────────────────────
         // RAG.CONTEXT k query f1 f2 ...  -> bulk (prompt-ready block)
+        // RAG.CONTEXT [AGENT name] k query f1 f2 ...  -> bulk prompt block
         "RAG.CONTEXT" => {
-            if args.len() < 3 {
-                return err("RAG.CONTEXT requires k query f1 f2 ...");
+            let (agent, rest) = parse_agent_scope(args);
+            if rest.len() < 3 {
+                return err("RAG.CONTEXT requires [AGENT name] k query f1 f2 ...");
             }
-            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
-            let query = String::from_utf8_lossy(&args[1]).to_string();
-            let qvec = match parse_floats(&args[2..]) {
+            let query = String::from_utf8_lossy(&rest[1]).to_string();
+            let qvec = match parse_floats(&rest[2..]) {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
-            Resp::Bulk(db.rag.context_block(&query, &qvec, k).into_bytes())
+            Resp::Bulk(db.rag.context_block(&agent, &query, &qvec, k).into_bytes())
         }
 
         // ── MVCC POINT-IN-TIME READS ─────────────────────────────────────

@@ -96,7 +96,12 @@ fn proc_key(agent: &str, name: &str) -> Vec<u8> {
 // v1: source_len, source, created_ts, salience, lineage
 // v2: v1 + valid_from (u64) + valid_to (u64; 0 = open-ended)  ← bi-temporal
 const META_VERSION_V1: u8 = 1;
-const META_VERSION: u8 = 2;
+/// v2 added bi-temporal valid_from/valid_to. v3 adds per-agent ownership
+/// (`owner`) so LTM recall can be scoped — an agent must not recall another
+/// agent's/user's memories. v1/v2 records decode with `owner = ""`, which is
+/// treated as LEGACY/PUBLIC: visible to every scope until re-written.
+const META_VERSION: u8 = 3;
+
 fn encode_meta(m: &Meta) -> Vec<u8> {
     let mut out = vec![META_VERSION];
     let src = m.source.as_bytes();
@@ -108,12 +113,16 @@ fn encode_meta(m: &Meta) -> Vec<u8> {
     // lineage decode stays trivial.
     out.extend_from_slice(&m.valid_from.to_le_bytes());
     out.extend_from_slice(&m.valid_to.to_le_bytes());
+    // v3 adds the owning agent scope (length-prefixed), still before lineage.
+    let own = m.owner.as_bytes();
+    out.extend_from_slice(&(own.len() as u32).to_le_bytes());
+    out.extend_from_slice(own);
     out.extend_from_slice(m.lineage.as_bytes());
     out
 }
 fn decode_meta(buf: &[u8]) -> Option<Meta> {
     let ver = *buf.first()?;
-    if ver != META_VERSION && ver != META_VERSION_V1 {
+    if ver != META_VERSION && ver != META_VERSION_V1 && ver != 2 {
         return None;
     }
     let mut p = 1usize;
@@ -125,7 +134,7 @@ fn decode_meta(buf: &[u8]) -> Option<Meta> {
     p += 8;
     let salience = f32::from_le_bytes(buf[p..p + 4].try_into().ok()?);
     p += 4;
-    let (valid_from, valid_to) = if ver == META_VERSION {
+    let (valid_from, valid_to) = if ver >= 2 {
         let vf = u64::from_le_bytes(buf[p..p + 8].try_into().ok()?);
         p += 8;
         let vt = u64::from_le_bytes(buf[p..p + 8].try_into().ok()?);
@@ -135,10 +144,19 @@ fn decode_meta(buf: &[u8]) -> Option<Meta> {
         // v1 records: fact was true from creation, still valid.
         (created_ts, 0)
     };
+    // v3: owner sits between the temporal fields and the lineage tail.
+    let owner = if ver >= 3 {
+        let ol = u32::from_le_bytes(buf[p..p + 4].try_into().ok()?) as usize;
+        p += 4;
+        let o = String::from_utf8(buf[p..p + ol].to_vec()).ok()?;
+        p += ol;
+        o
+    } else {
+        String::new()
+    };
     let lineage = String::from_utf8(buf[p..].to_vec()).ok()?;
-    Some(Meta { source, created_ts, salience, lineage, valid_from, valid_to })
+    Some(Meta { source, created_ts, salience, lineage, valid_from, valid_to, owner })
 }
-
 /// Provenance + importance + bi-temporal validity for one LTM entry.
 ///
 /// The bi-temporal fields (`valid_from`, `valid_to`) match Zep Graphiti's
@@ -154,6 +172,12 @@ pub struct Meta {
     pub lineage: String, // free-form derivation chain (utf8)
     pub valid_from: u64, // world-time the fact became true
     pub valid_to: u64,   // world-time it stopped (0 = still valid / open interval)
+    /// Owning agent scope. Recall is filtered to `owner == scope` — an agent
+    /// can never recall another agent's memories. Empty = LEGACY record from
+    /// before scoping existed; those stay visible to every scope so existing
+    /// corpora keep working (documented migration semantics, not a hole for
+    /// anything written after this field shipped).
+    pub owner: String,
 }
 
 /// A long-term memory record.
@@ -310,8 +334,9 @@ impl Memory {
         source: &str,
         salience: f32,
         lineage: &str,
+        owner: &str,
     ) -> std::io::Result<u64> {
-        self.ltm_store_temporal(text, vector, source, salience, lineage, 0, 0)
+        self.ltm_store_temporal(text, vector, source, salience, lineage, 0, 0, owner)
     }
 
     /// Bi-temporal store: `valid_from` = when the fact became true (0 = now);
@@ -325,6 +350,7 @@ impl Memory {
         lineage: &str,
         valid_from: u64,
         valid_to: u64,
+        owner: &str,
     ) -> std::io::Result<u64> {
         let id = self.alloc_id();
         let ts = self.engine.now();
@@ -340,6 +366,7 @@ impl Memory {
                 lineage: lineage.to_string(),
                 valid_from: vf,
                 valid_to,
+                owner: owner.to_string(),
             })),
         )?;
         self.vectors.insert(id, vector.clone())?;
@@ -489,13 +516,26 @@ impl Memory {
         Ok(())
     }
 
-    // ── RECALL (blended semantic + keyword) ────────────────────────────────
+    // ── RECALL (blended semantic + keyword, OWNER-SCOPED) ──────────────────
     //
     // Fast path: score ALL candidates using only the in-memory salience cache
     // (zero substrate reads during scoring). Fetch text + meta from the
     // substrate ONLY for the final top-k that gets returned. At N=2k memories
     // with common query tokens this went from ~2.3 ms → ~200 µs.
-    pub fn recall(&self, query: &str, query_vec: &[f32], k: usize) -> Vec<RecallHit> {
+    //
+    // SECURITY: `scope` is the requesting agent identity. Hits whose owner
+    // differs are dropped BEFORE the top-k truncation (with a 3× overfetch so
+    // a scoped recall still fills k). Legacy records (`owner == ""`, written
+    // before scoping existed) remain visible to every scope — documented
+    // migration semantics.
+    pub fn recall_scoped(
+        &self,
+        scope: &str,
+        query: &str,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Vec<RecallHit> {
+        let fetch = k * 3;
         // Fast salience lookup (RwLock<read>, held briefly).
         let sal_cache = self.salience_cache.read().unwrap();
         let sal_of = |id: u64| -> f32 {
@@ -504,7 +544,7 @@ impl Memory {
 
         // 1) semantic ANN
         let mut fused: HashMap<u64, (f32, &'static str)> = HashMap::new();
-        for (id, dist) in self.vectors.search(query_vec, k * 2) {
+        for (id, dist) in self.vectors.search(query_vec, fetch) {
             let sim = 1.0 - dist / 2.0;
             let score = sim * (0.5 + 0.5 * sal_of(id));
             fused.insert(id, (score, "semantic"));
@@ -542,6 +582,8 @@ impl Memory {
         drop(sal_cache);
 
         // 3) Streaming top-k via a small max-heap (O(N log k), no full sort).
+        // Capacity is the overfetch width (3×k): owner filtering happens at
+        // materialization, so extra candidates keep scoped recall filled.
         use std::collections::BinaryHeap;
         #[derive(Copy, Clone, PartialEq)]
         struct Scored { score: f32, id: u64, kind: &'static str }
@@ -557,9 +599,9 @@ impl Memory {
                 self.partial_cmp(o).unwrap_or(std::cmp::Ordering::Equal)
             }
         }
-        let mut heap: BinaryHeap<Scored> = BinaryHeap::with_capacity(k + 1);
+        let mut heap: BinaryHeap<Scored> = BinaryHeap::with_capacity(fetch + 1);
         for (id, (score, kind)) in fused {
-            if heap.len() < k {
+            if heap.len() < fetch {
                 heap.push(Scored { score, id, kind });
             } else if let Some(worst) = heap.peek() {
                 if score > worst.score {
@@ -575,13 +617,27 @@ impl Memory {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // 4) Materialize text + meta ONLY for the k winners.
-        top.into_iter()
-            .filter_map(|s| {
-                let (text, meta) = self.ltm_get_light(s.id)?;
-                Some(RecallHit { id: s.id, text, score: s.score, kind: s.kind, meta })
-            })
-            .collect()
+        // 4) Materialize text + meta ONLY for the winners, enforcing the
+        //    owner scope. Legacy (owner == "") stays visible to everyone.
+        let mut out: Vec<RecallHit> = Vec::with_capacity(k);
+        for s in top {
+            if out.len() == k {
+                break;
+            }
+            if let Some((text, meta)) = self.ltm_get_light(s.id) {
+                if !meta.owner.is_empty() && meta.owner != scope {
+                    continue;
+                }
+                out.push(RecallHit { id: s.id, text, score: s.score, kind: s.kind, meta });
+            }
+        }
+        out
+    }
+
+    /// Unscoped convenience wrapper — scope "default". Used by tests and
+    /// callers that legitimately operate on the default agent pool.
+    pub fn recall(&self, query: &str, query_vec: &[f32], k: usize) -> Vec<RecallHit> {
+        self.recall_scoped("default", query, query_vec, k)
     }
 
     /// Consolidation hook: bump an entry's salience (importance).
@@ -749,13 +805,14 @@ impl Memory {
     /// The Graphiti primitive: "what did we know at time T" instead of "now".
     pub fn recall_as_of(
         &self,
+        scope: &str,
         query: &str,
         query_vec: &[f32],
         k: usize,
         as_of: u64,
     ) -> Vec<RecallHit> {
         // Over-fetch, then filter by the fact's validity window.
-        self.recall(query, query_vec, k * 4)
+        self.recall_scoped(scope, query, query_vec, k * 4)
             .into_iter()
             .filter(|h| {
                 let vf_ok = h.meta.valid_from == 0 || h.meta.valid_from <= as_of;
@@ -842,6 +899,7 @@ mod tests {
             "agent:planner",
             0.9,
             "trigger:goal",
+            "default",
         )
         .unwrap();
         m.ltm_store(
@@ -850,6 +908,7 @@ mod tests {
             "user",
             0.7,
             "trigger:chat",
+            "default",
         )
         .unwrap();
         m.ltm_store(
@@ -858,12 +917,87 @@ mod tests {
             "tool:monitor",
             0.5,
             "trigger:alert",
+            "default",
         )
         .unwrap();
 
         let hits = m.recall("production deployment plan", &v("production deployment plan"), 3);
         assert!(!hits.is_empty());
         assert!(hits[0].text.contains("deployment"));
+    }
+
+    /// SECURITY: per-agent LTM recall scoping. Agent A must never recall
+    /// agent B's memories, and the unscoped default pool must not leak either
+    /// way. Legacy records (owner == "", from pre-scoping corpora) stay
+    /// visible to every scope so existing data keeps working.
+    #[test]
+    fn ltm_recall_is_agent_scoped() {
+        let m = Memory::open(eng());
+        let v = |s: &str| -> Vec<f32> {
+            // deterministic pseudo-embedding from tokens
+            let mut o = vec![0f32; 8];
+            for (i, t) in s.split_whitespace().enumerate() {
+                let h = t.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64));
+                o[i % 8] += (h % 1000) as f32 / 1000.0;
+            }
+            o
+        };
+
+        // alice's secret + bob's secret + one legacy record.
+        m.ltm_store("alice aws key is AKIA-ALICE-123",
+                    v("alice aws key secret credential"), "agent:alice", 0.9, "t", "alice").unwrap();
+        m.ltm_store("bob gpg passphrase is hunter2-bob",
+                    v("bob gpg passphrase secret credential"), "agent:bob", 0.9, "t", "bob").unwrap();
+        m.ltm_store("legacy public onboarding doc",
+                    v("legacy public onboarding doc"), "doc", 0.5, "t", "").unwrap();
+
+        // Alice asks about credentials: sees hers + legacy, NEVER bob's.
+        let a = m.recall_scoped("alice", "secret credential key",
+                                &v("alice aws key secret credential"), 10);
+        assert!(a.iter().any(|h| h.text.contains("AKIA-ALICE")),
+                "alice must see her own memory");
+        assert!(a.iter().any(|h| h.text.contains("onboarding")),
+                "legacy records visible to all scopes");
+        assert!(!a.iter().any(|h| h.text.contains("hunter2")),
+                "SECURITY: alice recalled bob's memory!");
+
+        // Bob symmetric.
+        let b = m.recall_scoped("bob", "secret credential passphrase",
+                                &v("bob gpg passphrase secret credential"), 10);
+        assert!(b.iter().any(|h| h.text.contains("hunter2")));
+        assert!(!b.iter().any(|h| h.text.contains("AKIA-ALICE")),
+                "SECURITY: bob recalled alice's memory!");
+
+        // Default pool sees only legacy — neither agent's writes leak into it.
+        let d = m.recall_scoped("default", "secret credential",
+                                &v("secret credential key passphrase"), 10);
+        assert!(!d.iter().any(|h| h.text.contains("AKIA-ALICE")));
+        assert!(!d.iter().any(|h| h.text.contains("hunter2")));
+
+        // Meta round-trips the owner through encode/decode (v3).
+        let rec = m.ltm_get(a.iter().find(|h| h.text.contains("AKIA")).unwrap().id).unwrap();
+        assert_eq!(rec.meta.owner, "alice");
+    }
+
+    /// Legacy v2 meta blobs (no owner) still decode after the version bump —
+    /// an old WAL must open without losing its memories.
+    #[test]
+    fn v2_meta_decodes_with_empty_owner() {
+        // hand-encode a v2 blob: [ver=2][src][ts][sal][vf][vt][lineage]
+        let mut blob = vec![2u8];
+        let src = b"tool:cli";
+        blob.extend_from_slice(&(src.len() as u32).to_le_bytes());
+        blob.extend_from_slice(src);
+        blob.extend_from_slice(&42u64.to_le_bytes());
+        blob.extend_from_slice(&0.6f32.to_le_bytes());
+        blob.extend_from_slice(&7u64.to_le_bytes());
+        blob.extend_from_slice(&0u64.to_le_bytes());
+        blob.extend_from_slice(b"op:rotate");
+        let meta = decode_meta(&blob).expect("v2 blob must decode");
+        assert_eq!(meta.source, "tool:cli");
+        assert_eq!(meta.lineage, "op:rotate");
+        assert_eq!(meta.valid_from, 7);
+        assert_eq!(meta.owner, "");
     }
 
     #[test]
@@ -878,11 +1012,12 @@ mod tests {
     fn lineage_survives_roundtrip() {
         let m = Memory::open(eng());
         let id = m
-            .ltm_store("secret key rotated", vec![1.0; 4], "tool:cli", 0.6, "op:rotate")
+            .ltm_store("secret key rotated", vec![1.0; 4], "tool:cli", 0.6, "op:rotate", "default")
             .unwrap();
         let rec = m.ltm_get(id).unwrap();
         assert_eq!(rec.meta.source, "tool:cli");
         assert_eq!(rec.meta.lineage, "op:rotate");
         assert_eq!(rec.meta.salience, 0.6);
+        assert_eq!(rec.meta.owner, "default");
     }
 }

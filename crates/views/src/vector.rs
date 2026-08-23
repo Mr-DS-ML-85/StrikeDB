@@ -247,7 +247,147 @@ const MMAP_MAP_SHARED: i32 = 0x01;
 const MMAP_O_RDWR: i32 = 0x2;
 const MMAP_O_CREAT: i32 = 0x40;
 const MMAP_O_TRUNC: i32 = 0x200;
+const MMAP_O_RDONLY: i32 = 0x0;
 const MMAP_MS_SYNC: i32 = 0x4;
+
+/// Read-only view of an fbin payload backed by a memory-mapped temp file.
+///
+/// `bulk_load_fbin` used to `std::fs::read` the whole file into a `Vec<f32>`
+/// — for 5M×384d that is 7.68 GB of ANONYMOUS heap, which the kernel OOM
+/// killer targets first (it OOM-killed the 5M build at 26 GB anon RSS on this
+/// 30 GB machine; `journalctl` shows "Out of memory: Killed process ..."). A
+/// file-backed mapping instead lives in evictable page cache: under memory
+/// pressure the kernel drops clean pages rather than killing the process.
+#[cfg(unix)]
+struct MmapInput {
+    ptr: *mut f32,
+    len: usize, // number of f32 elements (n*dim)
+    fd: i32,
+    _path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl MmapInput {
+    /// Open an fbin file, validate the 8-byte header, and stream the payload
+    /// into a uniquely-named temp file that is then mapped read-write and
+    /// unlinked immediately. Returns the header-declared (n, dim) alongside
+    /// the mapping.
+    ///
+    /// Unlike `std::fs::read` (which would hold the whole 7.68 GB payload as
+    /// ANONYMOUS heap that the OOM killer targets), the temp file is
+    /// MAP_SHARED: dirty pages are written back by the kernel and clean pages
+    /// are evictable, so the build's footprint is file-backed, not anonymous.
+    fn from_file(path: &str) -> std::io::Result<(Self, usize, usize)> {
+        use std::io::{Error, ErrorKind, Read, Seek, SeekFrom};
+        use std::os::unix::ffi::OsStrExt;
+        let mut file = std::fs::File::open(path)?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)?;
+        let n = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let dim = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        if n == 0 || dim == 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "fbin declares zero rows or dims"));
+        }
+        let want = n
+            .checked_mul(dim)
+            .and_then(|e| e.checked_mul(4))
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "fbin dimensions overflow"))?;
+        let file_len = file.seek(SeekFrom::End(0))?;
+        if (file_len as usize) - 8 < want {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "fbin truncated: header declares {n}×{dim} ({want} bytes) but \
+                     only {} bytes of payload follow",
+                    file_len as usize - 8
+                ),
+            ));
+        }
+        file.seek(SeekFrom::Start(8))?;
+
+        let tpath = std::env::temp_dir().join(format!(
+            "dbstrike_input_{}_{}.f32",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let cpath = std::ffi::CString::new(tpath.as_os_str().as_bytes()).ok().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidData, "temp path not representable as C string")
+        })?;
+        let fd = unsafe { open(cpath.as_ptr(), MMAP_O_RDWR | MMAP_O_CREAT | MMAP_O_TRUNC, 0o600) };
+        if fd < 0 {
+            return Err(Error::last_os_error());
+        }
+        if unsafe { ftruncate(fd, want as i64) } != 0 {
+            unsafe { close(fd) };
+            return Err(Error::last_os_error());
+        }
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                want,
+                MMAP_PROT_READ | MMAP_PROT_WRITE,
+                MMAP_MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == usize::MAX as *mut std::ffi::c_void || ptr.is_null() {
+            unsafe { close(fd) };
+            return Err(Error::last_os_error());
+        }
+        // Stream the payload into the mapping in bounded chunks (page cache,
+        // not anonymous heap — and never a second 7.68 GB copy).
+        {
+            let dst: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, want) };
+            let mut off = 0usize;
+            while off < want {
+                let got = file.read(&mut dst[off..])?;
+                if got == 0 {
+                    break;
+                }
+                off += got;
+            }
+        }
+        // Unlink NOW, like MmapTier: the inode stays alive via fd+mapping and
+        // is reclaimed on ANY exit (panic, SIGKILL, OOM-kill).
+        unsafe { unlink(cpath.as_ptr()) };
+        Ok((Self { ptr: ptr as *mut f32, len: want / 4, fd, _path: tpath }, n, dim))
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[f32] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MmapInput {
+    fn drop(&mut self) {
+        let bytes = self.len * std::mem::size_of::<f32>();
+        unsafe {
+            munmap(self.ptr as *mut std::ffi::c_void, bytes);
+            close(self.fd);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct MmapInput;
+
+#[cfg(not(unix))]
+impl MmapInput {
+    fn from_file(_path: &str) -> std::io::Result<(Self, usize, usize)> {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "mmap input requires unix"))
+    }
+}
 
 /// NVMe-backed array of `f32`, memory-mapped from a temp file. Exposes a
 /// `&[f32]` view for reads (the rerank path) and `&mut [f32]` for writes
@@ -1857,6 +1997,14 @@ struct Hnsw {
     /// `mmap` (cold tier) instead of RAM. `all_f32` stays empty; reads/writes
     /// go through `f32_tier`. RAM drops to ~int8-only at 100M+ scale.
     f32_tier: Option<MmapTier>,
+    /// Set on SEGMENT builds only (`build_segment`, `build_segment_indexed`):
+    /// the segment's HNSW graph construction reads `all_i8`, never `all_f32`,
+    /// so a segment can skip storing the f32 mirror entirely. `merge_segments`
+    /// then fills the merged f32/tier straight from the caller's shared
+    /// `data` + `perm` (row `perm[gidx]`), so the 7× segment f32 arenas (7.68 GB
+    /// at 5M×384d) are never allocated — they were pure ANONYMOUS heap that
+    /// the kernel OOM-killer targeted and SIGKILLed the build at 26 GB RSS.
+    skip_f32: bool,
     /// MODULE 4: number of distinct attribute categories, used to size the
     /// per-category count + entry tables.
     attr_kinds: usize,
@@ -1900,6 +2048,7 @@ impl Hnsw {
             turbo_r: Vec::new(),
             turbo_qjl: Vec::new(),
             f32_tier: None,
+            skip_f32: false,
             attr_kinds: 0,
             attr_counts: Vec::new(),
             attr_entry: Vec::new(),
@@ -2033,10 +2182,12 @@ impl Hnsw {
                     self.all_norm[idx] = vector_l2(&vector);
                 }
             }
-            if let Some(t) = self.f32_tier.as_mut() {
-                t.as_mut_slice()[o..o + self.dim].copy_from_slice(&vector);
-            } else {
-                self.all_f32[o..o + self.dim].copy_from_slice(&vector);
+            if !self.skip_f32 {
+                if let Some(t) = self.f32_tier.as_mut() {
+                    t.as_mut_slice()[o..o + self.dim].copy_from_slice(&vector);
+                } else {
+                    self.all_f32[o..o + self.dim].copy_from_slice(&vector);
+                }
             }
             // Attribute of an existing node is immutable for our workload; the
             // first writer wins. (Re-assigning would require re-linking counts.)
@@ -2095,14 +2246,16 @@ impl Hnsw {
                 self.all_norm.push(vector_l2(&vector));
             }
         }
-        if let Some(t) = self.f32_tier.as_mut() {
-            let o = idx * self.dim;
-            // Grow the tier lazily if needed (idx may exceed initial estimate).
-            if o + self.dim <= t.as_slice().len() {
-                t.as_mut_slice()[o..o + self.dim].copy_from_slice(&vector);
+        if !self.skip_f32 {
+            if let Some(t) = self.f32_tier.as_mut() {
+                let o = idx * self.dim;
+                // Grow the tier lazily if needed (idx may exceed initial estimate).
+                if o + self.dim <= t.as_slice().len() {
+                    t.as_mut_slice()[o..o + self.dim].copy_from_slice(&vector);
+                }
+            } else {
+                self.all_f32.extend_from_slice(&vector);
             }
-        } else {
-            self.all_f32.extend_from_slice(&vector);
         }
 
         let entry = match self.entry {
@@ -3317,6 +3470,7 @@ impl Hnsw {
     fn build_segment(data: &[f32], dim: usize, off: usize, count: usize, base_id: u64, attrs: &[u32]) -> Hnsw {
         let mut h = Hnsw::new();
         h.dim = dim;
+        h.skip_f32 = true;
         for row in 0..count {
             let v: Vec<f32> = data[(off + row) * dim..(off + row + 1) * dim].to_vec();
             h.insert_attr(base_id + row as u64, v, attrs[off + row]);
@@ -3330,6 +3484,7 @@ impl Hnsw {
         eprintln!("[MITM] build_segment: off={} count={} dim={} base_id={}", off, count, dim, base_id);
         let mut h = Hnsw::new();
         h.dim = dim;
+        h.skip_f32 = true;
         for row in 0..count {
             let true_row = perm[off + row];
             let v: Vec<f32> = data[true_row * dim..(true_row + 1) * dim].to_vec();
@@ -3349,7 +3504,20 @@ impl Hnsw {
     /// every layer the two nodes share. This gives the global graph a
     /// small-world backbone spanning all shards without rebuilding any
     /// segment's internal structure.
-    fn merge_segments(mut segments: Vec<Hnsw>, bridge: usize, mut tier: Option<&mut MmapTier>) -> Hnsw {
+    ///
+    /// `f32_source` is the caller's shared `(data, perm)`. When segments were
+    /// built with `skip_f32` (their graph construction reads `all_i8` only),
+    /// the merged f32/tier is filled from `data[perm[gidx] * dim..]` instead of
+    /// `seg.all_f32` — this is exact by construction (segment `si`'s `li`-th
+    /// node was built from row `perm[offsets[si] + li]`). This keeps segments
+    /// from ever allocating their 7.68 GB f32 mirrors at 5M×384d scale, which
+    /// previously pushed the merge over RAM and got the process OOM-killed.
+    fn merge_segments(
+        mut segments: Vec<Hnsw>,
+        bridge: usize,
+        mut tier: Option<&mut MmapTier>,
+        f32_source: Option<(&[f32], &[usize])>,
+    ) -> Hnsw {
         eprintln!("[MITM] merge_segments: {} segments, bridge={}", segments.len(), bridge);
         if segments.is_empty() {
             return Hnsw::new();
@@ -3360,6 +3528,7 @@ impl Hnsw {
         let dim = segments[0].dim;
         let quant = segments[0].quant;
         let mut merged = Hnsw::new();
+        let mut scratch_f32: Vec<f32> = Vec::new();
         merged.dim = dim;
         merged.m = segments[0].m;
         merged.m_max0 = segments[0].m_max0;
@@ -3400,7 +3569,7 @@ impl Hnsw {
         // and `ensure_visited` grows it to the node count on first search.
         eprintln!("[MITM] merge_segments: total={} total_f32_bytes={}", total, total * dim * 4);
 
-        for (si, seg) in segments.iter().enumerate() {
+        for (si, seg) in segments.iter_mut().enumerate() {
             if si == 0 { eprintln!("[MITM] merge: first node in segment 0"); }
             for (li, node) in seg.nodes.iter().enumerate() {
                 let gidx = offsets[si] + li;
@@ -3416,17 +3585,39 @@ impl Hnsw {
                 merged.all_i8.extend_from_slice(&seg.all_i8[o..o + dim]);
                 let go = gidx * dim;
                 if si == 0 && li < 3 { eprintln!("[MITM] merge: node {} all_i8 OK, dim={}", li, dim); }
+                // Exact-f32 source for the merged arena/tier. When segments
+                // were built with `skip_f32` they hold no f32 mirror; pull the
+                // row from the caller's shared data via the permutation instead
+                // (segment si's li-th node = original row `perm[offsets[si]+li]`).
+                // This is exact and keeps the 7.68 GB segment f32 mirrors out
+                // of anonymous heap (OOM-kill fix at 5M×384d).
+                //
+                // IMPORTANT: segments normalize internally (`insert_attr` calls
+                // `l2_normalize` before storing), so the caller's raw `data` row
+                // must be normalized here too — otherwise the exact-f32 rerank
+                // disagrees with the int8 traversal and reorders candidates by
+                // magnitude (wrong recall). `bulk_load_fbin` pre-normalizes its
+                // input, but `build_parallel_ids`/`build_parallel_attr` do not.
+                let f32_row: &[f32] = if let Some((src, perm)) = f32_source {
+                    let src_row = perm[gidx];
+                    scratch_f32.clear();
+                    scratch_f32.extend_from_slice(&src[src_row * dim..src_row * dim + dim]);
+                    l2_normalize(&mut scratch_f32);
+                    &scratch_f32
+                } else {
+                    &seg.all_f32[o..o + dim]
+                };
                 if let Some(t) = tier.as_mut() {
                     // Write directly to mmap — avoids RAM intermediate.
                     let go_tier = gidx; // tier uses same indexing
                     let slice = t.as_mut_slice();
                     if go_tier * dim + dim <= slice.len() {
-                        slice[go_tier * dim..go_tier * dim + dim].copy_from_slice(&seg.all_f32[o..o + dim]);
+                        slice[go_tier * dim..go_tier * dim + dim].copy_from_slice(f32_row);
                     }
                 } else if let Some(t) = merged.f32_tier.as_mut() {
-                    t.as_mut_slice()[go..go + dim].copy_from_slice(&seg.all_f32[o..o + dim]);
+                    t.as_mut_slice()[go..go + dim].copy_from_slice(f32_row);
                 } else {
-                    merged.all_f32.extend_from_slice(&seg.all_f32[o..o + dim]);
+                    merged.all_f32.extend_from_slice(f32_row);
                 }
                 if quant != QuantMode::Int8 && !seg.all_bin.is_empty() {
                     let stride = seg.all_bin.len() / seg.nodes.len().max(1);
@@ -3437,6 +3628,15 @@ impl Hnsw {
                     merged.all_norm.push(seg.all_norm[li]);
                 }
             }
+            // The segment's exact-f32 mirror has served its only purpose: it was
+            // copied into `merged` (RAM or mmap) above. The bridge passes below
+            // read only `all_i8`, so dropping `all_f32` here releases up to
+            // n*4 bytes per segment. Without this, a 5M×384d merge held BOTH the
+            // 7 segments' f32 arenas (~7.7GB) AND the merged arena (~7.7GB) plus
+            // the caller's raw `data` — a ~41GB peak that the kernel OOM-kills
+            // on a 30GB machine (verified via journalctl: "Out of memory: Killed
+            // process ... (dbstrike) anon-rss:26332344kB").
+            seg.all_f32 = Vec::new();
         }
 
         // MODULE 4: merge per-segment attribute tables into the global ones.
@@ -3953,7 +4153,18 @@ impl VectorIndex {
         // Respect ComputeMode: CpuOnly must NEVER touch the GPU, even when a
         // GPU is present (gpu_init() may have been called by the harness).
         let use_gpu_build = gpu::gpu_available()
-            && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly;
+            && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly
+            // GPU APGC seeding+refine allocates ~4.5 GB of buffers at 5M×384d,
+            // which exceeds the free VRAM on an 8 GB display GPU — the build
+            // silently falls back to a scalar CPU loop that pegs every core
+            // for ~17 minutes, freezing the desktop (reported as a crash).
+            // Cap the GPU build so huge corpora take the CPU path, which is
+            // slower per-vector but never parks the display GPU. Override with
+            // GPU_BUILD_MAX_N.
+            && n <= std::env::var("GPU_BUILD_MAX_N")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1_000_000);
         if use_gpu_build {
             eprintln!("[GPU] APGC build: GPU computes kNN, CPU wires HNSW edges");
         }
@@ -4299,7 +4510,7 @@ impl VectorIndex {
         // For tiered mode, pre-allocate the mmap BEFORE merge so merge_segments
         // can write f32 data directly to it — avoids the ~N×dim×4 RAM intermediate.
         let mut pre_tier = if tiered { MmapTier::new(n * dim) } else { None };
-        let mut merged = Hnsw::merge_segments(segments, bridge, pre_tier.as_mut());
+        let mut merged = Hnsw::merge_segments(segments, bridge, pre_tier.as_mut(), Some((data, &perm_arc)));
         // Move the tier into the merged Hnsw and drop any leftover all_f32.
         if let Some(t) = pre_tier {
             merged.f32_tier = Some(t);
@@ -4385,7 +4596,7 @@ impl VectorIndex {
             })
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let merged = Hnsw::merge_segments(segments, bridge, None);
+        let merged = Hnsw::merge_segments(segments, bridge, None, Some((data, &shared_perm)));
         Self { engine: Engine::open_for_build(), prefix: String::new(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
@@ -4422,49 +4633,33 @@ impl VectorIndex {
     /// merge cost this path exists to avoid.
     pub fn bulk_load_fbin(&self, path: &str, n_shards: usize) -> std::io::Result<(usize, usize)> {
         use std::io::{Error, ErrorKind};
-        let bytes = std::fs::read(path)?;
-        if bytes.len() < 8 {
-            return Err(Error::new(ErrorKind::InvalidData, "fbin shorter than header"));
-        }
-        let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let dim = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        if n == 0 || dim == 0 {
-            return Err(Error::new(ErrorKind::InvalidData, "fbin declares zero rows or dims"));
-        }
-        let want = n
-            .checked_mul(dim)
-            .and_then(|e| e.checked_mul(4))
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "fbin dimensions overflow"))?;
-        if bytes.len() - 8 < want {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "fbin truncated: header declares {n}×{dim} ({want} bytes) but \
-                     only {} bytes of payload follow",
-                    bytes.len() - 8
-                ),
-            ));
-        }
-
-        // Copy out rather than transmuting in place: the payload has no
-        // alignment guarantee and `f32` requires 4-byte alignment.
-        //
-        // `chunks_exact` rather than indexing `bytes[o..o+4]` per element: the
-        // indexed form emits a bounds check and a fallible `try_into` for every
-        // one of the n*dim floats (38.4M at 100k×384d), which is pure overhead
-        // when the length was already validated above.
-        let mut data: Vec<f32> = bytes[8..8 + want]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        drop(bytes);
-        for row in data.chunks_mut(dim) {
+        // Keep the payload as a FILE-BACKED mapping, not a 7.68 GB anonymous
+        // `Vec`. Anonymous heap is exactly what the OOM killer targets — the
+        // 5M×384d build died at 26 GB anon RSS (`journalctl`: "Out of memory:
+        // Killed process ... (dbstrike)"). A MAP_SHARED temp file sits in
+        // evictable page cache, so under memory pressure the kernel drops
+        // clean pages instead of SIGKILLing the process. `from_file` streams
+        // the file into the mapping in bounded chunks (never a second big copy)
+        // and returns the validated header (n, dim).
+        let (mut mmap_input, n, dim) = MmapInput::from_file(path)?;
+        for row in mmap_input.as_mut_slice().chunks_mut(dim) {
             l2_normalize(row);
         }
 
         let ids: Vec<u64> = (0..n as u64).collect();
         let attrs: Vec<u32> = vec![0u32; n];
-        let built = Self::build_parallel_ids(&data, dim, n_shards, &ids, &attrs);
+        // Scale the build's parallelism with dataset size. A 5M×384d HNSW build
+        // runs for ~20-30 min; at `n_shards` threads-per-core it pegs the whole
+        // machine and freezes the desktop for the entire load. For very large
+        // corpora use half the cores so the OS can keep the UI alive — the load
+        // is slower, but the machine stays usable.
+        let eff_shards = if n >= 2_000_000 {
+            (n_shards / 2).max(1)
+        } else {
+            n_shards
+        };
+        let data = mmap_input.as_slice();
+        let built = Self::build_parallel_ids(data, dim, eff_shards, &ids, &attrs);
         {
             let mut g = self.hnsw.write().unwrap();
             *g = built.hnsw.into_inner().unwrap();
@@ -4530,7 +4725,13 @@ impl VectorIndex {
         // This needed the GPU block's missing `l2_normalize` first: it used to
         // assume unit-length input, which raw `VADDBATCH` vectors are not.
         if gpu::gpu_available() && gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly {
-            let built = Self::build_parallel_tiered(data, dim, n_shards, false);
+            // Tier the merged f32 arena for very large corpora. The merge
+            // otherwise holds the raw `data` (n*4 bytes) + all segments' f32
+            // + the merged f32 — ~4× the dataset, which OOM-kills on a 30GB
+            // machine at 5M×384d. The tier streams f32 to the NVMe mmap so the
+            // merged arena is not a second RAM copy.
+            let tiered = n >= 1_000_000;
+            let built = Self::build_parallel_tiered(data, dim, n_shards, tiered);
             {
                 let mut h = built.hnsw.write().unwrap();
                 h.id_to_idx.clear();
@@ -4626,7 +4827,7 @@ impl VectorIndex {
             })
             .collect();
         let segments: Vec<Hnsw> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let merged = Hnsw::merge_segments(segments, bridge, None);
+        let merged = Hnsw::merge_segments(segments, bridge, None, Some((data, &shared_perm)));
         Self { engine: Engine::open_for_build(), prefix: String::new(), hnsw: RwLock::new(merged), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) }
     }
 
@@ -4831,6 +5032,16 @@ impl VectorIndex {
             p.push(b':');
             p
         }
+    }
+
+    /// Wipe every in-RAM structure: HNSW graph, quantized arenas, f32 tier,
+    /// sparse index and the GPU copy. The durable `vec:` payloads in the
+    /// engine are removed by the FLUSHALL engine wipe; after both steps the
+    /// index is equivalent to a fresh `open` over an empty keyspace.
+    pub fn reset_ram(&self) {
+        *self.hnsw.write().unwrap() = Hnsw::new();
+        *self.sparse.write().unwrap() = SparseIndex::new();
+        *self.gpu_idx.write().unwrap() = None;
     }
 
     /// Upload vectors + flat CSR graph to GPU for APGC-style GPU search.

@@ -648,7 +648,11 @@ python3 tests/test_dbstrike.py</code></pre>
     <section class="doc fade-up" id="wire">
       <h2>The RESP Wire</h2>
       <p>Speaks Redis <strong>RESP</strong> — any Redis client works unchanged.
-        40+ commands, case-insensitive, both array and inline forms.</p>
+        40+ commands, case-insensitive, both array and inline forms.
+        <strong>RESP2 + RESP3 compatible</strong>: <code>HELLO 3</code> negotiates
+        RESP3 (map handshake, <code>_</code> nulls), so modern clients
+        (redis-py ≥ 8, go-redis, jedis) connect out of the box alongside
+        redis-cli and redis-benchmark.</p>
 
       <h3>KV & General</h3>
       <div class="table-wrap"><table>
@@ -658,8 +662,9 @@ python3 tests/test_dbstrike.py</code></pre>
         <tr><td><code>MSET / MGET</code></td><td>k v [k v...] / k [k...]</td><td>OK / array</td></tr>
         <tr><td><code>INCR / INCRBY</code></td><td>key [n]</td><td>new integer</td></tr>
         <tr><td><code>KEYS / DBSIZE</code></td><td>prefix / —</td><td>array / count</td></tr>
-        <tr><td><code>SELECT / COMMAND</code></td><td>—</td><td>OK (no-op compat)</td></tr>
-        <tr><td><code>FLUSHALL / FLUSHDB</code></td><td>—</td><td>OK (no-op compat)</td></tr>
+        <tr><td><code>SELECT / COMMAND</code></td><td>—</td><td>OK / empty array (compat)</td></tr>
+        <tr><td><code>HELLO [proto]</code></td><td>[2|3]</td><td>handshake map — RESP2 &amp; RESP3 clients both connect</td></tr>
+        <tr><td><code>FLUSHALL / FLUSHDB</code></td><td>—</td><td>OK — real full wipe; WAL + snapshot backed up to <code>&lt;wal&gt;.bak-&lt;ms&gt;</code>, crash-safe, zero-copy</td></tr>
         <tr><td><code>QUIT</code></td><td>—</td><td>closes connection</td></tr>
       </table></div>
 
@@ -709,12 +714,12 @@ python3 tests/test_dbstrike.py</code></pre>
         <tr><th>Command</th><th>Args</th><th>Returns</th></tr>
         <tr><td><code>SUBSCRIBE / PSUBSCRIBE</code></td><td>ch [ch...]</td><td>real-time stream</td></tr>
         <tr><td><code>PUBLISH</code></td><td>ch msg</td><td>subscriber count</td></tr>
-        <tr><td><code>MEM.REMEMBER</code></td><td>text source sal f1...</td><td>:id</td></tr>
-        <tr><td><code>MEM.RECALL</code></td><td>k query f1...</td><td>id/score/text</td></tr>
+        <tr><td><code>MEM.REMEMBER</code></td><td>[AGENT name] text source sal f1...</td><td>:id (owner-scoped)</td></tr>
+        <tr><td><code>MEM.RECALL</code></td><td>[AGENT name] k query f1...</td><td>id/score/text — only that agent's memories</td></tr>
         <tr><td><code>MEM.LINK / MEM.UNLINK</code></td><td>from to rel [weight]</td><td>OK</td></tr>
         <tr><td><code>MEM.NEIGH / MEM.TRAV</code></td><td>from [rel] / start depth</td><td>neighbors / traversal</td></tr>
-        <tr><td><code>MEM.REMEMBER.T</code></td><td>text source sal vf vt f1...</td><td>:id (bi-temporal)</td></tr>
-        <tr><td><code>MEM.RECALL.AS_OF</code></td><td>k query as_of f1...</td><td>valid facts</td></tr>
+        <tr><td><code>MEM.REMEMBER.T</code></td><td>[AGENT name] text source sal vf vt f1...</td><td>:id (bi-temporal)</td></tr>
+        <tr><td><code>MEM.RECALL.AS_OF</code></td><td>[AGENT name] k query as_of f1...</td><td>valid facts (scoped)</td></tr>
         <tr><td><code>MEM.PROC.SET / GET / LIST</code></td><td>agent name [body]</td><td>OK / body / array</td></tr>
         <tr><td><code>MEM.WM_SET / GET / DELETE</code></td><td>agent key [value] ttl_ms</td><td>OK / bulk / OK</td></tr>
         <tr><td><code>MEM.EPISODE / EPISODES / FORGET</code></td><td>agent kind payload / agent limit / agent seq</td><td>:seq / array / OK</td></tr>
@@ -728,9 +733,9 @@ python3 tests/test_dbstrike.py</code></pre>
       <h3>RAG & MITM Debugger</h3>
       <div class="table-wrap"><table>
         <tr><th>Command</th><th>Args</th><th>Returns</th></tr>
-        <tr><td><code>RAG.INGEST</code></td><td>text source f1...</td><td>:id</td></tr>
-        <tr><td><code>RAG.SEARCH</code></td><td>k query f1...</td><td>cached/fresh + hits</td></tr>
-        <tr><td><code>RAG.CONTEXT</code></td><td>k query f1...</td><td>prompt-ready context block</td></tr>
+        <tr><td><code>RAG.INGEST</code></td><td>[AGENT name] text source f1...</td><td>:id (owner-scoped)</td></tr>
+        <tr><td><code>RAG.SEARCH</code></td><td>[AGENT name] k query f1...</td><td>cached/fresh + hits (scoped)</td></tr>
+        <tr><td><code>RAG.CONTEXT</code></td><td>[AGENT name] k query f1...</td><td>prompt-ready context block (scoped)</td></tr>
         <tr><td><code>CACHE.SRCSET / SRCDEL</code></td><td>key value</td><td>version bump</td></tr>
         <tr><td><code>CACHE.SET / GET</code></td><td>key [value]</td><td>verdict + value</td></tr>
         <tr><td><code>CACHE.BUGS / TRACES / CLEAR</code></td><td>—</td><td>debug reports</td></tr>
