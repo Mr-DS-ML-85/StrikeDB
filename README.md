@@ -967,7 +967,33 @@ SIGKILL'd, then reopened, then every acked key is verified.
 
  *Run yourself:* `cargo run --release -p bench -- --chaos`
 
- ### 🌊 Availability under connection flood (the honest edge case)
+### 🧾 `make prove-it` — the public evidence engine
+
+One command, RESP-only, stdlib-only, ~11 seconds — everything an outsider
+needs to verify the durability story without trusting our benchmarks:
+
+```bash
+make prove-it        # or: python3 scripts/prove_it.py
+```
+
+Six phases, 31 checks, exit code 0 only if every proof held:
+
+| Phase | What it proves |
+|---|---|
+| **Acked durability** | 6× randomized `SIGKILL` under mixed workload (KV + agent memory); *every* acknowledged write verified after restart, MEM.COUNT exact each round |
+| **Bulk-load atomicity** | `SIGKILL` mid-`VBULKLOADNS`: namespace is 0 (torn frame dropped) or full 50,000 (committed) — never partial; prior data untouched |
+| **Concurrency** | 8 parallel clients × 250 `INCRBY` on one key: zero lost updates, final == sum of acks |
+| **Invariant fuzz** | 400 random mixed ops then crash: MEM.COUNT exact, agent scoping still isolated, search healthy |
+| **Per-subsystem** | One acked write per subsystem (KV / vector / TS / table / CRDT / memory) survives `kill -9` |
+| **FLUSHALL undo** | Backup restore returns the exact pre-flush world — keys *and* memories |
+
+This harness has already paid rent: on its first runs it caught two real bugs
+that unit tests missed — **concurrent INCRBY lost updates** (OCC validation
+raced the group-commit queue) and a **restart-time vector namespace collision**
+between user VADDs and LTM embeddings that silently dropped user vectors.
+Both fixed; the proofs above run against the fixed build.
+
+### 🌊 Availability under connection flood (the honest edge case)
 
  Durability is crash-safe: a `kill -9` mid-flight loses **zero** acknowledged
  writes (see above). But a hard **connection flood** — `redis-benchmark -P 1024

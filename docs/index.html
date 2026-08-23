@@ -1043,6 +1043,19 @@ kill -9 $SVR; wait 2>/dev/null; true</code></pre>
         <tr><td>Acked writes</td><td>64,848</td></tr>
         <tr><td><strong>Lost after SIGKILL + reopen</strong></td><td class="hl">0</td></tr>
       </table></div>
+
+      <h3><code>make prove-it</code> — the public evidence engine</h3>
+      <p>One command, RESP-only, stdlib-only, ~11 seconds. Six phases, 31
+      checks — crash durability under randomized SIGKILL with mixed workloads,
+      bulk-load atomicity (0 or full namespace, never partial), 8-client
+      INCRBY consistency, mixed-workload invariant fuzz, per-subsystem
+      durability, and the FLUSHALL backup-restore round trip. Exit 0 only if
+      every proof held.</p>
+      <pre><code>make prove-it        # or: python3 scripts/prove_it.py</code></pre>
+      <p>It already caught two real bugs unit tests missed: concurrent INCRBY
+      lost updates (OCC validation raced the group-commit queue) and a
+      restart-time collision between user vectors and LTM embeddings sharing
+      one namespace. Both fixed; the proofs run against the fixed build.</p>
     </section>
 
     <!-- Demos -->

@@ -513,3 +513,44 @@ other user's memories. A cross-tenant leak in the flagship feature.
   `HELLO proto AUTH u p` honored via dispatch_auth.
 - **parse_floats accepts single-bulk vectors**: `VADD 11 "0.5 0.1 0.9"`
   alongside one-float-per-arg form.
+
+---
+
+## 9. `make prove-it` — public evidence engine + two bugs it caught (2026-08-24)
+
+### The harness
+`scripts/prove_it.py` — RESP-only, stdlib-only, ~11s, 31 checks, exit 0 only
+if every proof held. Phases: (1) 6× randomized SIGKILL under mixed workload
+with per-round acked-write verification, (2) bulk-load atomicity under kill,
+(3) 8-client INCRBY consistency, (4) mixed-workload invariant fuzz + scoping
+re-check post-crash, (4b) one acked write per subsystem surviving SIGKILL,
+(5) FLUSHALL backup-restore round trip. `make prove-it` runs it.
+
+### Harness lesson: isolate before you accuse
+First runs produced nonsense (dbsize=50588 from "fresh" servers, ids at 52).
+Root cause was OUR spawn, not the DB: the server takes its WAL path from
+`DBSTRIKE_WAL` env and defaults to repo-root `dbstrike.wal` — every phase had
+been testing one contaminated shared world. Also `str(b"...")` mangled bytes
+RESP args into literals. Rule for next time: prove your measurement rig on a
+known-empty state BEFORE trusting any failure it reports.
+
+### Bug 1 — concurrent INCRBY lost updates (real)
+8 clients × 250 INCRBY on one key → final=250, not 2000. Exactly N_INC
+surviving per run = collision waves: `Txn::commit` validates OCC conflicts
+BEFORE enqueueing to the group-commit flusher, so racing txns that read the
+same snapshot all pass validation and blind-overwrite in commit order.
+Fix: `Kv::incr_by_lossy` serializes its RMW with a dedicated mutex
+(counter ops serialize; plain SET/GET untouched; Redis INCR is serialized
+too). Verified: 2000/2000 unique acks, final=2000.
+
+### Bug 2 — restart-time vector namespace collision (real)
+User `VADD 777` + one LTM doc: pre-restart search hit 777@0.0; post-restart
+the same search returned a memory doc and 777 was GONE. Root cause: Memory's
+LTM embeddings lived in the DEFAULT vector namespace — two separate in-RAM
+graphs (Router's, Memory's) over the same `vec:` keys with independent dims;
+the restart rebuild merged them, first-inserted dim won, mismatched vectors
+were silently dropped. Fix: `Memory::open` uses reserved namespace
+`vec:__ltm__:` — own graph, own dim, VLISTNS stays clean.
+
+### Verification
+prove-it 31/31 · cargo 181/181 · mix repro stable pre/post restart.
