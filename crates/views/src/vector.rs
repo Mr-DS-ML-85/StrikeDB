@@ -4313,10 +4313,14 @@ impl VectorIndex {
             // segment's adjacency read-only), so workers own disjoint node
             // slices and buffer edges locally; one merge after join.
             // The single-threaded version ground for ~20 min of ONE core at 1M.
-            let n_threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8)
-                .min(32);
+            // CPU-politeness: DBSTRIKE_CPU_THREADS/PERCENT bound how many
+            // cores the emergency path may occupy (no desktop freezes).
+            let n_threads = gpu::cpu_workers(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+                    .min(32),
+            );
             let next_report = AtomicUsize::new(100_000);
             let done = AtomicUsize::new(0);
             let bridge_edges: Vec<Vec<(usize, Vec<(i32, usize)>)>> =
@@ -4479,7 +4483,7 @@ impl VectorIndex {
     pub fn build_parallel_tiered(data: &[f32], dim: usize, n_shards: usize, tiered: bool) -> Self {
         eprintln!("[MITM] build_parallel_tiered: n={} dim={} shards={} tiered={}", data.len()/dim, dim, n_shards, tiered);
         let n = data.len() / dim;
-        let shards = n_shards.max(1).min(n.max(1));
+        let shards = gpu::cpu_workers(n_shards.max(1).min(n.max(1)));
         // bridge=4: each node gets 4 cross-shard edges (good recall at low cost).
         // bridge=8 was default; 4 halves merge time while keeping recall ≥0.999.
         // SHUFFLE the row order before sharding. This is the key to cheap,
@@ -4978,6 +4982,7 @@ impl VectorIndex {
         } else {
             n_shards
         };
+        let eff_shards = gpu::cpu_workers(eff_shards);
         let data = mmap_input.as_slice();
         let built = Self::build_parallel_ids(data, dim, eff_shards, &ids, &attrs);
         {

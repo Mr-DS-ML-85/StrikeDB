@@ -306,6 +306,39 @@ const KERNEL_SRC: &str = include_str!("../kernels/all_kernels.cu");
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Initialize GPU — detect CUDA, create context. Kernels NOT compiled yet.
+/// CPU politeness: how many worker threads a heavy CPU phase may use.
+///
+/// "No CPU interference" contract — dbstrike's fallbacks (segment kNN,
+/// bridge beams, parallel builds) historically pegged every core for many
+/// minutes and froze the desktop. Two knobs, composable:
+///   • `DBSTRIKE_CPU_THREADS` — hard cap on workers (e.g. 4 keeps 12 cores
+///     free on a 16-thread machine);
+///   • `DBSTRIKE_CPU_PERCENT` — scales the request (50 → half).
+/// Percent applies first (floor 1), then the hard cap. Unset env = exactly
+/// the requested count, preserving historical behavior.
+pub fn cpu_workers(requested: usize) -> usize {
+    let cap = std::env::var("DBSTRIKE_CPU_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let pct = std::env::var("DBSTRIKE_CPU_PERCENT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    cpu_workers_with(requested, cap, pct)
+}
+
+/// Pure form for tests: `cap` = DBSTRIKE_CPU_THREADS, `pct` = DBSTRIKE_CPU_PERCENT.
+fn cpu_workers_with(requested: usize, cap: Option<usize>, pct: Option<usize>) -> usize {
+    let mut n = requested;
+    if let Some(pct) = pct {
+        let pct = pct.clamp(1, 100);
+        n = ((n.saturating_mul(pct)) / 100).max(1);
+    }
+    if let Some(cap) = cap.filter(|&c| c >= 1) {
+        n = n.min(cap);
+    }
+    n
+}
+
 // ═══ Exclusive mode — claim spare VRAM so squatters cannot interfere ═══
 //
 // History that motivates this: a local llama-server holding 7 of 8 GB turned
@@ -2593,6 +2626,24 @@ fn gpu_search_batched(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CPU politeness budget: DBSTRIKE_CPU_THREADS is a hard cap,
+    /// DBSTRIKE_CPU_PERCENT scales the core count; both compose, and the
+    /// result never exceeds the requested amount.
+    #[test]
+    fn cpu_worker_budget_math() {
+        // Hard cap clamps.
+        assert_eq!(cpu_workers_with(32, Some(8), None), 8);
+        // Percent scales the requested count (floor at 1).
+        assert_eq!(cpu_workers_with(16, None, Some(50)), 8);
+        assert_eq!(cpu_workers_with(7, None, Some(50)), 3);
+        // Percent of 1 never drops to zero.
+        assert_eq!(cpu_workers_with(1, None, Some(10)), 1);
+        // Cap + percent compose: percent applied first, cap second.
+        assert_eq!(cpu_workers_with(32, Some(4), Some(50)), 4);
+        // No env → requested unchanged.
+        assert_eq!(cpu_workers_with(12, None, None), 12);
+    }
 
     /// Exclusive-mode balloon sizing: claims free-minus-reserve, never
     /// negative, and never touches the reserve we need for our own work.

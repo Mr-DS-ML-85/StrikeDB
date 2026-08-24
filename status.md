@@ -150,7 +150,13 @@ undoable offline; `GETAT`/`SCAN` read raw engine keys (no kv: prefix);
    (…) but CUDA context creation failed — VRAM almost certainly exhausted…`.
 10. **Server env knobs**: `DBSTRIKE_WAL`, `DBSTRIKE_SYNC=1`(default durable),
     `DBSTRIKE_PASS`, `GPU_SELKV_RATIO`(0.9), `GPU_DELTA_AR_K`(0=off),
-    `DBSTRIKE_GPU_SINGLE`, `DBSTRIKE_TRACE`.
+    `DBSTRIKE_GPU_SINGLE`, `DBSTRIKE_TRACE`,
+    `DBSTRIKE_GPU_EXCLUSIVE=1`(+`DBSTRIKE_GPU_RESERVE_MB`, balloon spare VRAM
+    so squatters can't interfere — start dbstrike BEFORE heavy GPU apps),
+    `DBSTRIKE_FORCE_APGC_FALLBACK=1`(BUG-1 regression seam),
+    `DBSTRIKE_APGC_DEBUG=1`(fallback edge health),
+    `DBSTRIKE_CPU_THREADS`/`DBSTRIKE_CPU_PERCENT`(CPU politeness budget:
+    cap heavy CPU phases so the desktop stays alive — "no CPU interference").
 11. **memgent repo is OFF-LIMITS** (`/run/media/irfan/models/memgent`) — owned
     by another AI agent. OmniMemEval data is read-only:
     `/run/media/irfan/models/OmniMemEval/data/locomo/locomo10.json`.
