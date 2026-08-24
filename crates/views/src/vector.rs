@@ -4308,55 +4308,128 @@ impl VectorIndex {
                 .collect();
             use std::cmp::Reverse;
             use std::collections::BinaryHeap;
-            for i in 0..n {
-                let bi = match nearest_fseg[i] {
-                    Some(b) => b,
-                    None => continue,
-                };
-                let (lo, hi) = ranges[bi];
-                let ln = hi - lo;
-                if ln == 0 {
-                    continue;
-                }
-                let q = &i8_all[i * dim..i * dim + dim];
-                let dist_l = |l: usize| -> u32 {
-                    let v = &i8_all[(lo + l) * dim..(lo + l + 1) * dim];
-                    let dot: i64 = q.iter().zip(v).map(|(a, b)| (*a as i64) * (*b as i64)).sum();
-                    ((1.0 - dot as f32 / 16129.0).max(0.0) * 1000.0) as u32
-                };
-                let mut seen = vec![false; ln];
-                let mut expanded = vec![false; ln];
-                let mut pool: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
-                seen[0] = true; // local 0 == segment entry position
-                pool.push(Reverse((dist_l(0), 0usize)));
-                let mut best: Vec<(u32, usize)> = Vec::with_capacity(bridge_take * 2);
-                let mut expansions = 0usize;
-                while let Some(Reverse((d, l))) = pool.pop() {
-                    if expanded[l] {
-                        continue;
+            use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+            // PARALLEL beams: nodes are independent (each walks a FOREIGN
+            // segment's adjacency read-only), so workers own disjoint node
+            // slices and buffer edges locally; one merge after join.
+            // The single-threaded version ground for ~20 min of ONE core at 1M.
+            let n_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .min(32);
+            let next_report = AtomicUsize::new(100_000);
+            let done = AtomicUsize::new(0);
+            let bridge_edges: Vec<Vec<(usize, Vec<(i32, usize)>)>> =
+                std::thread::scope(|scope| {
+                    let chunk = (n + n_threads - 1) / n_threads;
+                    let handles: Vec<_> = (0..n_threads)
+                        .map(|t| {
+                            let lo_n = t * chunk;
+                            let hi_n = (lo_n + chunk).min(n);
+                            let seg_adj_ref = &seg_adj;
+                            let ranges_ref = &ranges;
+                            let i8_ref = &i8_all;
+                            let fseg_ref = &nearest_fseg;
+                            let report_ref = &next_report;
+                            let done_ref = &done;
+                            scope.spawn(move || {
+                                let mut out: Vec<(usize, Vec<(i32, usize)>)> =
+                                    Vec::new();
+                                for i in lo_n..hi_n {
+                                    let bi = match fseg_ref[i] {
+                                        Some(b) => b,
+                                        None => continue,
+                                    };
+                                    let (lo, hi) = ranges_ref[bi];
+                                    let ln = hi - lo;
+                                    if ln == 0 {
+                                        continue;
+                                    }
+                                    let q =
+                                        &i8_ref[i * dim..i * dim + dim];
+                                    let dist_l = |l: usize| -> u32 {
+                                        let v = &i8_ref[(lo + l) * dim
+                                            ..(lo + l + 1) * dim];
+                                        let dot: i64 = q
+                                            .iter()
+                                            .zip(v)
+                                            .map(|(a, b)| {
+                                                (*a as i64) * (*b as i64)
+                                            })
+                                            .sum();
+                                        ((1.0 - dot as f32 / 16129.0)
+                                            .max(0.0)
+                                            * 1000.0)
+                                            as u32
+                                    };
+                                    let mut seen = vec![false; ln];
+                                    let mut expanded = vec![false; ln];
+                                    let mut pool: BinaryHeap<
+                                        Reverse<(u32, usize)>,
+                                    > = BinaryHeap::new();
+                                    seen[0] = true;
+                                    pool.push(Reverse((dist_l(0), 0usize)));
+                                    let mut best: Vec<(u32, usize)> =
+                                        Vec::with_capacity(16);
+                                    let mut expansions = 0usize;
+                                    while let Some(Reverse((d, l))) =
+                                        pool.pop()
+                                    {
+                                        if expanded[l] {
+                                            continue;
+                                        }
+                                        expanded[l] = true;
+                                        best.push((d, l));
+                                        expansions += 1;
+                                        if expansions >= max_expand {
+                                            break;
+                                        }
+                                        for &nl in &seg_adj_ref[bi][l] {
+                                            if !seen[nl] {
+                                                seen[nl] = true;
+                                                pool.push(Reverse((
+                                                    dist_l(nl),
+                                                    nl,
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    best.sort();
+                                    best.truncate(bridge_take);
+                                    let mut edges: Vec<(i32, usize)> =
+                                        Vec::with_capacity(best.len());
+                                    for &(d, l) in &best {
+                                        let gpos = lo + l;
+                                        if gpos != i {
+                                            edges.push((d as i32, gpos));
+                                        }
+                                    }
+                                    if !edges.is_empty() {
+                                        out.push((i, edges));
+                                    }
+                                    let ddone =
+                                        done_ref.fetch_add(1, AOrd::Relaxed) + 1;
+                                    if ddone % 100_000 == 0 {
+                                        eprintln!(
+                                            "[GPU] fallback bridge walks: {ddone}/{n} nodes"
+                                        );
+                                    }
+                                }
+                                out
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap())
+                        .collect()
+                });
+            for per_thread in bridge_edges {
+                for (i, edges) in per_thread {
+                    for (d, gpos) in edges {
+                        all_knn[i].push((d, gpos as i32));
+                        all_knn[gpos].push((d, i as i32));
                     }
-                    expanded[l] = true;
-                    best.push((d, l));
-                    expansions += 1;
-                    if expansions >= max_expand {
-                        break;
-                    }
-                    for &nl in &seg_adj[bi][l] {
-                        if !seen[nl] {
-                            seen[nl] = true;
-                            pool.push(Reverse((dist_l(nl), nl)));
-                        }
-                    }
-                }
-                best.sort();
-                best.truncate(bridge_take);
-                for (d, l) in best {
-                    let gpos = lo + l;
-                    if gpos == i {
-                        continue;
-                    }
-                    all_knn[i].push((d as i32, gpos as i32));
-                    all_knn[gpos].push((d as i32, i as i32));
                 }
             }
         }
