@@ -715,11 +715,11 @@ python3 tests/test_dbstrike.py</code></pre>
         <tr><td><code>SUBSCRIBE / PSUBSCRIBE</code></td><td>ch [ch...]</td><td>real-time stream</td></tr>
         <tr><td><code>PUBLISH</code></td><td>ch msg</td><td>subscriber count</td></tr>
         <tr><td><code>MEM.REMEMBER</code></td><td>[AGENT name] text source sal f1...</td><td>:id (owner-scoped)</td></tr>
-        <tr><td><code>MEM.RECALL</code></td><td>[AGENT name] k query f1...</td><td>id/score/text — only that agent's memories</td></tr>
+        <tr><td><code>MEM.RECALL</code></td><td>[AGENT name] k query f1...</td><td>id/score/source/text + created_ts, valid_from, valid_to — only that agent's memories</td></tr>
         <tr><td><code>MEM.LINK / MEM.UNLINK</code></td><td>from to rel [weight]</td><td>OK</td></tr>
         <tr><td><code>MEM.NEIGH / MEM.TRAV</code></td><td>from [rel] / start depth</td><td>neighbors / traversal</td></tr>
         <tr><td><code>MEM.REMEMBER.T</code></td><td>[AGENT name] text source sal vf vt f1...</td><td>:id (bi-temporal)</td></tr>
-        <tr><td><code>MEM.RECALL.AS_OF</code></td><td>[AGENT name] k query as_of f1...</td><td>valid facts (scoped)</td></tr>
+        <tr><td><code>MEM.RECALL.AS_OF</code></td><td>[AGENT name] k query as_of f1...</td><td>valid facts (scoped) + bi-temporal triple per hit</td></tr>
         <tr><td><code>MEM.PROC.SET / GET / LIST</code></td><td>agent name [body]</td><td>OK / body / array</td></tr>
         <tr><td><code>MEM.WM_SET / GET / DELETE</code></td><td>agent key [value] ttl_ms</td><td>OK / bulk / OK</td></tr>
         <tr><td><code>MEM.EPISODE / EPISODES / FORGET</code></td><td>agent kind payload / agent limit / agent seq</td><td>:seq / array / OK</td></tr>

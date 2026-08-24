@@ -554,3 +554,43 @@ were silently dropped. Fix: `Memory::open` uses reserved namespace
 
 ### Verification
 prove-it 31/31 · cargo 181/181 · mix repro stable pre/post restart.
+
+---
+
+## 10. LoCoMo retrieval diagnostic — where the points actually leak (2026-08-24)
+
+`scripts/locomo_diag.py`: ingest LoCoMo turns straight into MEM.* over RESP
+(real embeddings via OpenAI-compatible endpoint — nomic-embed-text-v1.5 on
+the homelab box, or local fastembed bge-small), session date grounded into
+the stored text AND `valid_from`, `dia_id` as provenance `source`; then
+measure gold-evidence hit@k per category — pure retrieval truth, no LLM
+judge, no extraction pipeline.
+
+### Results (conversation 1, 199 QAs, k=10)
+
+| category | hit@10 | note |
+|---|---:|---|
+| temporal | **86.5%** | was 5.9% in the cold pipeline run — date-grounding + bi-temporal wiring fixed it |
+| adversarial | 72.3% | |
+| open_domain | 67.1% | |
+| multi_hop | 46-54% | needs graph traversal (MEM.LINK/TRAV) or extracted atomic facts |
+| single_hop | 43.8% | worst — questions paraphrase one detail buried in a chatty turn |
+| OVERALL | 66.3-66.8% | recall latency 0.5-0.7 ms — engine is free |
+
+### Findings
+1. **The 5.9% temporal disaster was wiring, not the engine**: same DB, dates
+   fed in → 86%. Bi-temporal primitives work when they're fed.
+2. **Embedder-invariance**: bge-small-384 vs nomic-768 differ by ~0.5%
+   overall. Embedding quality is NOT the current bottleneck at this
+   granularity.
+3. **hit@1 ≈ 6-15% while hit@10 ≈ 67%**: gold is retrieved but buried.
+   Ranking/granularity problem — raw dialog turns dilute the single fact a
+   question targets. Atomic-fact extraction (memgent's lane) and/or sentence
+   granularity + reranking is where the missing points live.
+
+Ops lessons from the session (all self-inflicted): the eval tool waits on
+background children even when detached-with-nohup; pipes (`grep|tail`)
+buffer away your progress lines; /tmp venvs die with shutdowns; aborted
+runs leave port-holding zombies that poison the next run. The diag script
+now prints an embedder pre-flight ETA, batches HTTP embeds with progress,
+and always kills its server via atexit.

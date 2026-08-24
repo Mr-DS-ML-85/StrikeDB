@@ -2241,10 +2241,18 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let hits = db.rag.memory().recall_scoped(&agent, &query, &qvec, k);
             let mut out = Vec::new();
             for h in hits {
+                // Per-hit: id, score, source, text + the bi-temporal window
+                // (created_ts, valid_from, valid_to). Callers doing temporal
+                // reasoning (LoCoMo-style "when did X happen" / as-of Qs)
+                // need these inline — without them every hit costs a
+                // round-trip to MEM.GET or goes answered blind.
                 out.push(Resp::Int(h.id as i64));
                 out.push(Resp::Bulk(format!("{:.6}", h.score).into_bytes()));
                 out.push(Resp::Bulk(h.meta.source.into_bytes()));
                 out.push(Resp::Bulk(h.text.into_bytes()));
+                out.push(Resp::Int(h.meta.created_ts as i64));
+                out.push(Resp::Int(h.meta.valid_from as i64));
+                out.push(Resp::Int(h.meta.valid_to as i64));
             }
             Resp::Array(out)
         }
@@ -2413,6 +2421,11 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 out.push(Resp::Bulk(format!("{:.6}", h.score).into_bytes()));
                 out.push(Resp::Bulk(h.meta.source.into_bytes()));
                 out.push(Resp::Bulk(h.text.into_bytes()));
+                // Same bi-temporal triple as MEM.RECALL — callers reason
+                // about validity windows without extra round-trips.
+                out.push(Resp::Int(h.meta.created_ts as i64));
+                out.push(Resp::Int(h.meta.valid_from as i64));
+                out.push(Resp::Int(h.meta.valid_to as i64));
             }
             Resp::Array(out)
         }

@@ -228,6 +228,14 @@ whose validity interval contains `t` — the Graphiti primitive for
 non-contradictory reasoning about evolving state ("what did we know at time
 T" instead of "what do we know now").
 
+Every recall hit returns its **bi-temporal window inline**:
+`id · score · source · text · created_ts · valid_from · valid_to` — so
+callers doing temporal reasoning never need a round-trip to `MEM.GET`.
+Grounding facts with real-world timestamps at write time (`MEM.REMEMBER.T`)
+and date-stamping stored text is what makes temporal QA solvable at all:
+on the LoCoMo benchmark, wiring session dates into ingest moved temporal
+retrieval from broken to **86% hit@10** (`scripts/locomo_diag.py`).
+
 ### Per-agent recall scoping (security)
 
 LTM recall is **owner-scoped**: every memory is written with an owning agent
