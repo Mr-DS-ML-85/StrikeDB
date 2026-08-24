@@ -2,6 +2,7 @@
 //! key conventions over the single storage substrate. No view owns its own
 //! engine; they share one MVCC + WAL substrate.
 
+pub mod payload;
 pub mod kv;
 pub mod table;
 pub mod timeseries;

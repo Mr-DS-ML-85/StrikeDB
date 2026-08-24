@@ -543,6 +543,12 @@ impl Engine {
     }
 
     /// Monotonic timestamp source (also serves as the logical commit clock).
+    /// Durable-state file paths `(wal, snapshot)` — used by the snapshot
+    /// API to copy/restore the checkpointed world.
+    pub fn paths(&self) -> (PathBuf, PathBuf) {
+        (self.wal_path.clone(), snap_path_for(&self.wal_path))
+    }
+
     pub fn now(&self) -> u64 {
         self.clock.fetch_add(1, Ordering::SeqCst) + 1
     }

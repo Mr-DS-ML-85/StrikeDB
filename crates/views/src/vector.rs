@@ -34,6 +34,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, RwLock};
 use storage::{Engine, Value};
+use crate::payload;
 
 /// MODULE 4 — a predicate over a node's `attr` (its category id). Qdrant forces
 /// you to pick ONE strategy (pre-filter, which breaks graph connectivity, or
@@ -5963,6 +5964,185 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
     pub fn corpus_sweep(&self) -> Option<()> {
         let mut g = self.gpu_idx.write().unwrap();
         g.as_mut()?.corpus.as_mut()?.sweep().ok()
+    }
+
+    // ══ GAP-4 closures: JSON payloads, filters, recommend, MMR, radius ══
+
+    fn payload_store(&self) -> payload::PayloadStore {
+        payload::PayloadStore::new(Arc::clone(&self.engine))
+    }
+
+    /// Durable arbitrary-JSON payload per point (`vp:` key convention).
+    pub fn set_payload(&self, id: u64, json: &[u8]) -> std::io::Result<()> {
+        let ps = self.payload_store();
+        ps.set(&self.prefix, id, json).map(|_| ())
+    }
+    pub fn get_payload_raw(&self, id: u64) -> Option<Vec<u8>> {
+        self.payload_store().get_raw(&self.prefix, id)
+    }
+    pub fn del_payload(&self, id: u64) -> std::io::Result<bool> {
+        self.payload_store().del(&self.prefix, id)
+    }
+
+    /// Filtered ANN: over-fetch the plain walk then post-filter payloads
+    /// until `k` survivors. Post-filtering keeps the hot traversal untouched;
+    /// a posting-list planner can replace this later without wire changes.
+    /// Returns only ids that HAVE payloads matching; un-payloaded ids are
+    /// dropped when a filter is present (Qdrant semantics).
+    pub fn search_with_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: &payload::Filter,
+    ) -> Vec<(u64, f32)> {
+        let ps = self.payload_store();
+        let mut out: Vec<(u64, f32)> = Vec::with_capacity(k);
+        for (id, dist) in self.search_ef(query, k * 3, ef) {
+            let Some(raw) = ps.get_raw(&self.prefix, id) else { continue };
+            let Ok(doc) = payload::parse_json(&raw) else { continue };
+            if filter.eval(id, &doc) {
+                out.push((id, dist));
+                if out.len() == k {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Qdrant-style Recommend — `best_score` strategy, exact formula from
+    /// qdrant.tech/documentation/search/explore:
+    ///
+    ///   sigmoid(x) = 0.5 * (1 + x/(1+|x|))
+    ///   score(v) = best_pos > best_neg ? +sigmoid(best_pos)
+    ///                                   : -sigmoid(best_neg)
+    ///
+    /// where best_pos/best_neg are MAX similarities against the example sets.
+    /// Negative-only queries are supported (outlier/discovery search).
+    /// Returned "distance" is `1 − score`, ascending = most recommended first.
+    pub fn recommend(
+        &self,
+        positive: &[u64],
+        negative: &[u64],
+        k: usize,
+        _lambda: f32,
+    ) -> Vec<(u64, f32)> {
+        let sigmoid = |x: f64| 0.5 * (1.0 + x / (1.0 + x.abs()));
+        let g = self.hnsw.read().unwrap();
+        let pos_v: Vec<Vec<f32>> = positive
+            .iter()
+            .filter_map(|id| g.id_to_idx.get(id).map(|&i| g.vec_at_f32(i).to_vec()))
+            .collect();
+        let neg_v: Vec<Vec<f32>> = negative
+            .iter()
+            .filter_map(|id| g.id_to_idx.get(id).map(|&i| g.vec_at_f32(i).to_vec()))
+            .collect();
+        let mut scored: Vec<(u64, f64)> = Vec::with_capacity(g.nodes.len());
+        for node in &g.nodes {
+            if node.deleted { continue; }
+            let Some(&idx) = g.id_to_idx.get(&node.id) else { continue };
+            let v = g.vec_at_f32(idx);
+            let sim = |e: &[f32]| -> f64 {
+                v.iter().zip(e).map(|(x, y)| (*x as f64) * (*y as f64)).sum::<f64>()
+            };
+            let bp = pos_v.iter().map(|e| sim(e)).fold(f64::MIN, f64::max);
+            let bn = neg_v.iter().map(|e| sim(e)).fold(f64::MIN, f64::max);
+            let score = if neg_v.is_empty() && !pos_v.is_empty() {
+                sigmoid(bp)
+            } else if pos_v.is_empty() {
+                -sigmoid(bn)
+            } else if bp > bn {
+                sigmoid(bp)
+            } else {
+                -sigmoid(bn)
+            };
+            scored.push((node.id, score));
+        }
+        drop(g);
+        // Distance-form: score ∈ [-1,1] → d = 1 − score ∈ [0,2], ascending.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored.into_iter().map(|(id, s)| (id, (1.0 - s) as f32)).collect()
+    }
+
+    /// MMR re-rank of an over-fetched candidate list:
+    ///   argmax  λ·rel(c) − (1−λ)·max sim(c, selected)
+    pub fn mmr_search(&self, query: &[f32], k: usize, ef: usize, lambda: f32) -> Vec<(u64, f32)> {
+        let cands = self.search_ef(query, k * 4, ef);
+        if cands.is_empty() { return cands; }
+        let g = self.hnsw.read().unwrap();
+        let vec_of = |id: u64| -> Option<Vec<f32>> {
+            g.id_to_idx.get(&id).map(|&i| g.vec_at_f32(i).to_vec())
+        };
+        let lam = lambda.clamp(0.0, 1.0);
+        let mut pool: Vec<(u64, f32)> = cands;
+        pool.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut selected: Vec<(u64, f32)> = Vec::with_capacity(k);
+        while selected.len() < k && !pool.is_empty() {
+            let mut bi = 0usize;
+            let mut bs = f32::MIN;
+            for (pi, (id, dist)) in pool.iter().enumerate() {
+                let rel = 1.0 - dist;
+                let div = selected
+                    .iter()
+                    .filter_map(|(sid, _)| {
+                        vec_of(*sid).zip(vec_of(*id)).map(|(a, b)| {
+                            a.iter().zip(&b).map(|(x, y)| x * y).sum::<f32>()
+                        })
+                    })
+                    .fold(0f32, |m, s| m.max(s));
+                let score = lam * rel - (1.0 - lam) * div;
+                if score > bs { bs = score; bi = pi; }
+            }
+            let (id, dist) = pool.remove(bi);
+            selected.push((id, dist));
+        }
+        selected
+    }
+
+    /// Radius search: everything within `max_dist`, capped at `max_k`.
+    pub fn radius_search(
+        &self,
+        query: &[f32],
+        max_dist: f32,
+        max_k: usize,
+        ef: usize,
+    ) -> Vec<(u64, f32)> {
+        self.search_ef(query, max_k, ef)
+            .into_iter()
+            .filter(|(_, d)| *d <= max_dist)
+            .collect()
+    }
+
+    /// Facet counts over payload documents for this namespace's points.
+    /// Counts top-level scalar values of `field`; returns up to `k`
+    /// `(value, count)` pairs sorted by count desc.
+    pub fn facet(&self, field: &str, k: usize) -> Vec<(String, u64)> {
+        use std::collections::HashMap as Map;
+        let ps = self.payload_store();
+        let prefix = format!("vp:{}:", self.prefix).into_bytes();
+        let snap = self.engine.snapshot();
+        let mut counts: Map<String, u64> = Map::new();
+        for (key, _) in self.engine.scan_prefix(&prefix, snap) {
+            if let Some(storage::Value::Bytes(b)) = self.engine.get(&key) {
+                if let Ok(doc) = payload::parse_json(&b) {
+                    for v in payload::values_at_pub(&doc, field) {
+                        let label = match v {
+                            payload::Json::Str(s) => s.clone(),
+                            payload::Json::Num(n) => format!("{n}"),
+                            payload::Json::Bool(b) => format!("{b}"),
+                            _ => continue,
+                        };
+                        *counts.entry(label).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(String, u64)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        out.truncate(k);
+        out
     }
 
     /// Structural health probe for the HNSW graph — BUG-1-class regression

@@ -52,6 +52,7 @@ use router::{Router, TieredMemory};
 use std::collections::HashMap;
 use storage::{Engine, Value};
 use views::{Filter, Kv, LearnedEf, Row, TimeSeries};
+use views::payload;
 
 struct Db {
     engine: Arc<Engine>,
@@ -618,6 +619,13 @@ fn format_ts_val(v: f64) -> String {
 /// command. Returns (scope, remaining-args). Default scope is "default" so
 /// unscoped clients keep one shared pool; agents that identify themselves are
 /// hard-isolated from each other at recall time.
+fn chrono_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 fn parse_agent_scope(args: &[Vec<u8>]) -> (String, &[Vec<u8>]) {
     if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"AGENT") {
         (String::from_utf8_lossy(&args[1]).to_string(), &args[2..])
@@ -1732,6 +1740,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let hits = vi.search_unified(
                 &q, k, 128, filter.as_ref(), learned.as_ref(), sparse.as_deref(), 50,
             );
+
             let mut out = Vec::new();
             for (id, dist) in hits {
                 out.push(Resp::Int(id as i64));
@@ -1761,6 +1770,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let mut filter: Option<Filter> = None;
             let mut use_learned = false;
             let mut sparse: Option<Vec<(u32, f32)>> = None;
+            let mut pfilter: Option<payload::Filter> = None;
+            let mut mmr_lambda: Option<f32> = None;
+            let mut radius: Option<f32> = None;
             while i < args.len() {
                 let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
                 if tok == "F" {
@@ -1772,6 +1784,41 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                         None => return err("F category is not an integer"),
                     };
                     filter = Some(Filter::Eq(cat));
+                    i += 2;
+
+                } else if tok == "PFILTER" {
+                    if i + 1 >= args.len() {
+                        return err("PFILTER requires a JSON filter document");
+                    }
+                    let parsed = payload::parse_json(&args[i + 1])
+                        .map_err(|e| format!("PFILTER bad JSON: {e}"))
+                        .and_then(|d| payload::Filter::parse(&d));
+                    match parsed {
+                        Ok(f) => pfilter = Some(f),
+                        Err(e) => return err(&format!("PFILTER: {e}")),
+                    }
+                    i += 2;
+                } else if tok == "MMR" {
+                    if i + 1 >= args.len() {
+                        return err("MMR requires lambda in [0,1]");
+                    }
+                    mmr_lambda = std::str::from_utf8(&args[i + 1])
+                        .ok()
+                        .and_then(|v| v.parse().ok());
+                    if mmr_lambda.is_none() {
+                        return err("MMR lambda is not a number");
+                    }
+                    i += 2;
+                } else if tok == "RADIUS" {
+                    if i + 1 >= args.len() {
+                        return err("RADIUS requires max distance");
+                    }
+                    radius = std::str::from_utf8(&args[i + 1])
+                        .ok()
+                        .and_then(|v| v.parse().ok());
+                    if radius.is_none() {
+                        return err("RADIUS is not a number");
+                    }
                     i += 2;
                 } else if tok == "L" {
                     use_learned = true;
@@ -1812,15 +1859,232 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if use_learned && learned.is_none() {
                 return err("learned search requires VCALIBRATE first");
             }
-            let hits = vi.search_unified(
-                &q, k, 128, filter.as_ref(), learned.as_ref(), sparse.as_deref(), 50,
-            );
+            if pfilter.is_some() && (mmr_lambda.is_some() || radius.is_some()) {
+                return err("PFILTER cannot combine with MMR/RADIUS in one query");
+            }
+            let hits = if let Some(f) = pfilter.as_ref() {
+                vi.search_with_filter(&q, k, 128.max(k * 3), f)
+            } else if let Some(lam) = mmr_lambda {
+                vi.mmr_search(&q, k, 128, lam)
+            } else if let Some(r) = radius {
+                vi.radius_search(&q, r, k, 128)
+            } else {
+                vi.search_unified(
+                    &q, k, 128, filter.as_ref(), learned.as_ref(), sparse.as_deref(), 50,
+                )
+            };
             let mut out = Vec::new();
             for (id, dist) in hits {
                 out.push(Resp::Int(id as i64));
                 out.push(Resp::Bulk(format!("{dist:.6}").into_bytes()));
             }
             Resp::Array(out)
+        }
+
+        // VSETPAYLOAD ns id <json> — durable arbitrary JSON payload per point.
+        "VSETPAYLOAD" => {
+            if args.len() != 3 {
+                return err("VSETPAYLOAD requires namespace id json");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let id: u64 = match std::str::from_utf8(&args[1]).ok().and_then(|v| v.parse().ok()) {
+                Some(n) => n,
+                None => return err("id is not a u64"),
+            };
+            match db.router.vectors_ns(&namespace).set_payload(id, &args[2]) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+        // VGETPAYLOAD ns id -> bulk JSON (or nil)
+        "VGETPAYLOAD" => {
+            if args.len() != 2 {
+                return err("VGETPAYLOAD requires namespace id");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let id: u64 = match std::str::from_utf8(&args[1]).ok().and_then(|v| v.parse().ok()) {
+                Some(n) => n,
+                None => return err("id is not a u64"),
+            };
+            match db.router.vectors_ns(&namespace).get_payload_raw(id) {
+                Some(b) => Resp::Bulk(b),
+                None => Resp::Bulk(b"null".to_vec()),
+            }
+        }
+        // VDELPAYLOAD ns id -> :0/:1
+        "VDELPAYLOAD" => {
+            if args.len() != 2 {
+                return err("VDELPAYLOAD requires namespace id");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let id: u64 = match std::str::from_utf8(&args[1]).ok().and_then(|v| v.parse().ok()) {
+                Some(n) => n,
+                None => return err("id is not a u64"),
+            };
+            match db.router.vectors_ns(&namespace).del_payload(id) {
+                Ok(true) => Resp::Int(1),
+                Ok(false) => Resp::Int(0),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+        // VRECOMMEND ns k lambda POS id... [NEG count id...] — best_score.
+        "VRECOMMEND" => {
+            if args.len() < 5 {
+                return err("VRECOMMEND requires namespace k lambda POS n id... [NEG n id...]");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(|v| v.parse().ok()) {
+                Some(v) => v,
+                None => return err("k is not an integer"),
+            };
+            let lambda: f32 = match std::str::from_utf8(&args[2]).ok().and_then(|v| v.parse().ok()) {
+                Some(v) => v,
+                None => return err("lambda is not a number"),
+            };
+            // Repeatable example specifiers: `POS <id>` / `NEG <id>`, any
+            // number of each, any order — mirrors Qdrant's positive/negative
+            // arrays without inventing count prefixes.
+            let mut i = 3usize;
+            let mut pos: Vec<u64> = Vec::new();
+            let mut neg: Vec<u64> = Vec::new();
+            while i + 1 < args.len() {
+                let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if tok == "POS" || tok == "NEG" {
+                    if let Some(id) = std::str::from_utf8(&args[i + 1])
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                    {
+                        if tok == "POS" { pos.push(id); } else { neg.push(id); }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if pos.is_empty() {
+                return err("VRECOMMEND requires at least one POS id");
+            }
+            let hits = db.router.vectors_ns(&namespace).recommend(&pos, &neg, k, lambda);
+            let mut out = Vec::new();
+            for (id, dist) in hits {
+                out.push(Resp::Int(id as i64));
+                out.push(Resp::Bulk(format!("{dist:.6}").into_bytes()));
+            }
+            Resp::Array(out)
+        }
+        // VFACET ns field k -> flat value,count pairs
+        "VFACET" => {
+            if args.len() != 3 {
+                return err("VFACET requires namespace field k");
+            }
+            let namespace = String::from_utf8_lossy(&args[0]).to_string();
+            let field = String::from_utf8_lossy(&args[1]).to_string();
+            let k: usize = std::str::from_utf8(&args[2]).ok().and_then(|v| v.parse().ok())
+                .unwrap_or(10);
+            let out: Vec<Resp> = db.router.vectors_ns(&namespace).facet(&field, k)
+                .into_iter()
+                .flat_map(|(value, count)| vec![
+                    Resp::Bulk(value.into_bytes()),
+                    Resp::Int(count as i64),
+                ])
+                .collect();
+            Resp::Array(out)
+        }
+        // VSNAPSHOT CREATE [name] | LIST | RESTORE <name>
+        // Reuses the durability machinery: checkpoint first, then copy the
+        // checkpointed world (wal + snap) into snapshots/<name>/.
+        "VSNAPSHOT" => {
+            use std::path::PathBuf;
+            let sub = args.first()
+                .map(|a| String::from_utf8_lossy(a).to_uppercase())
+                .unwrap_or_default();
+            let snap_dir = PathBuf::from("snapshots");
+            match sub.as_str() {
+                "CREATE" => {
+                    let name = args.get(1)
+                        .map(|a| String::from_utf8_lossy(a).to_string())
+                        .unwrap_or_else(|| format!("snap-{}", chrono_ms()));
+                    let vi = db.router.vectors();
+                    let _ = vi; // engine lives behind every index; take from router's shared engine below
+                    // Use the default index's engine (single substrate).
+                    let eng = db.router.engine();
+                    if let Err(e) = eng.checkpoint() {
+                        return err(&format!("ERR checkpoint: {e}"));
+                    }
+                    let (wal, snap) = eng.paths();
+                    let dst = snap_dir.join(&name);
+                    if let Err(e) = std::fs::create_dir_all(&dst) {
+                        return err(&format!("ERR snapshot dir: {e}"));
+                    }
+                    for src in [&wal, &snap] {
+                        if src.exists() {
+                            let fname = src.file_name().unwrap();
+                            if let Err(e) =
+                                std::fs::copy(src, dst.join(fname))
+                            {
+                                return err(&format!(
+                                    "ERR copy {}: {e}",
+                                    fname.to_string_lossy()
+                                ));
+                            }
+                        }
+                    }
+                    Resp::Simple(format!("OK snapshot {name} created").into())
+                }
+                "LIST" => {
+                    let mut entries: Vec<String> = Vec::new();
+                    if let Ok(rd) = std::fs::read_dir(&snap_dir) {
+                        for e in rd.flatten() {
+                            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                entries.push(e.file_name().to_string_lossy().into_owned());
+                            }
+                        }
+                    }
+                    entries.sort();
+                    Resp::Array(entries.into_iter().map(|n| Resp::Bulk(n.into_bytes())).collect())
+                }
+                "RESTORE" => {
+                    let name = match args.get(1) {
+                        Some(a) => String::from_utf8_lossy(a).to_string(),
+                        None => return err("VSNAPSHOT RESTORE requires a name (see VSNAPSHOT LIST)"),
+                    };
+                    let src = snap_dir.join(&name);
+                    if !src.is_dir() {
+                        return err(&format!("ERR no such snapshot {name}"));
+                    }
+                    let eng = db.router.engine();
+                    if let Err(e) = eng.checkpoint() {
+                        return err(&format!("ERR checkpoint: {e}"));
+                    }
+                    let (wal, snap) = eng.paths();
+                    // Back the live world up before overwriting (undoable).
+                    let ms = chrono_ms();
+                    for live in [&wal, &snap] {
+                        if live.exists() {
+                            let mut bak = live.clone().into_os_string();
+                            bak.push(format!(".pre-restore-{ms}"));
+                            if let Err(e) = std::fs::rename(live, &bak) {
+                                return err(&format!("ERR staging live state: {e}"));
+                            }
+                        }
+                    }
+                    for f in ["dbstrike.wal", "dbstrike.wal.snap"] {
+                        let p = src.join(f);
+                        if p.exists() {
+                            if let Err(e) = std::fs::copy(
+                                &p,
+                                wal.parent()
+                                    .unwrap_or(std::path::Path::new("."))
+                                    .join(f),
+                            ) {
+                                return err(&format!("ERR restore {f}: {e}"));
+                            }
+                        }
+                    }
+                    Resp::Simple("OK snapshot staged — restart to load restored world".into())
+                }
+                _ => err("VSNAPSHOT CREATE [name] | LIST | RESTORE <name>"),
+            }
         }
 
         // VSEARCHA k f1 f2 ...   -> query-adaptive k-NN (ruvector-style).
