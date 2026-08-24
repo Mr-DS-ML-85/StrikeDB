@@ -276,8 +276,16 @@ impl GpuState {
                 eprintln!("[GPU] cuModuleLoadDataEx failed: {}", ret);
                 return;
             }
-            // Get ALL function handles from the loaded module.
-            for name in &["cosine_dist_kernel", "batch_cosine_dist_kernel", "batch_cosine_dist_f32_kernel", "apgc_search_kernel", "matmul_kernel", "topk_select_kernel", "fused_cosine_topk_kernel", "preprocess_i8_to_f32_kernel", "apgc_optimize_kernel", "apgc_reverse_kernel", "apgc_merge_kernel", "nn_rev_kernel", "nn_descent_kernel", "opusedge_selkv_prune", "opusedge_delta_ar_route", "opusedge_head_gate", "opusedge_state_compress", "opusedge_proxy_delta"] {
+            // Get function handles for kernels the host actually launches.
+            // BUG-3 resolution: this list used to compile 18 names, but only
+            // these 8 are ever fetched via get_kernel — the other 10
+            // (apgc_optimize/reverse/merge, batch_cosine_dist_f32,
+            // preprocess_i8_to_f32 and the five standalone opusedge_*) were
+            // dead weight paid in NVRTC startup time on every boot. Their
+            // source remains in kernels/all_kernels.cu for reference; the
+            // live OpusEdge effect is the SelKV gate + δ-presort INSIDE
+            // apgc_search_kernel.
+            for name in &["cosine_dist_kernel", "batch_cosine_dist_kernel", "apgc_search_kernel", "matmul_kernel", "topk_select_kernel", "fused_cosine_topk_kernel", "nn_rev_kernel", "nn_descent_kernel"] {
                 let cname = CString::new(*name).unwrap();
                 let mut func = std::ptr::null_mut();
                 if cuModuleGetFunction(&mut func, self.module, cname.as_ptr()) == 0 {
@@ -592,11 +600,6 @@ pub fn gpu_check_capacity(n: usize, dim: usize) -> (bool, usize, usize) {
     }
 }
 
-/// Auto-tier: decide GPU vs CPU+RAM based on data size vs VRAM.
-pub fn gpu_tier_strategy(n: usize, dim: usize) -> ComputeMode {
-    gpu_auto_mode(n, dim)
-}
-
 /// Compute mode — controls how DB-Strike routes work across GPU/RAM/CPU.
 ///
 /// ```text
@@ -683,7 +686,13 @@ pub fn gpu_set_mode(mode: ComputeMode) {
 
 /// Auto-detect optimal mode based on GPU availability and data size.
 /// Call once after init with the dataset dimensions.
-pub fn gpu_auto_mode(n: usize, dim: usize) -> ComputeMode {
+/// PURE tier recommendation for a hypothetical `(n, dim)` — NO side effects.
+///
+/// This used to be an alias of `gpu_auto_mode`, whose `gpu_set_mode` call
+/// made every `GPU.INFO` silently flip the user's chosen compute mode to
+/// Turbo (a diagnostic with write access to policy state). Diagnostics must
+/// not mutate; only the explicit `GPU.MODE auto` command may.
+pub fn gpu_tier_strategy(n: usize, dim: usize) -> ComputeMode {
     if !gpu_available() {
         return ComputeMode::CpuOnly;
     }
@@ -692,36 +701,21 @@ pub fn gpu_auto_mode(n: usize, dim: usize) -> ComputeMode {
     let shards = 16usize;
     let shard_n = (n + shards - 1) / shards;
     let build_peak = shard_n * dim + 512 * shard_n * 4 + 20 * 1024 * 1024;
-    let data_only = n * dim + n * 80 * 4;
-
     if build_peak <= vram_free {
-        let mode = ComputeMode::Turbo;
-        gpu_set_mode(mode);
-        mode
-    } else if data_only <= vram_free {
-        let mode = ComputeMode::Hybrid;
-        gpu_set_mode(mode);
-        mode
+        ComputeMode::Turbo
     } else {
-        let mode = ComputeMode::Hybrid;
-        gpu_set_mode(mode);
-        mode
+        // Hybrid covers fits-in-VRAM AND tiered >VRAM; CorpusTier decides
+        // per-block placement at upload time.
+        ComputeMode::Hybrid
     }
 }
 
-/// Check if data of given size should use GPU path in current mode.
-pub fn gpu_should_use_gpu(n: usize, dim: usize) -> bool {
-    let mode = gpu_get_mode();
-    match mode {
-        ComputeMode::Turbo => true,
-        ComputeMode::Hybrid => {
-            // Use GPU if data fits in VRAM; otherwise CPU fallback for this chunk
-            let (fits, _, _) = gpu_check_capacity(n, dim);
-            fits
-        }
-        ComputeMode::CpuOnly => false,
-    }
+pub fn gpu_auto_mode(n: usize, dim: usize) -> ComputeMode {
+    let mode = gpu_tier_strategy(n, dim);
+    gpu_set_mode(mode);
+    mode
 }
+
 
 /// Legacy alias.
 pub type GpuTier = ComputeMode;

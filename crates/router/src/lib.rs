@@ -63,6 +63,16 @@ impl Router {
             .clone()
     }
 
+    /// Enumerate all open vector indexes as `(name, index)` pairs, default
+    /// namespace first. Read-only snapshot for diagnostics (GPU.INFO).
+    pub fn vector_indexes(&self) -> Vec<(String, Arc<VectorIndex>)> {
+        let mut out = vec![("default".to_string(), Arc::clone(&self.vectors_default))];
+        for (name, idx) in self.vectors_ns.read().unwrap().iter() {
+            out.push((name.clone(), Arc::clone(idx)));
+        }
+        out
+    }
+
     /// Enumerate all open namespaces as `(name, element_count)` pairs.
     /// The default (non-namespaced) index only appears once it has been
     /// opened; namespaces created via `vectors_ns` are always listed.

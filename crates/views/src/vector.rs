@@ -5950,6 +5950,21 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
 
     /// k-NN search returning (id, cosine_distance) ascending.
     /// Default search-ef of 128 gives Qdrant-class recall at 100k+ scale.
+    /// Live VUGVA corpus-tier stats for GPU.INFO: per open index,
+    /// `Some((spill_bytes, dram_bytes, vram_blocks, numa_bound))` when the
+    /// corpus is tier-backed (Hybrid), None for Turbo/CpuOnly.
+    pub fn corpus_tier_stats(&self) -> Option<(usize, usize, usize, bool)> {
+        let g = self.gpu_idx.read().unwrap();
+        g.as_ref().and_then(|idx| idx.corpus.as_ref()).map(|c| c.stats())
+    }
+
+    /// Run one VUGVA eviction sweep over this index's tier-backed corpus.
+    /// `None` when no tier is attached (Turbo/CpuOnly or upload pending).
+    pub fn corpus_sweep(&self) -> Option<()> {
+        let mut g = self.gpu_idx.write().unwrap();
+        g.as_mut()?.corpus.as_mut()?.sweep().ok()
+    }
+
     /// Structural health probe for the HNSW graph — BUG-1-class regression
     /// signal. Returns `(nodes, zero_degree_l0, bfs_reachable_from_entry,
     /// out_of_range_edges)`. A collapsed build shows as low reachability;

@@ -48,6 +48,8 @@ pub struct CorpusTier {
     /// against the shape the corpus was allocated with.
     n: usize,
     dim: usize,
+    /// GPU count the pool was built with (for per-GPU stats iteration).
+    gpus: usize,
 }
 
 impl CorpusTier {
@@ -93,6 +95,7 @@ impl CorpusTier {
             Tier::Dram
         };
 
+        let gpus = gpu_ordinals.len();
         let name = pool
             .allocate("dbstrike.corpus.i8", &[n, dim], 1, tier)
             .map_err(|e| format!("VUGVA corpus allocate failed: {e}"))?;
@@ -101,6 +104,7 @@ impl CorpusTier {
             name,
             n,
             dim,
+            gpus,
         })
     }
 
@@ -161,6 +165,22 @@ impl CorpusTier {
         self.pool
             .background_sweep()
             .map_err(|e| format!("VUGVA sweep failed: {e}"))
+    }
+
+    /// Live tier statistics for GPU.INFO: `(spill_bytes, dram_bytes,
+    /// vram_cached_blocks, numa_bound)`. Zero spill/dram means the corpus
+    /// sits wholly in VRAM; nonzero spill proves T2 is carrying weight.
+    pub fn stats(&self) -> (usize, usize, usize, bool) {
+        let gpus = self.gpus;
+        let mut dram = 0usize;
+        let mut blocks = 0usize;
+        let mut numa = true;
+        for gi in 0..gpus {
+            if let Ok(d) = self.pool.dram_used(gi) { dram += d; }
+            if let Ok(b) = self.pool.vram_cached_blocks(gi) { blocks += b; }
+            if let Ok(nb) = self.pool.dram_numa_bound(gi) { numa &= nb; }
+        }
+        (self.pool.spill_used(), dram, blocks, numa)
     }
 
     /// Rows in the corpus.

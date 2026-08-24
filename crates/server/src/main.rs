@@ -2074,6 +2074,20 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
         }
 
+        // GPU.SWEEP — run one eviction sweep over every tier-backed corpus,
+        // demoting idle VRAM pages toward DRAM/NVMe (VUGVA page manager,
+        // paper §4.1). Cheap when nothing is resident; the lever for >VRAM
+        // working sets until automatic paging lands.
+        "GPU.SWEEP" => {
+            let mut swept = 0usize;
+            for (_name, idx) in db.router.vector_indexes() {
+                if idx.corpus_sweep().is_some() {
+                    swept += 1;
+                }
+            }
+            Resp::Simple(format!("OK swept {swept} tiered index(es)").into())
+        }
+
         // GPU.LOAD <kernel> — compile and load a CUDA kernel on demand.
         // Kernels: cosine_dist, matmul. Lazy: only compiled when first requested.
         "GPU.LOAD" => {
@@ -2099,6 +2113,18 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let excl = gpu::gpu_exclusive_reserved();
             out.push(Resp::Bulk(b"exclusive_reserved_bytes".to_vec()));
             out.push(Resp::Bulk(excl.to_string().into_bytes()));
+            // Live VUGVA corpus-tier stats per open namespace (BUG-2 tail).
+            for (name, idx) in db.router.vector_indexes() {
+                if let Some((spill, dram, blocks, numa)) = idx.corpus_tier_stats() {
+                    out.push(Resp::Bulk(format!("tier_{name}").into_bytes()));
+                    out.push(Resp::Bulk(
+                        format!(
+                            "spill={spill}B dram={dram}B vram_blocks={blocks} numa_local={numa}"
+                        )
+                        .into_bytes(),
+                    ));
+                }
+            }
             // Add tier strategy for common sizes.
             let strategy = gpu::gpu_tier_strategy(1_000_000, 384);
             out.push(Resp::Bulk(b"tier_1M_384d".to_vec()));
