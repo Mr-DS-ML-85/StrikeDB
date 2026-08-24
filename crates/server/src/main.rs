@@ -2095,6 +2095,10 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 out.push(Resp::Bulk(k.as_bytes().to_vec()));
                 out.push(Resp::Bulk(v.as_bytes().to_vec()));
             }
+            // Exclusive-mode live reservation (DBSTRIKE_GPU_EXCLUSIVE=1).
+            let excl = gpu::gpu_exclusive_reserved();
+            out.push(Resp::Bulk(b"exclusive_reserved_bytes".to_vec()));
+            out.push(Resp::Bulk(excl.to_string().into_bytes()));
             // Add tier strategy for common sizes.
             let strategy = gpu::gpu_tier_strategy(1_000_000, 384);
             out.push(Resp::Bulk(b"tier_1M_384d".to_vec()));

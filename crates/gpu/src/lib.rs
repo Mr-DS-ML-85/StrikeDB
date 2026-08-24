@@ -306,6 +306,96 @@ const KERNEL_SRC: &str = include_str!("../kernels/all_kernels.cu");
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Initialize GPU — detect CUDA, create context. Kernels NOT compiled yet.
+// ═══ Exclusive mode — claim spare VRAM so squatters cannot interfere ═══
+//
+// History that motivates this: a local llama-server holding 7 of 8 GB turned
+// every VRAM-sensitive decision (single-launch build buffers, corpus upload,
+// fused-rerank mirror) into a coin flip, and the APGC fallback it triggered
+// was BUG-1. `DBSTRIKE_GPU_EXCLUSIVE=1` claims all spare VRAM at init minus
+// a working reserve, so later processes simply fail to allocate instead of
+// silently degrading this engine.
+
+/// Balloon size for exclusive mode: current free VRAM minus the working
+/// reserve we leave for our own allocations. Underflow-safe, never negative.
+fn balloon_bytes(free: usize, reserve: usize) -> usize {
+    free.saturating_sub(reserve)
+}
+
+struct VramBalloon {
+    ptr: u64,
+    bytes: usize,
+}
+impl Drop for VramBalloon {
+    fn drop(&mut self) {
+        unsafe {
+            cuMemFree_v2(self.ptr);
+        }
+        eprintln!(
+            "[GPU] exclusive reservation released ({:.2} GB)",
+            self.bytes as f64 / 1073741824.0
+        );
+    }
+}
+
+static VRAM_BALLOON: std::sync::Mutex<Option<VramBalloon>> =
+    std::sync::Mutex::new(None);
+
+/// Claim spare VRAM for the process lifetime. Idempotent; logs the claim.
+/// Called from `gpu_init` when `DBSTRIKE_GPU_EXCLUSIVE=1`. The reserve stays
+/// unclaimed so this engine's own builds and uploads keep working.
+pub fn gpu_exclusive_claim() -> Option<usize> {
+    if std::env::var("DBSTRIKE_GPU_EXCLUSIVE").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let mut guard = VRAM_BALLOON.lock().ok()?;
+    if let Some(b) = guard.as_ref() {
+        return Some(b.bytes);
+    }
+    let state = GPU_STATE.get()?;
+    if !state.available || state.ctx.is_null() {
+        return None;
+    }
+    let reserve_mb: usize = std::env::var("DBSTRIKE_GPU_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
+    let (mut free, mut total) = (0usize, 0usize);
+    unsafe {
+        if cuCtxSetCurrent(state.ctx) != 0 || cuMemGetInfo_v2(&mut free, &mut total) != 0 {
+            return None;
+        }
+    }
+    let want = balloon_bytes(free, reserve_mb.saturating_mul(1024 * 1024));
+    if want < 64 * 1024 * 1024 {
+        eprintln!(
+            "[GPU] exclusive mode: only {free} B free — nothing worth claiming"
+        );
+        return None;
+    }
+    let mut ptr = 0u64;
+    unsafe {
+        if cuMemAlloc_v2(&mut ptr, want) != 0 {
+            eprintln!("[GPU] exclusive mode: claim of {want} B failed");
+            return None;
+        }
+    }
+    eprintln!(
+        "[GPU] EXCLUSIVE: reserved {:.2} GB spare VRAM ({reserve_mb} MB working reserve kept) — squatters cannot interfere",
+        want as f64 / 1073741824.0
+    );
+    *guard = Some(VramBalloon { ptr, bytes: want });
+    Some(want)
+}
+
+/// Live exclusive-reservation size in bytes, for GPU.INFO.
+pub fn gpu_exclusive_reserved() -> usize {
+    VRAM_BALLOON
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|b| b.bytes))
+        .unwrap_or(0)
+}
+
 pub fn gpu_init() -> bool {
     if GPU_ENABLED.load(Ordering::Relaxed) { return true; }
     // The context this process had was destroyed and cannot be rebuilt; see
@@ -323,6 +413,10 @@ pub fn gpu_init() -> bool {
     });
     if state.available {
         GPU_ENABLED.store(true, Ordering::Relaxed);
+        // Claim spare VRAM before anything else allocates, so the balloon is
+        // as large as possible and external processes are locked out from
+        // the first allocation onward.
+        let _ = gpu_exclusive_claim();
         true
     } else {
         false
@@ -2498,6 +2592,19 @@ fn gpu_search_batched(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Exclusive-mode balloon sizing: claims free-minus-reserve, never
+    /// negative, and never touches the reserve we need for our own work.
+    #[test]
+    fn balloon_sizing_math() {
+        assert_eq!(balloon_bytes(8 << 30, 2 << 30), 6 << 30);
+        // Reserve larger than free → claim nothing, no underflow panic.
+        assert_eq!(balloon_bytes(100 << 20, 2 << 30), 0);
+        // Exactly equal → nothing to claim.
+        assert_eq!(balloon_bytes(2 << 30, 2 << 30), 0);
+    }
+
     use super::*;
 
     #[test]
