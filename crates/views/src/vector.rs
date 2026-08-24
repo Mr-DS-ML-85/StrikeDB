@@ -4087,6 +4087,187 @@ impl VectorIndex {
     /// (int8 + layer-0 edges) stays in RAM; only the cold f32 payload is
     /// spilled, so live RAM at 100M+ scale drops to ~int8-only while recall is
     /// byte-identical (the rerank still reads exact f32 — just through mmap).
+    /// Emergency kNN source for the APGC GPU branch: used when the device
+    /// build fails (VRAM refusal, budget abort). Rebuilt after BUG-1's
+    /// 1M×384d collapse (self-recall 1/12); three defects fixed:
+    ///
+    /// 1. SILENT SEGMENT FAILURE — a failed `gpu_batch_cosine_dist_topk`
+    ///    left that segment's `all_knn` rows EMPTY and the log still printed
+    ///    "segment k/15" as if healthy. A graph with missing segments plus
+    ///    entry-hub wiring is exactly the collapse signature. Failure is now
+    ///    loud and recovered via CPU brute force (slow but correct beats
+    ///    fast and collapsed).
+    /// 2. BRIDGE COVERAGE CLIFF — each entry kept only its top-64 nearest
+    ///    nodes, so at 15 entries × 1M nodes just 960/1M nodes got real
+    ///    bridges; everyone else fell through to `nearest_entry = 0`.
+    ///    Now every node computes its true nearest foreign entry directly
+    ///    (O(n × segs) work, negligible next to the segment kNN).
+    /// 3. GARBAGE-DISTANCE EDGES — uncovered nodes kept `(f32::MAX, 0)`,
+    ///    and `f32::MAX * 1000.0 as i32` saturated into i32::MAX edge
+    ///    weights poisoning the diversity pass. No longer reachable: every
+    ///    node gets a measured distance or no bridge at all.
+    ///
+    /// Output is flat kNN in PERM-POSITION space (node i ↔ i8_all row i),
+    /// same contract as the success path.
+    fn apgc_fallback_knn(
+        i8_all: &[i8],
+        ranges: &[(usize, usize)],
+        n: usize,
+        dim: usize,
+        k_init: usize,
+    ) -> Vec<usize> {
+        let mut all_knn: Vec<Vec<(i32, i32)>> = vec![Vec::new(); n];
+        // Phase 1: within-segment kNN, failure-loud.
+        for (si, &(lo, hi)) in ranges.iter().enumerate() {
+            let seg_n = hi - lo;
+            if seg_n < 2 {
+                continue;
+            }
+            let seg_i8 = &i8_all[lo * dim..hi * dim];
+            match gpu::gpu_batch_cosine_dist_topk(seg_i8, seg_i8, seg_n, seg_n, dim, k_init) {
+                Some((indices, distances)) => {
+                    for local_i in 0..seg_n {
+                        let global_i = lo + local_i; // perm position
+                        for j in 0..k_init {
+                            let idx = indices[local_i * k_init + j];
+                            if idx >= 0 && (idx as usize) != local_i {
+                                let global_j = lo + idx as usize;
+                                let d = distances[local_i * k_init + j];
+                                all_knn[global_i].push(((d * 1000.0) as i32, global_j as i32));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "[GPU] segment {}/{}: GPU topk FAILED — recovering via CPU brute force",
+                        si + 1,
+                        ranges.len()
+                    );
+                    for local_i in 0..seg_n {
+                        let global_i = lo + local_i;
+                        let q = &i8_all[global_i * dim..global_i * dim + dim];
+                        let mut best: Vec<(i32, usize)> = Vec::with_capacity(seg_n);
+                        for other in 0..seg_n {
+                            if other == local_i {
+                                continue;
+                            }
+                            let d = cos_dist_q(q, &seg_i8[other * dim..other * dim + dim]);
+                            best.push(((d * 1000.0) as i32, other));
+                        }
+                        best.sort_unstable();
+                        best.truncate(k_init);
+                        for (d, other) in best {
+                            all_knn[global_i].push((d, (lo + other) as i32));
+                        }
+                    }
+                }
+            }
+            eprintln!("[GPU] segment {}/{}: {} nodes", si + 1, ranges.len(), seg_n);
+        }
+
+        // Phase 2: bridge — EVERY node finds its true nearest foreign entry.
+        // Direct per-node measurement replaces the old topk-per-entry scheme
+        // whose coverage capped at entries × width regardless of n.
+        let entries: Vec<usize> = ranges
+            .iter()
+            .filter_map(|&(lo, _)| if lo < n { Some(lo) } else { None })
+            .collect();
+        let mut nearest_entry: Vec<usize> = vec![usize::MAX; n];
+        let mut nearest_dists: Vec<f32> = vec![f32::MAX; n];
+        let gpu_ready = gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly && gpu::gpu_init();
+        for &eg in &entries {
+            let q = &i8_all[eg * dim..eg * dim + dim];
+            let dists: Option<Vec<f32>> = if gpu_ready {
+                gpu::gpu_cosine_dist(q, i8_all, n, dim)
+            } else {
+                None
+            };
+            match dists {
+                Some(dists) => {
+                    for (i, &d) in dists.iter().enumerate() {
+                        if d < nearest_dists[i] {
+                            nearest_dists[i] = d;
+                            nearest_entry[i] = eg;
+                        }
+                    }
+                }
+                None => {
+                    // CPU path per node against this entry.
+                    for (i, chunk) in i8_all.chunks_exact(dim).enumerate() {
+                        let d = cos_dist_q(chunk, q);
+                        if d < nearest_dists[i] {
+                            nearest_dists[i] = d;
+                            nearest_entry[i] = eg;
+                        }
+                    }
+                }
+            }
+        }
+        // Wire each node to its nearest FOREIGN entry (a node that resolved
+        // to its own segment's entry gets no bridge here — it already lives
+        // in that entry's neighbourhood).
+        let own_seg_of_entry: std::collections::HashMap<usize, usize> = ranges
+            .iter()
+            .enumerate()
+            .flat_map(|(si, &(lo, hi))| (lo..hi).map(move |i| (i, si)))
+            .collect();
+        for i in 0..n {
+            let eg = nearest_entry[i];
+            if eg == usize::MAX || eg == i || !nearest_dists[i].is_finite() {
+                continue;
+            }
+            let same_seg = own_seg_of_entry.get(&i) == own_seg_of_entry.get(&eg);
+            if same_seg {
+                continue;
+            }
+            let d = (nearest_dists[i] * 1000.0) as i32;
+            all_knn[i].push((d, eg as i32));
+            all_knn[eg].push((d, i as i32));
+        }
+        // Entry clique keeps the hubs mutually reachable.
+        for (a, &ea) in entries.iter().enumerate() {
+            for &eb in &entries[a + 1..] {
+                let d = (cos_dist_q(
+                    &i8_all[ea * dim..ea * dim + dim],
+                    &i8_all[eb * dim..eb * dim + dim],
+                ) * 1000.0) as i32;
+                all_knn[ea].push((d, eb as i32));
+                all_knn[eb].push((d, ea as i32));
+            }
+        }
+        // Dedup + cap, guaranteeing each node's bridge slot survives.
+        // PAD WITH SELF, not 0: downstream the flat graph feeds the level-0
+        // candidate pass, whose `nb != i` guard silently skips self-slots.
+        // Zero-padding made every under-full node carry phantom edges to
+        // NODE 0 — an invisible hub that rotted whole neighbourhoods (the
+        // deepest layer of the BUG-1 collapse, present on BOTH the old and
+        // new bridge code).
+        let mut knnf = vec![0usize; n * k_init];
+        for i in 0..n {
+            for slot in knnf[i * k_init..(i + 1) * k_init].iter_mut() {
+                *slot = i;
+            }
+            let entry_global = nearest_entry[i];
+            let mut edges = std::mem::take(&mut all_knn[i]);
+            edges.sort_by(|a, b| a.0.cmp(&b.0));
+            edges.dedup_by_key(|e| e.1);
+            edges.truncate(k_init.saturating_sub(1));
+            let has_entry = edges.iter().any(|&(_, nb)| nb == entry_global as i32);
+            if !has_entry && entry_global != usize::MAX && entry_global != i {
+                edges.push((
+                    ((if nearest_dists[i].is_finite() { nearest_dists[i] } else { 1.0 }) * 1000.0)
+                        as i32,
+                    entry_global as i32,
+                ));
+            }
+            for (j, (_, nb)) in edges.iter().enumerate().take(k_init) {
+                knnf[i * k_init + j] = *nb as usize;
+            }
+        }
+        knnf
+    }
+
     pub fn build_parallel_tiered(data: &[f32], dim: usize, n_shards: usize, tiered: bool) -> Self {
         eprintln!("[MITM] build_parallel_tiered: n={} dim={} shards={} tiered={}", data.len()/dim, dim, n_shards, tiered);
         let n = data.len() / dim;
@@ -4200,93 +4381,24 @@ impl VectorIndex {
                 }
             }
 
-            // Call APGC GPU build: seeds+kNN against all vectors, non-seeds→seeds
-            let knn_flat = if let Some(graph) = gpu::gpu_build_knn_graph(&i8_all, n, dim, k_init) {
-                graph
+            // Call APGC GPU build: seeds+kNN against all vectors, non-seeds→seeds.
+            // DBSTRIKE_FORCE_APGC_FALLBACK=1 routes straight to the fallback —
+            // the regression seam for BUG-1's collapsed-graph class (in
+            // production this path is entered only via VRAM-refusal/budget
+            // aborts whose timing varies with machine load).
+            let force_fallback =
+                std::env::var("DBSTRIKE_FORCE_APGC_FALLBACK").ok().as_deref() == Some("1");
+            let knn_flat = if !force_fallback {
+                match gpu::gpu_build_knn_graph(&i8_all, n, dim, k_init) {
+                    Some(graph) => graph,
+                    None => {
+                        eprintln!("[GPU] APGC build failed, falling back to segment kNN");
+                        Self::apgc_fallback_knn(&i8_all, &ranges, n, dim, k_init)
+                    }
+                }
             } else {
-                eprintln!("[GPU] APGC build failed, falling back to segment kNN");
-                // Fallback graph MUST be in PERM-POSITION space: the HNSW
-                // below indexes nodes by perm position (node i ↔ i8_all row i).
-                // The previous version pushed TRUE-ROW ids here — every edge
-                // pointed at the wrong node → zero recall.
-                let mut all_knn: Vec<Vec<(i32, i32)>> = vec![Vec::new(); n];
-                let seg_ranges: Vec<(usize, usize)> = ranges.clone();
-                for (si, &(lo, hi)) in seg_ranges.iter().enumerate() {
-                    let seg_n = hi - lo;
-                    if seg_n < 2 { continue; }
-                    let seg_i8 = &i8_all[lo * dim..hi * dim];
-                    if let Some((indices, distances)) = gpu::gpu_batch_cosine_dist_topk(
-                        seg_i8, seg_i8, seg_n, seg_n, dim, k_init)
-                    {
-                        for local_i in 0..seg_n {
-                            let global_i = lo + local_i; // perm position
-                            for j in 0..k_init {
-                                let idx = indices[local_i * k_init + j];
-                                if idx >= 0 && (idx as usize) != local_i {
-                                    let global_j = lo + idx as usize; // perm position
-                                    let d = distances[local_i * k_init + j];
-                                    all_knn[global_i].push(((d * 1000.0) as i32, global_j as i32));
-                                }
-                            }
-                        }
-                    }
-                    eprintln!("[GPU] segment {}/{}: {} nodes", si+1, seg_ranges.len(), seg_n);
-                }
-                // Bridge: nearest entry per node (all in perm-position space)
-                let entries: Vec<usize> = seg_ranges.iter()
-                    .filter_map(|&(lo, _)| if lo < n { Some(lo) } else { None })
-                    .collect();
-                let entry_i8: Vec<i8> = entries.iter().flat_map(|&e| {
-                    i8_all[e * dim..(e + 1) * dim].iter().copied()
-                }).collect();
-                let mut nearest_entry: Vec<usize> = vec![0; n];
-                let mut nearest_entry_dists: Vec<f32> = vec![0.0; n];
-                if let Some((entry_topk_idx, entry_topk_dist)) = gpu::gpu_batch_cosine_dist_topk(
-                    &entry_i8, &i8_all, entries.len(), n, dim, bridge * 4)
-                {
-                    let mut node_entry_best: Vec<(f32, usize)> = vec![(f32::MAX, 0); n];
-                    for ei in 0..entries.len() {
-                        let eg = entries[ei];
-                        for j in 0..(bridge * 4).min(n) {
-                            let idx = entry_topk_idx[ei * (bridge * 4).min(n) + j] as usize;
-                            let d = entry_topk_dist[ei * (bridge * 4).min(n) + j];
-                            if idx < n && d < node_entry_best[idx].0 {
-                                node_entry_best[idx] = (d, eg);
-                            }
-                        }
-                    }
-                    for i in 0..n { nearest_entry[i] = node_entry_best[i].1; nearest_entry_dists[i] = node_entry_best[i].0; }
-                    for ei in 0..entries.len() {
-                        let eg = entries[ei];
-                        for j in 0..(bridge * 4).min(n) {
-                            let idx = entry_topk_idx[ei * (bridge * 4).min(n) + j] as usize;
-                            let d = entry_topk_dist[ei * (bridge * 4).min(n) + j];
-                            if idx < n && idx != eg && !all_knn[eg].iter().any(|&(_, nb)| nb == idx as i32) {
-                                all_knn[eg].push(((d * 1000.0) as i32, idx as i32));
-                                all_knn[idx].push(((d * 1000.0) as i32, eg as i32));
-                            }
-                        }
-                    }
-                }
-                for i in 0..n {
-                    let eg = nearest_entry[i];
-                    let d = (nearest_entry_dists[i] * 1000.0) as i32;
-                    if eg != i { all_knn[i].push((d, eg as i32)); all_knn[eg].push((d, i as i32)); }
-                }
-                for i in 0..n {
-                    let entry_global = nearest_entry[i];
-                    let entry_dist = nearest_entry_dists[i];
-                    let mut edges = std::mem::take(&mut all_knn[i]);
-                    edges.sort_by(|a, b| a.0.cmp(&b.0));
-                    edges.dedup_by_key(|e| e.1);
-                    let has_entry = edges.iter().take(k_init).any(|&(_, nb)| nb == entry_global as i32);
-                    if !has_entry && entry_global != i { edges.insert(0, ((entry_dist * 1000.0) as i32, entry_global as i32)); }
-                    edges.truncate(k_init);
-                    all_knn[i] = edges;
-                }
-                let mut knnf = vec![0usize; n * k_init];
-                for i in 0..n { for j in 0..k_init.min(all_knn[i].len()) { knnf[i * k_init + j] = all_knn[i][j].1 as usize; } }
-                knnf
+                eprintln!("[GPU] DBSTRIKE_FORCE_APGC_FALLBACK=1 — forcing segment kNN fallback");
+                Self::apgc_fallback_knn(&i8_all, &ranges, n, dim, k_init)
             };
 
             // Build HNSW from flat kNN graph
@@ -5625,6 +5737,48 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
 
     /// k-NN search returning (id, cosine_distance) ascending.
     /// Default search-ef of 128 gives Qdrant-class recall at 100k+ scale.
+    /// Structural health probe for the HNSW graph — BUG-1-class regression
+    /// signal. Returns `(nodes, zero_degree_l0, bfs_reachable_from_entry,
+    /// out_of_range_edges)`. A collapsed build shows as low reachability;
+    /// a rotted adjacency shows as zero-degree or wild-edge counts.
+    pub fn graph_health(&self) -> (usize, usize, usize, usize) {
+        let g = self.hnsw.read().unwrap();
+        let n = g.nodes.len();
+        let mut zero_deg = 0usize;
+        let mut bad = 0usize;
+        for nd in &g.nodes {
+            if nd.neighbors.is_empty() || nd.neighbors[0].is_empty() {
+                zero_deg += 1;
+            }
+            for lvl in &nd.neighbors {
+                for &nb in lvl {
+                    if (nb as i64) < 0 || nb as usize >= n {
+                        bad += 1;
+                    }
+                }
+            }
+        }
+        let entry = g.entry.unwrap_or(0).min(n.saturating_sub(1));
+        let mut seen = vec![false; n];
+        let mut stack = vec![entry];
+        seen[entry] = true;
+        let mut reach = 0usize;
+        while let Some(cur) = stack.pop() {
+            reach += 1;
+            if g.nodes[cur].neighbors.is_empty() {
+                continue;
+            }
+            for &nb in &g.nodes[cur].neighbors[0] {
+                let nbu = nb as usize;
+                if nbu < n && !seen[nbu] {
+                    seen[nbu] = true;
+                    stack.push(nbu);
+                }
+            }
+        }
+        (n, zero_deg, reach, bad)
+    }
+
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
         self.search_ef(query, k, 128)
     }

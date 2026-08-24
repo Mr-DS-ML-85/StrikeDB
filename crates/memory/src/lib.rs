@@ -588,6 +588,26 @@ impl Memory {
     // a scoped recall still fills k). Legacy records (`owner == ""`, written
     // before scoping existed) remain visible to every scope — documented
     // migration semantics.
+    /// World-time "now" for validity evaluation.
+    ///
+    /// TIME-DOMAIN CONTRACT (decided 2026-08-24 after the memgent breakage):
+    /// valid_from/valid_to are WORLD times — callers use unix milliseconds;
+    /// benchmarks may use small synthetic values. The engine's logical clock
+    /// ticks from ~0, so evaluating windows against it alone judges every
+    /// wall-clock-dated fact "not yet valid" and silently hides it. Taking
+    /// max(logical, wall-clock-ms) makes both dialects behave: synthetic
+    /// windows (≤ logical range) resolve against the clock, real dates
+    /// resolve against the wall. AS_OF queries stay caller-supplied verbatim
+    /// — the caller's world, the caller's time.
+    fn effective_now(&self) -> u64 {
+        let logical = self.engine.snapshot();
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        logical.max(wall_ms)
+    }
+
     pub fn recall_scoped(
         &self,
         scope: &str,
@@ -595,9 +615,10 @@ impl Memory {
         query_vec: &[f32],
         k: usize,
     ) -> Vec<RecallHit> {
-        // snapshot(), not now(): now() advances the logical clock, which would
-        // make every recall a time mutation.
-        self.recall_at(scope, query, query_vec, k, self.engine.snapshot())
+        // NOT engine.snapshot() alone — see effective_now(). snapshot() also
+        // has the virtue of not advancing the logical clock, which now()
+        // would; wall-clock reading is side-effect-free too.
+        self.recall_at(scope, query, query_vec, k, self.effective_now())
     }
 
     /// The single recall pipeline. `at` is the world-time the validity
@@ -1020,11 +1041,16 @@ mod tests {
         );
 
         // A FUTURE-dated supersede must NOT hide the fact early: valid_to is
-        // world-time, not ingestion order.
+        // world-time — expressed here in wall-clock ms per the time-domain
+        // contract, since the logical clock sits below wall time.
         let id2 = m
             .ltm_store_temporal("the second merge is scheduled", v.clone(), "t", 0.9, "x", 0, 0, "alice")
             .unwrap();
-        let vt_future = m.engine.snapshot() + 100_000;
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let vt_future = wall_ms + 100_000;
         m.ltm_invalidate_scoped(id2, vt_future, "alice").unwrap();
         assert!(
             has(&m.recall_scoped("alice", q, &v, 50), id2),
@@ -1048,6 +1074,45 @@ mod tests {
             has(&m.recall_as_of("alice", q, &v, 50, vf3), id3),
             "AS_OF(valid_from) lost the fact"
         );
+    }
+
+    /// Regression for the memgent/LoCoMo ingest breakage: callers pass
+    /// WALL-CLOCK unix-ms windows (1.677e12 ≈ Mar 2023), while the engine's
+    /// logical clock ticks from ~0. "Now"-recall must evaluate validity
+    /// against world time — max(logical, wall-clock-ms) — or every
+    /// historically-dated fact is judged "not yet valid" and vanishes.
+    #[test]
+    fn recall_honours_unix_ms_windows_from_callers() {
+        let m = Memory::open(eng());
+        let v = vec![0.3f32; 8];
+        let mar2023_ms: u64 = 1_677_628_800_000; // [2023-03-01] in unix-ms
+        let id = m
+            .ltm_store_temporal(
+            "jon works at google",
+                v.clone(),
+                "conv",
+                0.9,
+                "x",
+                mar2023_ms,
+                0,
+                "h1",
+            )
+            .unwrap();
+        assert_eq!(m.ltm_get(id).unwrap().meta.valid_from, mar2023_ms);
+        let hits = m.recall_scoped("h1", "jon google", &v, 5);
+        assert!(
+            hits.iter().any(|h| h.id == id),
+            "unix-ms dated fact invisible at now — time-domain mismatch"
+        );
+
+        // Superseding it at any moment AFTER its window started hides it.
+        m.ltm_invalidate_scoped(id, mar2023_ms + 1000, "h1").unwrap();
+        assert!(!m.recall_scoped("h1", "jon google", &v, 5).iter().any(|h| h.id == id));
+        // ...and AS_OF before the supersede resurrects it.
+        assert!(m
+            .recall_as_of("h1", "jon google", &v, 5, mar2023_ms)
+            .iter()
+            .any(|h| h.id == id));
     }
 
     fn eng() -> Arc<Engine> {
