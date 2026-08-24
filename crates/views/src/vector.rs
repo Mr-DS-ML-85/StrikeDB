@@ -4118,6 +4118,7 @@ impl VectorIndex {
     ) -> Vec<usize> {
         let mut all_knn: Vec<Vec<(i32, i32)>> = vec![Vec::new(); n];
         // Phase 1: within-segment kNN, failure-loud.
+        let dbg = std::env::var("DBSTRIKE_APGC_DEBUG").ok().as_deref() == Some("1");
         for (si, &(lo, hi)) in ranges.iter().enumerate() {
             let seg_n = hi - lo;
             if seg_n < 2 {
@@ -4164,6 +4165,37 @@ impl VectorIndex {
                 }
             }
             eprintln!("[GPU] segment {}/{}: {} nodes", si + 1, ranges.len(), seg_n);
+            if dbg {
+                let total_edges: usize = (lo..hi).map(|i| all_knn[i].len()).sum();
+                let sample = lo + seg_n / 2;
+                eprintln!(
+                    "[DBG] seg{si}: edges={total_edges} ({:.1}/node) sample node {sample}: {:?}",
+                    total_edges as f64 / seg_n as f64,
+                    &all_knn[sample][..4.min(all_knn[sample].len())]
+                );
+                // Verify one edge against CPU truth on the same int8 data.
+                if !all_knn[sample].is_empty() {
+                    let (_, nb) = all_knn[sample][0];
+                    let q = &i8_all[sample * dim..sample * dim + dim];
+                    let v = &i8_all[nb as usize * dim..nb as usize * dim + dim];
+                    let dot: i64 = q.iter().zip(v).map(|(a, b)| (*a as i64) * (*b as i64)).sum();
+                    eprintln!("[DBG] seg{si}: sample edge dist cpu={:.4}", 1.0 - dot as f32 / 16129.0);
+                    // CPU brute-force best WITHIN this segment for the same node.
+                    let mut best_dot = i64::MIN;
+                    let mut best_r = lo;
+                    for r in lo..hi {
+                        if r == sample { continue; }
+                        let w = &i8_all[r * dim..r * dim + dim];
+                        let dot: i64 = q.iter().zip(w).map(|(a, b)| (*a as i64) * (*b as i64)).sum();
+                        if dot > best_dot { best_dot = dot; best_r = r; }
+                    }
+                    eprintln!(
+                        "[DBG] seg{si}: CPU best-in-segment node {best_r} dist={:.4}  (GPU top1 dist={:.4})",
+                        1.0 - best_dot as f32 / 16129.0,
+                        all_knn[sample][0].0 as f32 / 1000.0
+                    );
+                }
+            }
         }
 
         // Phase 2: bridge — EVERY node finds its true nearest foreign entry.
@@ -4175,31 +4207,47 @@ impl VectorIndex {
             .collect();
         let mut nearest_entry: Vec<usize> = vec![usize::MAX; n];
         let mut nearest_dists: Vec<f32> = vec![f32::MAX; n];
+        // Best FOREIGN segment per node — the target of its bridge walk.
+        let own_seg_of_pos: Vec<usize> = {
+            let mut v = vec![0usize; n];
+            for (si, &(lo, hi)) in ranges.iter().enumerate() {
+                for p in lo..hi.min(n) {
+                    v[p] = si;
+                }
+            }
+            v
+        };
+        let mut nearest_fseg: Vec<Option<usize>> = vec![None; n];
+        let mut nearest_fd: Vec<f32> = vec![f32::MAX; n];
         let gpu_ready = gpu::gpu_get_mode() != gpu::ComputeMode::CpuOnly && gpu::gpu_init();
-        for &eg in &entries {
+        for (bi, &eg) in entries.iter().enumerate() {
             let q = &i8_all[eg * dim..eg * dim + dim];
             let dists: Option<Vec<f32>> = if gpu_ready {
                 gpu::gpu_cosine_dist(q, i8_all, n, dim)
             } else {
                 None
             };
+            let mut update = |i: usize, d: f32| {
+                if d < nearest_dists[i] {
+                    nearest_dists[i] = d;
+                    nearest_entry[i] = eg;
+                }
+                if own_seg_of_pos[i] != bi && d < nearest_fd[i] {
+                    nearest_fd[i] = d;
+                    nearest_fseg[i] = Some(bi);
+                }
+            };
             match dists {
                 Some(dists) => {
                     for (i, &d) in dists.iter().enumerate() {
-                        if d < nearest_dists[i] {
-                            nearest_dists[i] = d;
-                            nearest_entry[i] = eg;
-                        }
+                        update(i, d);
                     }
                 }
                 None => {
                     // CPU path per node against this entry.
                     for (i, chunk) in i8_all.chunks_exact(dim).enumerate() {
                         let d = cos_dist_q(chunk, q);
-                        if d < nearest_dists[i] {
-                            nearest_dists[i] = d;
-                            nearest_entry[i] = eg;
-                        }
+                        update(i, d);
                     }
                 }
             }
@@ -4224,6 +4272,93 @@ impl VectorIndex {
             let d = (nearest_dists[i] * 1000.0) as i32;
             all_knn[i].push((d, eg as i32));
             all_knn[eg].push((d, i as i32));
+        }
+
+        // PHASE 2b — REAL BRIDGE WALKS (the merge_segments semantic that was
+        // missing from this path entirely). Segment-local kNN is honest but
+        // useless for global navigation on shuffled clustered data: a node's
+        // true nearest neighbours live in OTHER segments, and entry-hub edges
+        // give greedy descent no route to them (measured: best in-segment
+        // neighbour at d=0.054 while global truth sits at d≈0.000). For every
+        // node, beam-walk its nearest foreign segment's LOCAL graph from that
+        // segment's entry and wire the node to the true nearest nodes found.
+        // This is what the CPU path's bridge has always done; without it the
+        // fallback graph is an archipelago.
+        {
+            let bridge_take = 8usize;
+            let max_expand = 256usize;
+            let seg_adj: Vec<Vec<Vec<usize>>> = ranges
+                .iter()
+                .map(|&(lo, hi)| {
+                    let mut adj = vec![Vec::new(); hi - lo];
+                    for pos in lo..hi {
+                        for (_, nb) in &all_knn[pos] {
+                            let nbu = *nb as usize;
+                            if nbu >= lo && nbu < hi && nbu != pos {
+                                adj[pos - lo].push(nbu - lo);
+                            }
+                        }
+                    }
+                    for lst in adj.iter_mut() {
+                        lst.sort_unstable();
+                        lst.dedup();
+                    }
+                    adj
+                })
+                .collect();
+            use std::cmp::Reverse;
+            use std::collections::BinaryHeap;
+            for i in 0..n {
+                let bi = match nearest_fseg[i] {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let (lo, hi) = ranges[bi];
+                let ln = hi - lo;
+                if ln == 0 {
+                    continue;
+                }
+                let q = &i8_all[i * dim..i * dim + dim];
+                let dist_l = |l: usize| -> u32 {
+                    let v = &i8_all[(lo + l) * dim..(lo + l + 1) * dim];
+                    let dot: i64 = q.iter().zip(v).map(|(a, b)| (*a as i64) * (*b as i64)).sum();
+                    ((1.0 - dot as f32 / 16129.0).max(0.0) * 1000.0) as u32
+                };
+                let mut seen = vec![false; ln];
+                let mut expanded = vec![false; ln];
+                let mut pool: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+                seen[0] = true; // local 0 == segment entry position
+                pool.push(Reverse((dist_l(0), 0usize)));
+                let mut best: Vec<(u32, usize)> = Vec::with_capacity(bridge_take * 2);
+                let mut expansions = 0usize;
+                while let Some(Reverse((d, l))) = pool.pop() {
+                    if expanded[l] {
+                        continue;
+                    }
+                    expanded[l] = true;
+                    best.push((d, l));
+                    expansions += 1;
+                    if expansions >= max_expand {
+                        break;
+                    }
+                    for &nl in &seg_adj[bi][l] {
+                        if !seen[nl] {
+                            seen[nl] = true;
+                            pool.push(Reverse((dist_l(nl), nl)));
+                        }
+                    }
+                }
+                best.sort();
+                best.truncate(bridge_take);
+                for (d, l) in best {
+                    let gpos = lo + l;
+                    if gpos == i {
+                        continue;
+                    }
+                    all_knn[i].push((d as i32, gpos as i32));
+                    all_knn[gpos].push((d as i32, i as i32));
+                }
+            }
         }
         // Entry clique keeps the hubs mutually reachable.
         for (a, &ea) in entries.iter().enumerate() {
@@ -6249,6 +6384,10 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-1 surgical probe: are level-0 adjacency lists TRUE near neighbours?
+    /// Prints adjacency members with their true cosine distance and their
+    /// rank in the brute-force ordering, for sampled nodes.
 
     /// The parallel build must label each node with **its own** client id.
     ///
