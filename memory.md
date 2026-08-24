@@ -594,3 +594,12 @@ buffer away your progress lines; /tmp venvs die with shutdowns; aborted
 runs leave port-holding zombies that poison the next run. The diag script
 now prints an embedder pre-flight ETA, batches HTTP embeds with progress,
 and always kills its server via atexit.
+
+### Wire-contract hardening (review from the memgent agent)
+The first WITHMETA rollout made 7-field hits the unconditional reply — a
+silent stride change that positional parsers would chew into garbage without
+erroring. Fixed per review: default stays the FROZEN 4-field contract
+(id, score, source, text); the bi-temporal triple is strictly opt-in via a
+trailing `WITHMETA` flag on MEM.RECALL / MEM.RECALL.AS_OF. Both strides
+verified over live RESP (4 vs 7 fields for k=1). Rule going forward: extend
+reply shapes only by appending NEW opt-in flags, never by widening defaults.

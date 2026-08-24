@@ -252,7 +252,7 @@ def main():
             t0 = time.time()
             # query text feeds the BM25 leg; the vector feeds the dense leg
             hits = c.cmd("MEM.RECALL", "AGENT", agent, args.k, q,
-                         *[round(float(x), 4) for x in qv])
+                         *[round(float(x), 4) for x in qv], "WITHMETA")
             lat_sum += time.time() - t0
             lat_n += 1
             srcs = []

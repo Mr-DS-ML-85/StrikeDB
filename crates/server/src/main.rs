@@ -2220,39 +2220,45 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Err(e) => err(&e.to_string()),
             }
         }
-        // MEM.RECALL k query f1 f2 ...  -> array of (id, score, source, text)
-        // MEM.RECALL [AGENT name] k query f1 f2 ...  -> array of (id, score, source, text)
+        // MEM.RECALL [AGENT name] k query f1 f2 ... [WITHMETA]
+        //   default  -> 4 fields/hit (id, score, source, text) — FROZEN contract
+        //   WITHMETA -> 7 fields/hit (+ created_ts, valid_from, valid_to)
         // Scoped: an agent only ever recalls its OWN memories (plus legacy
         // owner-less records). Cross-agent recall is impossible.
         "MEM.RECALL" => {
             let (agent, rest) = parse_agent_scope(args);
             if rest.len() < 3 {
-                return err("MEM.RECALL requires [AGENT name] k query f1 f2 ...");
+                return err("MEM.RECALL requires [AGENT name] k query f1 f2 ... [WITHMETA]");
             }
-            let k: usize = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
+            let with_meta = rest
+                .last()
+                .map(|a| a.eq_ignore_ascii_case(b"WITHMETA"))
+                .unwrap_or(false);
+            let body = if with_meta { &rest[..rest.len() - 1] } else { rest };
+            if body.len() < 3 {
+                return err("MEM.RECALL requires [AGENT name] k query f1 f2 ... [WITHMETA]");
+            }
+            let k: usize = match std::str::from_utf8(&body[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
-            let query = String::from_utf8_lossy(&rest[1]).to_string();
-            let qvec = match parse_floats(&rest[2..]) {
+            let query = String::from_utf8_lossy(&body[1]).to_string();
+            let qvec = match parse_floats(&body[2..]) {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
             let hits = db.rag.memory().recall_scoped(&agent, &query, &qvec, k);
             let mut out = Vec::new();
             for h in hits {
-                // Per-hit: id, score, source, text + the bi-temporal window
-                // (created_ts, valid_from, valid_to). Callers doing temporal
-                // reasoning (LoCoMo-style "when did X happen" / as-of Qs)
-                // need these inline — without them every hit costs a
-                // round-trip to MEM.GET or goes answered blind.
                 out.push(Resp::Int(h.id as i64));
                 out.push(Resp::Bulk(format!("{:.6}", h.score).into_bytes()));
                 out.push(Resp::Bulk(h.meta.source.into_bytes()));
                 out.push(Resp::Bulk(h.text.into_bytes()));
-                out.push(Resp::Int(h.meta.created_ts as i64));
-                out.push(Resp::Int(h.meta.valid_from as i64));
-                out.push(Resp::Int(h.meta.valid_to as i64));
+                if with_meta {
+                    out.push(Resp::Int(h.meta.created_ts as i64));
+                    out.push(Resp::Int(h.meta.valid_from as i64));
+                    out.push(Resp::Int(h.meta.valid_to as i64));
+                }
             }
             Resp::Array(out)
         }
@@ -2395,22 +2401,35 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Err(e) => err(&e.to_string()),
             }
         }
-        // MEM.RECALL.AS_OF [AGENT name] k query as_of f1 f2 ...  -> hits
+        // MEM.RECALL.AS_OF [AGENT name] k query as_of f1 f2 ... [WITHMETA]
+        //   same stride contract as MEM.RECALL (4 default, 7 with WITHMETA)
         "MEM.RECALL.AS_OF" => {
             let (agent, rest) = parse_agent_scope(args);
             if rest.len() < 4 {
-                return err("MEM.RECALL.AS_OF requires [AGENT name] k query as_of f1 f2 ...");
+                return err(
+                    "MEM.RECALL.AS_OF requires [AGENT name] k query as_of f1 f2 ... [WITHMETA]",
+                );
             }
-            let k: usize = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
+            let with_meta = rest
+                .last()
+                .map(|a| a.eq_ignore_ascii_case(b"WITHMETA"))
+                .unwrap_or(false);
+            let body = if with_meta { &rest[..rest.len() - 1] } else { rest };
+            if body.len() < 4 {
+                return err(
+                    "MEM.RECALL.AS_OF requires [AGENT name] k query as_of f1 f2 ... [WITHMETA]",
+                );
+            }
+            let k: usize = match std::str::from_utf8(&body[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
-            let query = String::from_utf8_lossy(&rest[1]).to_string();
-            let as_of: u64 = match std::str::from_utf8(&rest[2]).ok().and_then(|s| s.parse().ok()) {
+            let query = String::from_utf8_lossy(&body[1]).to_string();
+            let as_of: u64 = match std::str::from_utf8(&body[2]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("as_of is not a u64"),
             };
-            let qvec = match parse_floats(&rest[3..]) {
+            let qvec = match parse_floats(&body[3..]) {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
@@ -2421,11 +2440,11 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 out.push(Resp::Bulk(format!("{:.6}", h.score).into_bytes()));
                 out.push(Resp::Bulk(h.meta.source.into_bytes()));
                 out.push(Resp::Bulk(h.text.into_bytes()));
-                // Same bi-temporal triple as MEM.RECALL — callers reason
-                // about validity windows without extra round-trips.
-                out.push(Resp::Int(h.meta.created_ts as i64));
-                out.push(Resp::Int(h.meta.valid_from as i64));
-                out.push(Resp::Int(h.meta.valid_to as i64));
+                if with_meta {
+                    out.push(Resp::Int(h.meta.created_ts as i64));
+                    out.push(Resp::Int(h.meta.valid_from as i64));
+                    out.push(Resp::Int(h.meta.valid_to as i64));
+                }
             }
             Resp::Array(out)
         }

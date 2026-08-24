@@ -715,7 +715,7 @@ python3 tests/test_dbstrike.py</code></pre>
         <tr><td><code>SUBSCRIBE / PSUBSCRIBE</code></td><td>ch [ch...]</td><td>real-time stream</td></tr>
         <tr><td><code>PUBLISH</code></td><td>ch msg</td><td>subscriber count</td></tr>
         <tr><td><code>MEM.REMEMBER</code></td><td>[AGENT name] text source sal f1...</td><td>:id (owner-scoped)</td></tr>
-        <tr><td><code>MEM.RECALL</code></td><td>[AGENT name] k query f1...</td><td>id/score/source/text + created_ts, valid_from, valid_to — only that agent's memories</td></tr>
+        <tr><td><code>MEM.RECALL</code></td><td>[AGENT name] k query f1... [WITHMETA]</td><td>4 fields/hit (id score source text); +WITHMETA &rarr; 7 fields/hit incl. created_ts, valid_from, valid_to — frozen stride contract</td></tr>
         <tr><td><code>MEM.LINK / MEM.UNLINK</code></td><td>from to rel [weight]</td><td>OK</td></tr>
         <tr><td><code>MEM.NEIGH / MEM.TRAV</code></td><td>from [rel] / start depth</td><td>neighbors / traversal</td></tr>
         <tr><td><code>MEM.REMEMBER.T</code></td><td>[AGENT name] text source sal vf vt f1...</td><td>:id (bi-temporal)</td></tr>

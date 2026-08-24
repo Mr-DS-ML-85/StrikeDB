@@ -228,9 +228,16 @@ whose validity interval contains `t` — the Graphiti primitive for
 non-contradictory reasoning about evolving state ("what did we know at time
 T" instead of "what do we know now").
 
-Every recall hit returns its **bi-temporal window inline**:
-`id · score · source · text · created_ts · valid_from · valid_to` — so
-callers doing temporal reasoning never need a round-trip to `MEM.GET`.
+Every recall hit returns its **bi-temporal window inline** — callers doing
+temporal reasoning never need a round-trip to `MEM.GET`:
+
+> **Wire contract (frozen).** `MEM.RECALL` / `MEM.RECALL.AS_OF` return
+> **4 fields per hit** by default: `id · score · source · text`. Append the
+> trailing flag **`WITHMETA`** to receive **7 fields per hit**:
+> `id · score · source · text · created_ts · valid_from · valid_to`.
+> The default stride never changes silently — extended output is strictly
+> opt-in, so positional parsers get deterministic bytes forever.
+
 Grounding facts with real-world timestamps at write time (`MEM.REMEMBER.T`)
 and date-stamping stored text is what makes temporal QA solvable at all:
 on the LoCoMo benchmark, wiring session dates into ingest moved temporal
