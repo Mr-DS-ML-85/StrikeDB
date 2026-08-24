@@ -81,6 +81,38 @@ impl Router {
     /// opened while `CpuOnly` — e.g. restored from WAL at startup — get a
     /// GPU copy without a rebuild.
     pub fn upload_all_to_gpu(&self) {
+        // Materialize every PERSISTED namespace before uploading. After a
+        // restart the ns map is RAM-empty (graphs are lazily rebuilt), so an
+        // immediate GPU.MODE used to upload nothing useful while payloads sat
+        // recoverable on disk — first searches then silently ran CPU-side.
+        // Scan `vec:` keys, derive distinct namespace names (default and the
+        // reserved __ltm__ memory namespace excluded), and force-open each.
+        let mut names: Vec<String> = Vec::new();
+        let snap = self.engine.snapshot();
+        for (key, _) in self.engine.scan_prefix(b"vec:", snap) {
+            if key.len() <= 5 {
+                continue;
+            }
+            let rest = &key[4..];
+            // default-index keys are exactly "vec:" + 8-byte id
+            if rest.len() == 8 {
+                continue;
+            }
+            if let Some(pos) = rest.iter().rposition(|&c| c == b':') {
+                let ns = &rest[..pos];
+                if ns.is_empty() || ns == b"__ltm__" {
+                    continue;
+                }
+                if let Ok(s) = std::str::from_utf8(ns) {
+                    names.push(s.to_string());
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        for name in &names {
+            self.vectors_ns(name);
+        }
         self.vectors_default.upload_to_gpu();
         let ns = self.vectors_ns.read().unwrap();
         for v in ns.values() {

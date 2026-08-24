@@ -4730,7 +4730,16 @@ impl VectorIndex {
             // + the merged f32 — ~4× the dataset, which OOM-kills on a 30GB
             // machine at 5M×384d. The tier streams f32 to the NVMe mmap so the
             // merged arena is not a second RAM copy.
-            let tiered = n >= 1_000_000;
+            //
+            // BUG (2026-08-24, repro'd at 1M×384d / 15 segments): tiered=true
+            // produces a COLLAPSED graph — self-recall@50 was 1/12 across the
+            // id range while the same data through the CPU non-tiered builder
+            // scored 12/12, and stored payloads were bit-perfect. Root cause
+            // not yet found (suspected inter-segment bridge wiring in the
+            // tiered merge). Until it is root-caused, production loads force
+            // tiered=false: correctness over memory. Large loads must fit RAM
+            // (~4× dataset transiently) or be sharded by namespace.
+            let tiered = false; // was: n >= 1_000_000
             let built = Self::build_parallel_tiered(data, dim, n_shards, tiered);
             {
                 let mut h = built.hnsw.write().unwrap();
@@ -5162,7 +5171,6 @@ pub fn open(engine: Arc<Engine>) -> Self {
 /// `vec:<prefix>:` are loaded, so a "faces" namespace won't collide
 /// with a "phash" namespace or the default index.
 pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
-    let mut hnsw = Hnsw::new();
     let search_prefix: Vec<u8> = if prefix.is_empty() {
         b"vec:".to_vec()
     } else {
@@ -5171,18 +5179,61 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
         p.push(b':');
         p
     };
+    // Collect (id, vector) pairs first, then PARALLEL-build. The previous
+    // loop did `hnsw.insert` per payload: one thread doing 1M sequential
+    // multi-layer greedy descents ≈ minutes of silent blocking on the first
+    // post-restart search. The sharded builder finishes large corpora in
+    // seconds and is forced down the proven CPU non-tiered path — the
+    // tiered/GPU branch has a known 1M-scale graph-collapse bug and must
+    // not be reachable from recovery.
+    let mut ids: Vec<u64> = Vec::new();
+    let mut packed: Vec<f32> = Vec::new();
+    let expected_len = if prefix.is_empty() { 12 } else { search_prefix.len() + 8 };
     for (key, val) in engine.scan_prefix(&search_prefix, engine.snapshot()) {
         if let Value::Vector(v) = val {
             // Default index: key must be exactly "vec:" + 8 bytes.
             // Namespaced index: key must be "vec:<prefix>:" + 8 bytes.
-            let expected_len = if prefix.is_empty() { 12 } else { search_prefix.len() + 8 };
             if key.len() != expected_len {
                 continue;
             }
             let id = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
-            hnsw.insert(id, v);
+            packed.extend_from_slice(&v);
+            ids.push(id);
         }
     }
+    let dim = if ids.is_empty() { 0 } else { packed.len() / ids.len() };
+    let label = if prefix.is_empty() { "<default>".to_string() } else { prefix.clone() };
+    let hnsw = if ids.is_empty() {
+        Hnsw::new()
+    } else {
+        eprintln!(
+            "[open_ns] '{label}': rebuilding {} vectors x {dim}d via parallel build...",
+            ids.len(),
+            label = label
+        );
+        let t0 = std::time::Instant::now();
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+        // CPU non-tiered only: recovery must never depend on GPU state, and
+        // the tiered graph has an unresolved 1M-scale connectivity bug.
+        let mut built = Self::build_parallel_tiered(&packed, dim, cores, false);
+        {
+            let mut h = built.hnsw.write().unwrap();
+            h.id_to_idx.clear();
+            for i in 0..h.nodes.len() {
+                let row = h.nodes[i].id as usize;
+                debug_assert!(row < ids.len(), "row {row} out of range");
+                let cid = ids[row];
+                h.nodes[i].id = cid;
+                h.id_to_idx.insert(cid, i);
+            }
+        }
+        eprintln!(
+            "[open_ns] '{label}': rebuilt {} nodes in {:.1}s",
+            ids.len(),
+            t0.elapsed().as_secs_f32()
+        );
+        built.hnsw.into_inner().unwrap_or_else(|l| l.into_inner())
+    };
     let idx = Self { engine, prefix, hnsw: RwLock::new(hnsw), sparse: RwLock::new(SparseIndex::new()), gpu_idx: RwLock::new(None) };
     idx.upload_to_gpu_if_enabled();
     idx

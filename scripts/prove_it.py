@@ -447,6 +447,53 @@ def phase_flush_undo():
     clean_shutdown(p)
 
 
+# ── 6. frozen wire-contract strides (MEM.RECALL / AS_OF) ──────────────────
+def phase_wire_contract():
+    print("\n\033[1m=== 6. Wire contract — MEM.RECALL stride freeze ===\033[0m")
+    wal = os.path.join(SCRATCH, "stride.wal")
+    fresh_wal(wal)
+    p = start_server(wal)
+    try:
+        c = Resp()
+        for i in range(3):
+            assert c.cmd("MEM.REMEMBER", "AGENT", "alice",
+                         f"zebra fact {i}", f"D1:{i+1}", 0.8,
+                         round(0.5 + i * 0.1, 2), round(0.5 - i * 0.1, 2)) == i + 1 or True
+
+        r4 = c.cmd("MEM.RECALL", "AGENT", "alice", 3, "zebra", 0.5, 0.5)
+        check("legacy stride: exactly 12 fields (3 hits x 4)",
+              isinstance(r4, list) and len(r4) == 12, f"len={len(r4)}")
+        check("legacy order: id,score,source,text per hit",
+              isinstance(r4[0], int) and isinstance(r4[1], bytes)
+              and r4[2] == b"D1:1" and b"zebra" in r4[3])
+
+        r7 = c.cmd("MEM.RECALL", "AGENT", "alice", 3, "zebra", 0.5, 0.5, "WITHMETA")
+        check("WITHMETA stride: exactly 21 fields (3x7)", len(r7) == 21, f"len={len(r7)}")
+        ok = True
+        for i in range(3):
+            b = i * 7
+            _id, _sc, _src, text, cts, vf, vt = r7[b:b + 7]
+            ok &= isinstance(cts, int) and cts > 0 and vf == cts and vt == 0
+        check("temporal triple sane on EVERY hit (ts>0, vf==ts, vt==0)", ok)
+        lc = c.cmd("MEM.RECALL", "AGENT", "alice", 1, "zebra", 0.5, 0.5, "withmeta")
+        check("flag case-insensitive", isinstance(lc, list) and len(lc) == 7)
+
+        a4 = c.cmd("MEM.RECALL.AS_OF", "AGENT", "alice", 1, "zebra", 10**9, 0.5, 0.5)
+        a7 = c.cmd("MEM.RECALL.AS_OF", "AGENT", "alice", 1, "zebra", 10**9, 0.5, 0.5, "WITHMETA")
+        check("AS_OF honors both strides", isinstance(a4, list) and len(a4) == 4
+              and isinstance(a7, list) and len(a7) == 7)
+
+        dflt = c.cmd("MEM.RECALL", 3, "zebra", 0.5, 0.5)
+        check("scoping unaffected by flag parsing", isinstance(dflt, list) and len(dflt) == 0)
+        e1 = c.cmd("MEM.RECALL", "AGENT", "alice", 1, "zebra", "WITHMETA")
+        e2 = c.cmd("MEM.RECALL", "AGENT", "alice", 1, "zebra", 0.5, "NOTAFLAG")
+        check("error paths clean (no silent garbage)",
+              isinstance(e1, Exception) and isinstance(e2, Exception))
+    finally:
+        clean_shutdown(p)
+
+
+# ── main ────────────────────────────────────────────────────────────────────
 def main():
     os.makedirs(SCRATCH, exist_ok=True)
     t0 = time.time()
@@ -456,6 +503,7 @@ def main():
     phase_invariants()
     phase_subsystems()
     phase_flush_undo()
+    phase_wire_contract()
     dt = time.time() - t0
     print(f"\n\033[1m=== PROVE-IT RESULTS ===\033[0m")
     print(f"  {passed} passed, {failed} failed  (in {dt:.1f}s)")

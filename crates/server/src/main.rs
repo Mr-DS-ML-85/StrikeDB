@@ -2128,7 +2128,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                         gpu::gpu_set_mode(gpu::ComputeMode::Turbo);
                         if !gpu::gpu_available() {
                             gpu::gpu_set_mode(gpu::ComputeMode::CpuOnly);
-                            return err("ERR no GPU detected");
+                            let why = gpu::init_fail_reason();
+                            return err(&format!("ERR no usable GPU — {why}"));
                         }
                         db.router.upload_all_to_gpu();
                         Resp::Simple("OK compute mode = Turbo (full GPU)".into())

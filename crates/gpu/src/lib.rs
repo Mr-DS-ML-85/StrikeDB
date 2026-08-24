@@ -58,6 +58,8 @@ extern "C" {
     fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut i8) -> i32;
     fn cuInit(flags: u32) -> i32;
     fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32;
+    fn cuDeviceGetName(name: *mut u8, len: i32, device: i32) -> i32;
+    fn cuDeviceTotalMem_v2(bytes: *mut usize, device: i32) -> i32;
     fn cuCtxCreate_v2(context: *mut *mut std::ffi::c_void, flags: u32, device: i32) -> i32;
     fn cuModuleLoadDataEx(module: *mut *mut std::ffi::c_void, image: *const i8,
                           numOptions: u32, options: *const u32,
@@ -147,6 +149,18 @@ static GPU_ENABLED: AtomicBool = AtomicBool::new(false);
 /// ran on the device nor fell back to the CPU. Refusing up front turns a
 /// bricked GPU into a clean CPU fallback.
 static GPU_DESTROYED: AtomicBool = AtomicBool::new(false);
+/// Why the last `gpu_init` failed — human-readable, for honest error reports.
+/// Empty string = last init succeeded (or never ran).
+static LAST_INIT_FAIL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Human-readable reason the last GPU init failed ("" if none/success).
+pub fn init_fail_reason() -> String {
+    LAST_INIT_FAIL.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+fn bytes_gb(b: usize) -> String {
+    format!("{:.1} GB", b as f64 / 1024.0 / 1024.0 / 1024.0)
+}
 static KERNELS_COMPILED: AtomicBool = AtomicBool::new(false);
 static KERNELS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static KERNEL_LOCK: Mutex<()> = Mutex::new(());
@@ -157,11 +171,43 @@ impl GpuState {
     /// Initialize CUDA context + detect VRAM. NO kernel compilation.
     fn init_ctx() -> Option<Self> {
         unsafe {
-            if cuInit(0) != 0 { return None; }
+            if cuInit(0) != 0 {
+                eprintln!("[GPU] cuInit failed — no usable NVIDIA driver");
+                *LAST_INIT_FAIL.lock().unwrap() =
+                    "cuInit failed (no usable NVIDIA driver)".to_string();
+                return None;
+            }
             let mut device = 0i32;
-            if cuDeviceGet(&mut device, 0) != 0 { return None; }
+            if cuDeviceGet(&mut device, 0) != 0 {
+                eprintln!("[GPU] no CUDA device found");
+                *LAST_INIT_FAIL.lock().unwrap() = "no CUDA device found".to_string();
+                return None;
+            }
+            // Device name + total VRAM are queryable WITHOUT a context — grab
+            // them first so a context failure can report something actionable
+            // instead of the old gaslighting "no GPU detected".
+            let mut name = [0u8; 256];
+            cuDeviceGetName(name.as_mut_ptr(), name.len() as i32, device);
+            let dev_name = {
+                let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                String::from_utf8_lossy(&name[..end]).into_owned()
+            };
+            let mut vram_total_noctx: usize = 0;
+            cuDeviceTotalMem_v2(&mut vram_total_noctx, device);
+
             let mut ctx = std::ptr::null_mut();
-            if cuCtxCreate_v2(&mut ctx, CU_CTX_SCHED_BLOCKING_SYNC, device) != 0 { return None; }
+            if cuCtxCreate_v2(&mut ctx, CU_CTX_SCHED_BLOCKING_SYNC, device) != 0 {
+                let msg = format!(
+                    "{dev_name} present ({}) but CUDA context creation failed — \
+                     VRAM almost certainly exhausted by another process \
+                     (`nvidia-smi` to see who); free memory or stop the holder",
+                    bytes_gb(vram_total_noctx)
+                );
+                eprintln!("[GPU] {msg}");
+                *LAST_INIT_FAIL.lock().unwrap() = msg;
+                return None;
+            }
+            *LAST_INIT_FAIL.lock().unwrap() = String::new();
 
             let mut vram_total: usize = 0;
             let mut vram_free: usize = 0;
