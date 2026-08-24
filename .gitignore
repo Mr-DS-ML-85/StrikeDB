@@ -17,3 +17,4 @@ bench-out/
 **/*.snap
 **/*.wal.bak-*
 .prove-it/
+.aider*
