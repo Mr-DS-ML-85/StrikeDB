@@ -416,6 +416,44 @@ impl Memory {
         Ok(())
     }
 
+    /// Owner-scoped invalidate: the wire-facing form of [`Self::ltm_invalidate`].
+    ///
+    /// Succeeds only when `requester` matches the fact's `Meta.owner`. Facts
+    /// stored without an agent scope carry owner `"default"`, so a bare
+    /// `MEM.INVALIDATE` keeps working on them while remaining unable to touch
+    /// any `[AGENT name]`-scoped fact. Unknown ids are an error, not a silent
+    /// OK — a typo'd id must not look like a successful supersede.
+    ///
+    /// The unscoped [`Self::ltm_invalidate`] stays for trusted in-process
+    /// callers (the bench) and must not be exposed to the wire.
+    pub fn ltm_invalidate_scoped(
+        &self,
+        id: u64,
+        invalid_at: u64,
+        requester: &str,
+    ) -> std::io::Result<()> {
+        let rec = self.ltm_get(id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("ERR no such fact {id}"),
+            )
+        })?;
+        if rec.meta.owner != requester {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "ERR fact {id} owned by '{}' — requester '{}' denied",
+                    rec.meta.owner, requester
+                ),
+            ));
+        }
+        let mut m = rec.meta;
+        m.valid_to = invalid_at;
+        self.engine
+            .put(meta_key(id), Value::Bytes(encode_meta(&m)))?;
+        Ok(())
+    }
+
     pub fn ltm_get(&self, id: u64) -> Option<LtmRecord> {
         let text = match self.engine.get(&ltm_key(id)) {
             Some(Value::Bytes(b)) => String::from_utf8_lossy(&b).to_string(),
@@ -557,6 +595,25 @@ impl Memory {
         query_vec: &[f32],
         k: usize,
     ) -> Vec<RecallHit> {
+        // snapshot(), not now(): now() advances the logical clock, which would
+        // make every recall a time mutation.
+        self.recall_at(scope, query, query_vec, k, self.engine.snapshot())
+    }
+
+    /// The single recall pipeline. `at` is the world-time the validity
+    /// window is evaluated against: current logical time for "now" recall,
+    /// caller-supplied for time-travel. Applying the window INSIDE the
+    /// materialization loop is what keeps AS_OF correct — filtering after a
+    /// now-scoped top-k would resurrect nothing that the present has already
+    /// superseded.
+    fn recall_at(
+        &self,
+        scope: &str,
+        query: &str,
+        query_vec: &[f32],
+        k: usize,
+        at: u64,
+    ) -> Vec<RecallHit> {
         let fetch = k * 3;
         // Fast salience lookup (RwLock<read>, held briefly).
         let sal_cache = self.salience_cache.read().unwrap();
@@ -640,7 +697,10 @@ impl Memory {
         });
 
         // 4) Materialize text + meta ONLY for the winners, enforcing the
-        //    owner scope. Legacy (owner == "") stays visible to everyone.
+        //    owner scope AND the bi-temporal validity window at `at`.
+        //    Mirrors the documented supersede contract: a fact whose interval
+        //    excludes `at` is invisible there, whatever the current time is.
+        //    Legacy (owner == "") stays visible to everyone.
         let mut out: Vec<RecallHit> = Vec::with_capacity(k);
         for s in top {
             if out.len() == k {
@@ -648,6 +708,11 @@ impl Memory {
             }
             if let Some((text, meta)) = self.ltm_get_light(s.id) {
                 if !meta.owner.is_empty() && meta.owner != scope {
+                    continue;
+                }
+                let vf_ok = meta.valid_from == 0 || meta.valid_from <= at;
+                let vt_ok = meta.valid_to == 0 || meta.valid_to > at;
+                if !(vf_ok && vt_ok) {
                     continue;
                 }
                 out.push(RecallHit { id: s.id, text, score: s.score, kind: s.kind, meta });
@@ -833,16 +898,10 @@ impl Memory {
         k: usize,
         as_of: u64,
     ) -> Vec<RecallHit> {
-        // Over-fetch, then filter by the fact's validity window.
-        self.recall_scoped(scope, query, query_vec, k * 4)
-            .into_iter()
-            .filter(|h| {
-                let vf_ok = h.meta.valid_from == 0 || h.meta.valid_from <= as_of;
-                let vt_ok = h.meta.valid_to == 0 || h.meta.valid_to > as_of;
-                vf_ok && vt_ok
-            })
-            .take(k)
-            .collect()
+        // The window is applied at `as_of` INSIDE the pipeline — never as a
+        // post-filter over a now-scoped top-k (that order would make every
+        // past-superseded fact unreachable, breaking time travel).
+        self.recall_at(scope, query, query_vec, k, as_of)
     }
 
     // ── PROCEDURAL MEMORY (Mem0's third pillar) ────────────────────────────
@@ -894,6 +953,102 @@ pub fn tokenize(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MEM.INVALIDATE must be owner-scoped: an agent may only invalidate
+    /// facts it owns. Regression test for the cross-scope write hole
+    /// (bare `MEM.INVALIDATE id at` let any agent kill any fact).
+    #[test]
+    fn ltm_invalidate_is_owner_scoped() {
+        let m = Memory::open(eng());
+        let v = vec![0.1f32; 8];
+        let alice_fact = m
+            .ltm_store_temporal("alice owns this fact", v.clone(), "t", 0.5, "x", 0, 0, "alice")
+            .unwrap();
+        let bob_fact = m
+            .ltm_store_temporal("bob owns this fact", v.clone(), "t", 0.5, "x", 0, 0, "bob")
+            .unwrap();
+        let bare_fact = m
+            .ltm_store_temporal("unscoped fact", v.clone(), "t", 0.5, "x", 0, 0, "default")
+            .unwrap();
+
+        // Cross-scope: bob must NOT be able to invalidate alice's fact.
+        assert!(m.ltm_invalidate_scoped(alice_fact, 9999, "bob").is_err());
+        // Bare ("default") requester must NOT touch a scoped agent's fact.
+        assert!(m.ltm_invalidate_scoped(alice_fact, 9999, "default").is_err());
+        // The denial must have left the fact intact and still valid at now.
+        let rec = m.ltm_get(alice_fact).unwrap();
+        assert_eq!(rec.meta.valid_to, 0, "denied invalidate mutated valid_to");
+
+        // Owner may invalidate their own fact.
+        m.ltm_invalidate_scoped(alice_fact, 5000, "alice").unwrap();
+        assert_eq!(m.ltm_get(alice_fact).unwrap().meta.valid_to, 5000);
+
+        // Unscoped facts stay manageable by the default scope only.
+        assert!(m.ltm_invalidate_scoped(bare_fact, 1, "bob").is_err());
+        m.ltm_invalidate_scoped(bare_fact, 100, "default").unwrap();
+        assert_eq!(m.ltm_get(bare_fact).unwrap().meta.valid_to, 100);
+
+        // Unknown ids are reported, not silently OK'd.
+        assert!(m.ltm_invalidate_scoped(u64::MAX, 7, "alice").is_err());
+
+        let _ = bob_fact;
+    }
+
+    /// Recall at "now" must apply the fact's validity window (documented
+    /// supersede contract: "recall at 'now' hides it"), while AS_OF keeps
+    /// time-travel intact.
+    #[test]
+    fn recall_applies_bitemporal_window_at_now() {
+        let m = Memory::open(eng());
+        let v = vec![0.2f32; 8];
+        let q = "merge scheduled";
+        let has = |hits: &[RecallHit], target| hits.iter().any(|h| h.id == target);
+
+        let id = m
+            .ltm_store_temporal("the merge is scheduled", v.clone(), "t", 0.9, "x", 0, 0, "alice")
+            .unwrap();
+        assert_eq!(
+            m.recall_scoped("alice", q, &v, 5).len(),
+            1,
+            "fact must be visible before invalidation"
+        );
+        // Superseded at world-time 1 — strictly before every later now().
+        m.ltm_invalidate_scoped(id, 1, "alice").unwrap();
+        assert!(
+            !has(&m.recall_scoped("alice", q, &v, 5), id),
+            "invalidated fact leaked into now-recall"
+        );
+
+        // A FUTURE-dated supersede must NOT hide the fact early: valid_to is
+        // world-time, not ingestion order.
+        let id2 = m
+            .ltm_store_temporal("the second merge is scheduled", v.clone(), "t", 0.9, "x", 0, 0, "alice")
+            .unwrap();
+        let vt_future = m.engine.snapshot() + 100_000;
+        m.ltm_invalidate_scoped(id2, vt_future, "alice").unwrap();
+        assert!(
+            has(&m.recall_scoped("alice", q, &v, 50), id2),
+            "future-dated supersede applied before its world-time"
+        );
+
+        // Time-travel leg: a fact superseded shortly after creation is gone
+        // from the present but still reachable at its creation moment.
+        let id3 = m
+            .ltm_store_temporal("the third merge is scheduled", v.clone(), "t", 0.9, "x", 0, 0, "alice")
+            .unwrap();
+        let vf3 = m.ltm_get(id3).unwrap().meta.valid_from;
+        let now3 = m.engine.snapshot();
+        assert!(now3 > vf3, "store must advance the logical clock past valid_from");
+        m.ltm_invalidate_scoped(id3, vf3 + 1, "alice").unwrap();
+        assert!(
+            !has(&m.recall_scoped("alice", q, &v, 50), id3),
+            "superseded fact leaked into now-recall"
+        );
+        assert!(
+            has(&m.recall_as_of("alice", q, &v, 50, vf3), id3),
+            "AS_OF(valid_from) lost the fact"
+        );
+    }
 
     fn eng() -> Arc<Engine> {
         let dir = std::env::temp_dir().join(format!("dbstrike_mem_{}", std::process::id()));

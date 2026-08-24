@@ -2384,20 +2384,25 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Err(e) => err(&e.to_string()),
             }
         }
-        // MEM.INVALIDATE id at  -> OK   (bump fact's valid_to to `at`)
+        // MEM.INVALIDATE [AGENT name] id at  -> OK   (bump fact's valid_to to `at`)
+        // Owner-scoped: the fact's Meta.owner must match the requesting agent
+        // ("default" for bare form) or the invalidate is denied. Without this
+        // any agent who knew an id could supersede another agent's fact — a
+        // cross-scope write on a read-isolated system.
         "MEM.INVALIDATE" => {
-            if args.len() != 2 {
-                return err("MEM.INVALIDATE requires id at");
+            let (agent, rest) = parse_agent_scope(args);
+            if rest.len() != 2 {
+                return err("MEM.INVALIDATE requires [AGENT name] id at");
             }
-            let id: u64 = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let id: u64 = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("id is not a u64"),
             };
-            let at: u64 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let at: u64 = match std::str::from_utf8(&rest[1]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("at is not a u64"),
             };
-            match db.rag.memory().ltm_invalidate(id, at) {
+            match db.rag.memory().ltm_invalidate_scoped(id, at, &agent) {
                 Ok(_) => Resp::Simple("OK".into()),
                 Err(e) => err(&e.to_string()),
             }
