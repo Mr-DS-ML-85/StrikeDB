@@ -9,9 +9,8 @@
 //! - `ACL WHOAMI` — current user
 //! - `ACL SAVE` / `ACL LOAD` — persist/restore ACL to engine
 //!
-//! Password hashing: SHA-256 with per-user random salt (zero external crates).
-//! The salt is 16 bytes, stored alongside the hash. Verification is
-//! hash(salt + password) == stored_hash.
+//! Password hashing: 4096-round iterated SHA-256 with a per-user 16-byte
+//! salt from /dev/urandom (zero external crates), compared in constant time.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,98 +105,220 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 // Password hashing: SHA-256(salt || password)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Deterministic PRNG for salt generation (xorshift64, seeded from timestamp).
-struct SaltRng {
-    state: u64,
-}
-
-impl SaltRng {
-    fn new(seed: u64) -> Self {
-        Self { state: seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0xC0FFEE) }
-    }
-
-    fn next_bytes(&mut self, buf: &mut [u8]) {
-        for chunk in buf.chunks_mut(8) {
-            self.state ^= self.state << 13;
-            self.state ^= self.state >> 7;
-            self.state ^= self.state << 17;
-            let val = self.state.to_le_bytes();
-            for (b, &v) in chunk.iter_mut().zip(val.iter()) {
-                *b = v;
-            }
+/// 16 random salt bytes from the kernel CSPRNG. The old generator was an
+/// xorshift seeded from the wall clock, so salts were predictable and two users
+/// created in the same nanosecond shared one. `/dev/urandom` is std-only; the
+/// fallback (no /dev/urandom, e.g. a locked-down sandbox) still mixes clock,
+/// pid and a stack address through SHA-256 so salts never collide in practice.
+fn generate_salt() -> [u8; 16] {
+    let mut salt = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        if f.read_exact(&mut salt).is_ok() {
+            return salt;
         }
     }
-}
-
-fn generate_salt() -> [u8; 16] {
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as u64;
-    let mut rng = SaltRng::new(now);
-    let mut salt = [0u8; 16];
-    rng.next_bytes(&mut salt);
+        .as_nanos();
+    let local = 0u8;
+    let mut seed = Vec::new();
+    seed.extend_from_slice(&now.to_le_bytes());
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(&(&local as *const u8 as usize).to_le_bytes());
+    seed.extend_from_slice(&CTR.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    salt.copy_from_slice(&sha256(&seed)[..16]);
     salt
 }
+
+/// Key-stretching rounds. A single SHA-256 made an offline guess as cheap as
+/// one hash; 4096 rounds costs a few hundred µs per AUTH (connection setup,
+/// not the command hot path) and multiplies brute-force cost accordingly.
+const HASH_ROUNDS: usize = 4096;
 
 fn hash_password(password: &str, salt: &[u8; 16]) -> [u8; 32] {
     let mut data = Vec::with_capacity(16 + password.len());
     data.extend_from_slice(salt);
     data.extend_from_slice(password.as_bytes());
-    sha256(&data)
+    let mut h = sha256(&data);
+    let mut buf = [0u8; 48];
+    for _ in 1..HASH_ROUNDS {
+        buf[..32].copy_from_slice(&h);
+        buf[32..].copy_from_slice(salt);
+        h = sha256(&buf);
+    }
+    h
+}
+
+/// Constant-time equality: `==` on the arrays short-circuits on the first
+/// differing byte, leaking how much of the hash matched through timing.
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 fn verify_password(password: &str, salt: &[u8; 16], hash: &[u8; 32]) -> bool {
-    hash_password(password, salt) == *hash
+    ct_eq(&hash_password(password, salt), hash)
+}
+
+/// Redis-style glob match (`*`, `?`, `[abc]`, `[a-z]`, `[^x]`, `\x`) over
+/// raw bytes. Shared by ACL key patterns and the `KEYS` command.
+pub fn glob_match(pat: &[u8], s: &[u8]) -> bool {
+    let (mut p, mut i) = (0usize, 0usize);
+    // Backtrack point for the most recent `*`: (pattern idx after *, string idx).
+    let mut star: Option<(usize, usize)> = None;
+    while i < s.len() {
+        if p < pat.len() {
+            match pat[p] {
+                b'*' => {
+                    while p < pat.len() && pat[p] == b'*' {
+                        p += 1;
+                    }
+                    if p == pat.len() {
+                        return true;
+                    }
+                    star = Some((p, i));
+                    continue;
+                }
+                b'?' => {
+                    p += 1;
+                    i += 1;
+                    continue;
+                }
+                b'[' => {
+                    if let Some((matched, next)) = class_match(pat, p, s[i]) {
+                        if matched {
+                            p = next;
+                            i += 1;
+                            continue;
+                        }
+                    } else if s[i] == b'[' {
+                        // Unterminated class: treat `[` literally.
+                        p += 1;
+                        i += 1;
+                        continue;
+                    }
+                }
+                b'\\' if p + 1 < pat.len() => {
+                    if pat[p + 1] == s[i] {
+                        p += 2;
+                        i += 1;
+                        continue;
+                    }
+                }
+                c => {
+                    if c == s[i] {
+                        p += 1;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        match star {
+            Some((sp, si)) => {
+                p = sp;
+                i = si + 1;
+                star = Some((sp, si + 1));
+            }
+            None => return false,
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// Match `c` against the `[...]` class starting at `pat[start]`. Returns
+/// `(matched, index after ])`, or `None` if the class is unterminated.
+fn class_match(pat: &[u8], start: usize, c: u8) -> Option<(bool, usize)> {
+    let mut j = start + 1;
+    let negate = j < pat.len() && pat[j] == b'^';
+    if negate {
+        j += 1;
+    }
+    let mut matched = false;
+    let mut first = true;
+    while j < pat.len() && (pat[j] != b']' || first) {
+        first = false;
+        if pat[j] == b'\\' && j + 1 < pat.len() {
+            matched |= pat[j + 1] == c;
+            j += 2;
+        } else if j + 2 < pat.len() && pat[j + 1] == b'-' && pat[j + 2] != b']' {
+            let (lo, hi) = if pat[j] <= pat[j + 2] { (pat[j], pat[j + 2]) } else { (pat[j + 2], pat[j]) };
+            matched |= c >= lo && c <= hi;
+            j += 3;
+        } else {
+            matched |= pat[j] == c;
+            j += 1;
+        }
+    }
+    if j >= pat.len() {
+        return None;
+    }
+    Some((matched != negate, j + 1))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // User and ACL Store
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Permission categories (Redis-compatible).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Permission categories (Redis-compatible names).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PermCategory {
-    All,           // +@all — all commands
-    Read,          // +@read — read-only commands
-    Write,         // +@write — write commands
-    Set,           // +@set — KV set commands
-    SortedSet,     // +@sorted_set (not used yet)
-    Hash,          // +@hash (not used yet)
-    List,          // +@list (not used yet)
-    Admin,         // +@admin — server management
-    Slow,          // +@slow — slow commands
-    Dangerous,     // +@dangerous — dangerous commands (FLUSHALL, etc.)
-    Scripting,     // +@scripting (not used yet)
-    PubSub,        // +@pubsub — pub/sub commands
-    Vector,        // +@vector — vector search commands
-    TimeSeries,    // +@timeseries — time-series commands
-    Memory,        // +@memory — agent memory commands
-    Table,         // +@table — table commands
-    Reduce,        // +@reduce — reducer commands
+    All,        // +@all — all commands
+    Read,       // +@read — commands that only read data
+    Write,      // +@write — commands that modify data
+    Admin,      // +@admin — server management
+    Dangerous,  // +@dangerous — FLUSHALL, CONFIG, file access, ...
+    PubSub,     // +@pubsub
+    Vector,     // +@vector — vector index commands
+    TimeSeries, // +@timeseries
+    Memory,     // +@memory — agent memory + RAG
+    Table,      // +@table
+    Reduce,     // +@reduce — reducer VM
+    Connection, // +@connection — PING/ECHO/HELLO/CLIENT/...
 }
 
 impl PermCategory {
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "all" | "*" => Some(PermCategory::All),
             "read" => Some(PermCategory::Read),
             "write" => Some(PermCategory::Write),
-            "set" => Some(PermCategory::Set),
-            "sorted_set" => Some(PermCategory::SortedSet),
-            "hash" => Some(PermCategory::Hash),
-            "list" => Some(PermCategory::List),
             "admin" => Some(PermCategory::Admin),
-            "slow" => Some(PermCategory::Slow),
             "dangerous" => Some(PermCategory::Dangerous),
-            "scripting" => Some(PermCategory::Scripting),
             "pubsub" => Some(PermCategory::PubSub),
             "vector" => Some(PermCategory::Vector),
             "timeseries" => Some(PermCategory::TimeSeries),
-            "memory" => Some(PermCategory::Memory),
+            "memory" | "rag" => Some(PermCategory::Memory),
             "table" => Some(PermCategory::Table),
             "reduce" => Some(PermCategory::Reduce),
+            "connection" => Some(PermCategory::Connection),
             _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            PermCategory::All => "all",
+            PermCategory::Read => "read",
+            PermCategory::Write => "write",
+            PermCategory::Admin => "admin",
+            PermCategory::Dangerous => "dangerous",
+            PermCategory::PubSub => "pubsub",
+            PermCategory::Vector => "vector",
+            PermCategory::TimeSeries => "timeseries",
+            PermCategory::Memory => "memory",
+            PermCategory::Table => "table",
+            PermCategory::Reduce => "reduce",
+            PermCategory::Connection => "connection",
         }
     }
 }
@@ -206,221 +327,333 @@ impl PermCategory {
 #[derive(Clone, Debug)]
 pub struct User {
     pub name: String,
-    pub password_hash: [u8; 32],
-    pub salt: [u8; 16],
+    /// `None` = `nopass` (any password authenticates).
+    pub password: Option<([u8; 16], [u8; 32])>,
+    /// Admin switch (`on`/`off`). A disabled user cannot authenticate and an
+    /// already-authenticated connection loses every permission.
     pub enabled: bool,
-    /// Categories this user can access. Empty = no access (except AUTH).
-    pub categories: Vec<PermCategory>,
-    /// Key patterns this user can access (e.g. "user:*", "*"). Empty = all keys.
-    pub key_patterns: Vec<String>,
+    /// Rules in the order given; the LAST matching rule wins (Redis
+    /// semantics), so `+@all -flushall` and `-@all +get` both do what they say.
+    pub rules: Vec<Rule>,
+    /// Key patterns this user may touch. Empty = no keys.
+    pub key_patterns: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Rule {
+    AllowCmd(String),
+    DenyCmd(String),
+    AllowCat(PermCategory),
+    DenyCat(PermCategory),
 }
 
 impl User {
-    /// Check if this user can execute the given command.
-    pub fn can_command(&self, cmd: &str, category: PermCategory) -> bool {
+    fn new_restricted(name: &str) -> Self {
+        // Redis: a user created by ACL SETUSER starts OFF with no password,
+        // no commands and no keys — permissions must be granted explicitly.
+        User { name: name.to_string(), password: Some(([0; 16], [0xff; 32])), enabled: false, rules: Vec::new(), key_patterns: Vec::new() }
+    }
+
+    fn superuser(name: &str) -> Self {
+        User {
+            name: name.to_string(),
+            password: None,
+            enabled: true,
+            rules: vec![Rule::AllowCat(PermCategory::All)],
+            key_patterns: vec![b"*".to_vec()],
+        }
+    }
+
+    /// May this user run `cmd` (upper-case), whose categories are `cats`?
+    pub fn can_command(&self, cmd: &str, cats: &[PermCategory]) -> bool {
         if !self.enabled {
             return false;
         }
-        // AUTH is always allowed (otherwise user can never log in).
-        if cmd.eq_ignore_ascii_case("AUTH") || cmd.eq_ignore_ascii_case("ACL") {
+        // Connection-level commands every authenticated client needs.
+        if matches!(cmd, "AUTH" | "HELLO" | "QUIT" | "PING" | "RESET") {
             return true;
         }
-        // "all" category covers everything.
-        if self.categories.contains(&PermCategory::All) {
-            return true;
+        let mut allowed = false;
+        for r in &self.rules {
+            match r {
+                Rule::AllowCmd(c) if c == cmd => allowed = true,
+                Rule::DenyCmd(c) if c == cmd => allowed = false,
+                Rule::AllowCat(c) if *c == PermCategory::All || cats.contains(c) => allowed = true,
+                Rule::DenyCat(c) if *c == PermCategory::All || cats.contains(c) => allowed = false,
+                _ => {}
+            }
         }
-        self.categories.contains(&category)
+        allowed
+    }
+
+    pub fn can_key(&self, key: &[u8]) -> bool {
+        self.key_patterns.iter().any(|p| glob_match(p, key))
+    }
+
+    fn describe(&self) -> String {
+        let mut out = vec![if self.enabled { "on".to_string() } else { "off".to_string() }];
+        if self.password.is_none() {
+            out.push("nopass".into());
+        }
+        for p in &self.key_patterns {
+            out.push(format!("~{}", String::from_utf8_lossy(p)));
+        }
+        for r in &self.rules {
+            out.push(match r {
+                Rule::AllowCmd(c) => format!("+{}", c.to_lowercase()),
+                Rule::DenyCmd(c) => format!("-{}", c.to_lowercase()),
+                Rule::AllowCat(c) => format!("+@{}", c.name()),
+                Rule::DenyCat(c) => format!("-@{}", c.name()),
+            });
+        }
+        out.join(" ")
     }
 }
 
 /// The ACL store — manages users and authentication.
 pub struct AclStore {
     users: RwLock<HashMap<String, User>>,
-    /// The server requirepass (if set via env DBSTRIKE_REQUIREPASS).
-    requirepass: Option<String>,
+    /// The server requirepass (`DBSTRIKE_PASS`).
+    requirepass: bool,
     /// When true, the per-command permission gate must run on the RESP hot
-    /// path. When false it is provably a no-op (no requirepass, and no user
-    /// exists whose categories could deny a command), so the dispatch loop
-    /// skips it entirely and pays one relaxed load instead of a lock + scan.
-    ///
-    /// Set true at construction when auth is required, and latched true by any
-    /// mutation that can introduce a restriction (`del_user`,
-    /// `set_user_categories`, disabling a user). Never set back to false, so
-    /// enforcement can only become MORE strict, never silently weaker.
+    /// path. When false it is provably a no-op (no requirepass and no user
+    /// other than the unrestricted default exists), so the dispatch loop skips
+    /// it and pays one relaxed load. Latched true by any ACL mutation and never
+    /// cleared, so enforcement can only become stricter.
     strict: AtomicBool,
 }
 
 impl AclStore {
-    /// Create a new ACL store with a default "default" user.
-    /// If `requirepass` is set, the default user requires that password.
+    /// Create a store with the `default` superuser. With `requirepass` set,
+    /// `default` requires that password; otherwise it is `nopass`.
     pub fn new(requirepass: Option<String>) -> Arc<Self> {
         let mut users = HashMap::new();
-
-        // Default user: full access if no requirepass; otherwise needs auth.
-        let default_enabled = requirepass.is_none();
-        let default_salt = generate_salt();
-        let default_hash = if let Some(ref pw) = requirepass {
-            hash_password(pw, &default_salt)
-        } else {
-            [0u8; 32]
-        };
-
-        users.insert(
-            "default".to_string(),
-            User {
-                name: "default".to_string(),
-                password_hash: default_hash,
-                salt: default_salt,
-                enabled: default_enabled,
-                categories: vec![PermCategory::All],
-                key_patterns: vec!["*".to_string()],
-            },
-        );
-
+        let mut default = User::superuser("default");
+        if let Some(ref pw) = requirepass {
+            let salt = generate_salt();
+            default.password = Some((salt, hash_password(pw, &salt)));
+        }
+        users.insert("default".to_string(), default);
         let strict = requirepass.is_some();
         Arc::new(Self {
             users: RwLock::new(users),
-            requirepass,
+            requirepass: requirepass.is_some(),
             strict: AtomicBool::new(strict),
         })
     }
 
-    /// True if the per-command permission gate must run on this request.
-    /// In the default no-auth install this stays false, so the RESP hot path
-    /// skips the ACL work entirely (a single relaxed load).
     pub fn needs_permission_check(&self) -> bool {
         self.strict.load(Ordering::Relaxed)
     }
 
-    /// Latch strict mode on. Used by every ACL mutation that can deny a
-    /// command the default user could otherwise run, and by AUTH when a named
-    /// (possibly restricted) user authenticates.
     pub fn latch_strict(&self) {
         self.strict.store(true, Ordering::Relaxed);
     }
 
-    /// Authenticate a password against the default user (Redis `AUTH password`).
+    /// `AUTH password` — authenticate as `default`.
     pub fn auth_default(&self, password: &str) -> bool {
-        let users = self.users.read().unwrap();
-        if let Some(user) = users.get("default") {
-            verify_password(password, &user.salt, &user.password_hash)
-        } else {
-            false
-        }
+        self.auth_user("default", password)
     }
 
-    /// Authenticate a specific user (Redis `AUTH username password`).
+    /// `AUTH username password`. Fails for unknown or disabled users. (The
+    /// old code authenticated disabled users and then RE-ENABLED them, so an
+    /// admin's `ACL SETUSER bob off` was undone by bob's next login.)
     pub fn auth_user(&self, username: &str, password: &str) -> bool {
         let users = self.users.read().unwrap();
-        if let Some(user) = users.get(username) {
-            // Auth works regardless of enabled flag.
-            verify_password(password, &user.salt, &user.password_hash)
-        } else {
-            false
+        match users.get(username) {
+            Some(u) if u.enabled => match &u.password {
+                None => true,
+                Some((salt, hash)) => verify_password(password, salt, hash),
+            },
+            _ => false,
         }
     }
 
-    /// Check if a user (by name) can execute a command in the given category.
-    pub fn can_command(&self, username: &str, cmd: &str, category: PermCategory) -> bool {
+    pub fn can_command(&self, username: &str, cmd: &str, cats: &[PermCategory]) -> bool {
         let users = self.users.read().unwrap();
-        if let Some(user) = users.get(username) {
-            user.can_command(cmd, category)
-        } else {
-            false
+        users.get(username).is_some_and(|u| u.can_command(cmd, cats))
+    }
+
+    pub fn can_keys<'a>(&self, username: &str, mut keys: impl Iterator<Item = &'a [u8]>) -> bool {
+        let users = self.users.read().unwrap();
+        match users.get(username) {
+            Some(u) => keys.all(|k| u.can_key(k)),
+            None => false,
         }
     }
 
-    /// Check if the server requires authentication.
     pub fn requires_auth(&self) -> bool {
-        self.requirepass.is_some()
+        self.requirepass
     }
 
-    /// Set a user's password (hashed). Creates the user if it doesn't exist.
-    pub fn set_user_password(&self, username: &str, password: &str) {
-        let salt = generate_salt();
-        let hash = hash_password(password, &salt);
+    /// Apply `ACL SETUSER` rule tokens to `username`, creating the user
+    /// (OFF, no permissions) if needed. All tokens are validated before any
+    /// change is made, so a typo can't leave a half-applied rule set.
+    pub fn set_user(&self, username: &str, tokens: &[String]) -> Result<(), String> {
         let mut users = self.users.write().unwrap();
-        if let Some(user) = users.get_mut(username) {
-            user.salt = salt;
-            user.password_hash = hash;
-            user.enabled = true;
-        } else {
-            users.insert(
-                username.to_string(),
-                User {
-                    name: username.to_string(),
-                    password_hash: hash,
-                    salt,
-                    enabled: true,
-                    categories: vec![PermCategory::All],
-                    key_patterns: vec!["*".to_string()],
-                },
-            );
-        }
-    }
-
-    /// Enable or disable a user.
-    pub fn set_user_enabled(&self, username: &str, enabled: bool) -> bool {
-        let mut users = self.users.write().unwrap();
-        if let Some(user) = users.get_mut(username) {
-            user.enabled = enabled;
-            if !enabled {
-                // A disabled user could otherwise run commands under a stale
-                // connection, so the gate must stay armed.
-                self.latch_strict();
+        let mut u = users.get(username).cloned().unwrap_or_else(|| User::new_restricted(username));
+        for t in tokens {
+            let lower = t.to_ascii_lowercase();
+            match lower.as_str() {
+                "on" => u.enabled = true,
+                "off" => u.enabled = false,
+                "nopass" => u.password = None,
+                "resetpass" => u.password = Some(([0; 16], [0xff; 32])),
+                "allkeys" => u.key_patterns = vec![b"*".to_vec()],
+                "resetkeys" => u.key_patterns.clear(),
+                "allcommands" => u.rules = vec![Rule::AllowCat(PermCategory::All)],
+                "nocommands" => u.rules.clear(),
+                "reset" => u = User::new_restricted(username),
+                _ => {
+                    if let Some(raw) = t.strip_prefix('#') {
+                        // Internal persisted form `#<salt hex>:<hash hex>` (ACL SAVE).
+                        u.password = Some(parse_hashed(raw).ok_or_else(|| format!("Error in ACL SETUSER modifier '{t}': bad hash"))?);
+                    } else if let Some(pw) = t.strip_prefix('>') {
+                        let salt = generate_salt();
+                        u.password = Some((salt, hash_password(pw, &salt)));
+                    } else if let Some(pat) = t.strip_prefix('~') {
+                        u.key_patterns.push(pat.as_bytes().to_vec());
+                    } else if let Some(rest) = t.strip_prefix('+') {
+                        u.rules.push(parse_rule(rest, true)?);
+                    } else if let Some(rest) = t.strip_prefix('-') {
+                        u.rules.push(parse_rule(rest, false)?);
+                    } else {
+                        return Err(format!("Error in ACL SETUSER modifier '{t}': Syntax error"));
+                    }
+                }
             }
-            true
-        } else {
-            false
         }
+        users.insert(username.to_string(), u);
+        self.latch_strict();
+        Ok(())
     }
 
-    /// Set a user's categories (replaces existing).
+    /// Back-compat helpers used by tests.
+    #[cfg(test)]
+    pub fn set_user_password(&self, username: &str, password: &str) {
+        let _ = self.set_user(username, &[format!(">{password}"), "on".into()]);
+    }
+
+    #[cfg(test)]
+    pub fn set_user_enabled(&self, username: &str, enabled: bool) -> bool {
+        let exists = self.users.read().unwrap().contains_key(username);
+        exists && self.set_user(username, &[if enabled { "on" } else { "off" }.to_string()]).is_ok()
+    }
+
+    #[cfg(test)]
     pub fn set_user_categories(&self, username: &str, cats: Vec<PermCategory>) -> bool {
         let mut users = self.users.write().unwrap();
-        if let Some(user) = users.get_mut(username) {
-            user.categories = cats;
-            // A category list narrower than All can deny commands the default
-            // user would run — the gate must stay armed from here on.
-            self.latch_strict();
-            true
-        } else {
-            false
+        match users.get_mut(username) {
+            Some(u) => {
+                u.rules = cats.into_iter().map(Rule::AllowCat).collect();
+                drop(users);
+                self.latch_strict();
+                true
+            }
+            None => false,
         }
     }
 
-    /// Delete a user. Returns true if the user existed.
     pub fn del_user(&self, username: &str) -> bool {
-        let mut users = self.users.write().unwrap();
-        let removed = users.remove(username).is_some();
+        if username == "default" {
+            return false; // Redis refuses to delete the default user
+        }
+        let removed = self.users.write().unwrap().remove(username).is_some();
         if removed {
             self.latch_strict();
         }
         removed
     }
 
-    /// Get a user's info as a flat string (Redis ACL GETUSER format).
-    pub fn get_user_info(&self, username: &str) -> Option<String> {
+    /// `ACL GETUSER` as flat key/value pairs.
+    pub fn get_user_info(&self, username: &str) -> Option<Vec<(String, String)>> {
         let users = self.users.read().unwrap();
         users.get(username).map(|u| {
-            let status = if u.enabled { "on" } else { "off" };
-            let keys: Vec<&str> = u.key_patterns.iter().map(|s| s.as_str()).collect();
-            format!(
-                "flags {} channels * commands * ~{} resetchannels {}",
-                status,
-                keys.join(" ~"),
-                if u.categories.is_empty() { "off" } else { "on" }
-            )
+            let flags = if u.enabled { "on" } else { "off" };
+            let keys: Vec<String> = u.key_patterns.iter().map(|p| format!("~{}", String::from_utf8_lossy(p))).collect();
+            let cmds: Vec<String> = u.describe().split(' ').filter(|t| t.starts_with('+') || t.starts_with('-')).map(String::from).collect();
+            vec![
+                ("flags".into(), if u.password.is_none() { format!("{flags} nopass") } else { flags.to_string() }),
+                ("commands".into(), if cmds.is_empty() { "-@all".into() } else { cmds.join(" ") }),
+                ("keys".into(), keys.join(" ")),
+            ]
         })
     }
 
-    /// List all users (Redis ACL LIST format).
+    /// Serialize every user as `ACL SETUSER`-style token lines, passwords as
+    /// salted hashes (never plaintext). Used by `ACL SAVE`.
+    pub fn dump(&self) -> String {
+        let users = self.users.read().unwrap();
+        let mut lines: Vec<String> = users
+            .values()
+            .map(|u| {
+                let mut toks = vec![u.name.clone(), "reset".into()];
+                match &u.password {
+                    None => toks.push("nopass".into()),
+                    Some((salt, hash)) => toks.push(format!("#{}:{}", hex_encode(salt), hex_encode(hash))),
+                }
+                toks.extend(u.describe().split(' ').filter(|t| *t != "nopass").map(String::from));
+                toks.join(" ")
+            })
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    }
+
+    /// Replace the user table from a `dump()` (ACL LOAD / startup).
+    pub fn load(&self, text: &str) -> Result<usize, String> {
+        let staged = AclStore {
+            users: RwLock::new(HashMap::new()),
+            requirepass: self.requirepass,
+            strict: AtomicBool::new(true),
+        };
+        let mut n = 0;
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let mut it = line.split(' ');
+            let name = it.next().ok_or("empty ACL line")?;
+            let toks: Vec<String> = it.map(String::from).collect();
+            staged.set_user(name, &toks)?;
+            n += 1;
+        }
+        let new_users = staged.users.into_inner().unwrap();
+        if !new_users.contains_key("default") {
+            return Err("ACL dump has no default user".into());
+        }
+        *self.users.write().unwrap() = new_users;
+        self.latch_strict();
+        Ok(n)
+    }
+
+    /// `ACL LIST` lines.
     pub fn list_users(&self) -> Vec<String> {
         let users = self.users.read().unwrap();
-        users.values().map(|u| {
-            let flags = if u.enabled { "on" } else { "off" };
-            format!("user {} {} {}", u.name, flags, "reset")
-        }).collect()
+        let mut v: Vec<String> = users.values().map(|u| format!("user {} {}", u.name, u.describe())).collect();
+        v.sort();
+        v
+    }
+}
+
+fn hex_encode(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn parse_hashed(raw: &str) -> Option<([u8; 16], [u8; 32])> {
+    let (s, h) = raw.split_once(':')?;
+    let dec = |x: &str| -> Option<Vec<u8>> {
+        (0..x.len()).step_by(2).map(|i| u8::from_str_radix(x.get(i..i + 2)?, 16).ok()).collect()
+    };
+    Some((dec(s)?.try_into().ok()?, dec(h)?.try_into().ok()?))
+}
+
+fn parse_rule(rest: &str, allow: bool) -> Result<Rule, String> {
+    if let Some(cat) = rest.strip_prefix('@') {
+        let c = PermCategory::from_str(cat).ok_or_else(|| format!("Error in ACL SETUSER modifier '@{cat}': Unknown command category"))?;
+        Ok(if allow { Rule::AllowCat(c) } else { Rule::DenyCat(c) })
+    } else if rest.is_empty() {
+        Err("Error in ACL SETUSER modifier: empty command".into())
+    } else {
+        let c = rest.to_ascii_uppercase();
+        Ok(if allow { Rule::AllowCmd(c) } else { Rule::DenyCmd(c) })
     }
 }
 
@@ -428,46 +661,58 @@ impl AclStore {
 // Command category mapping
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Map a Redis command name to its permission category.
-pub fn command_category(cmd: &str) -> PermCategory {
+use PermCategory::*;
+
+/// Categories of a command (upper-case name). Unknown commands are
+/// `admin`+`dangerous`: a command added later without a mapping must be
+/// DENIED to restricted users, not silently readable (the old default was
+/// `Read`, which let a read-only user run GPU.MODE, CHECKPOINT, ...).
+pub fn command_categories(cmd: &str) -> &'static [PermCategory] {
     match cmd {
-        // KV read
-        "GET" | "MGET" | "KEYS" | "DBSIZE" | "EXISTS" | "TYPE" | "TTL" | "PTTL" => PermCategory::Read,
-        // KV write
-        "SET" | "MSET" | "DEL" | "INCR" | "INCRBY" | "DECR" | "DECRBY"
-        | "APPEND" | "SETNX" | "SETEX" | "PSETEX" | "SETXX" => PermCategory::Write,
-        // Admin
-        "PING" | "QUIT" | "INFO" | "ECHO" | "TIME" => PermCategory::Admin,
-        "CONFIG" | "SELECT" | "FLUSHALL" | "FLUSHDB" | "COMMAND" => PermCategory::Admin,
-        "CLIENT" => PermCategory::Admin,
-        // Vector
-        "VADD" | "VADDNS" | "VDEL" | "VADDBATCH" | "VBULKLOAD" | "VSEARCH" | "VSEARCHNS" | "VSEARCHA" | "VSEARCH.MANY"
-        | "VSETQUANT" | "VFITQUANT" | "VQUANT" | "VCALIBRATE" => PermCategory::Vector,
-        // Time-series
-        "TSADD" | "TSADD.F" | "TSRANGE" | "TSRANGE.LATEST" | "TSLATEST" | "TSAVG" => PermCategory::TimeSeries,
-        // Pub/sub
-        "SUBSCRIBE" | "PSUBSCRIBE" | "UNSUBSCRIBE" | "PUNSUBSCRIBE" | "PUBLISH" => PermCategory::PubSub,
-        // Reduce
-        "REDUCE" | "REDUCE.PROGRAM" => PermCategory::Reduce,
-        // Table
-        "TABLE.SET" | "TABLE.GET" | "TABLE.DEL" | "TABLE.SCAN" | "TABLE.FILTEREQ" => PermCategory::Table,
-        // Memory
-        "MEM.REMEMBER" | "MEM.RECALL" | "MEM.FORGET" | "MEM.LINK" | "MEM.UNLINK"
-        | "MEM.NEIGH" | "MEM.TRAV" | "MEM.COUNT" | "MEM.GET" | "MEM.CONSOLIDATE"
-        | "MEM.EPISODES_CLEAR" | "MEM.PROC.SET" | "MEM.PROC.GET" | "MEM.PROC.LIST"
-        | "MEM.REMEMBER.T" | "MEM.INVALIDATE" | "MEM.RECALL.AS_OF"
-        | "MEM.INCOMING" => PermCategory::Memory,
-        // CRDT / HLC (consensus)
-        "CRDT.GCOUNTER" | "CRDT.PNCOUNTER" | "CRDT.LWW" | "CRDT.GET"
-        | "HLC.NOW" | "HLC.UPDATE" => PermCategory::Admin,
-        // RAG
-        "RAG.INGEST" | "RAG.SEARCH" | "RAG.CONTEXT" => PermCategory::Vector,
-        // Checkpoint / cache
-        "CHECKPOINT" | "CDCLEN" | "CACHE.*" | "GETAT" | "SCAN" => PermCategory::Admin,
-        // ACL / AUTH
-        "AUTH" | "ACL" => PermCategory::Admin,
-        // Everything else is read by default
-        _ => PermCategory::Read,
+        "PING" | "ECHO" | "QUIT" | "HELLO" | "AUTH" | "CLIENT" | "SELECT" | "RESET" | "TIME" | "COMMAND" => &[Connection],
+        "INFO" | "DBSIZE" | "CDCLEN" => &[Admin, Read],
+        "GET" | "MGET" | "KEYS" | "EXISTS" | "TYPE" | "TTL" | "PTTL" | "STRLEN" | "GETAT" | "SCAN" | "GETRANGE" => &[Read],
+        "SET" | "MSET" | "DEL" | "UNLINK" | "INCR" | "INCRBY" | "DECR" | "DECRBY" | "APPEND" | "GETSET" | "GETDEL"
+        | "SETNX" | "EXPIRE" | "PEXPIRE" | "PERSIST" => &[Write],
+        "FLUSHALL" | "FLUSHDB" | "CONFIG" | "CHECKPOINT" | "MEMTRACK" | "SHUTDOWN" | "ACL" | "VSNAPSHOT"
+        | "GPU.LOAD" | "GPU.UNLOAD" | "GPU.MODE" | "GPU.SWEEP" | "CACHE.CLEAR" | "CACHE.BUGS" | "CACHE.TRACES" => &[Admin, Dangerous],
+        "GPU.INFO" => &[Admin, Read],
+        // VBULKLOAD reads an arbitrary server-side file path.
+        "VBULKLOAD" | "VBULKLOADNS" => &[Vector, Write, Dangerous],
+        "VSEARCH" | "VSEARCHNS" | "VSEARCHA" | "VSEARCHANS" | "VSEARCH.MANY" | "VSEARCH.MANYNS" | "VGETPAYLOAD"
+        | "VLISTNS" | "VQUANT" | "VQUANTNS" | "VFACET" | "VRECOMMEND" => &[Vector, Read],
+        "VADD" | "VADDNS" | "VDEL" | "VDELNS" | "VADDBATCH" | "VADDBATCHNS" | "VSETQUANT" | "VSETQUANTNS"
+        | "VFITQUANT" | "VFITQUANTNS" | "VCALIBRATE" | "VSETPAYLOAD" | "VDELPAYLOAD" => &[Vector, Write],
+        "TSRANGE" | "TSRANGE.LATEST" | "TSLATEST" | "TSAVG" => &[TimeSeries, Read],
+        "TSADD" | "TSADD.F" => &[TimeSeries, Write],
+        "SUBSCRIBE" | "PSUBSCRIBE" | "UNSUBSCRIBE" | "PUNSUBSCRIBE" | "PUBLISH" | "PUBSUB" => &[PubSub],
+        "REDUCE" | "REDUCE.PROGRAM" => &[Reduce, Write],
+        "TABLE.GET" | "TABLE.SCAN" | "TABLE.FILTEREQ" => &[Table, Read],
+        "TABLE.SET" | "TABLE.DEL" => &[Table, Write],
+        "MEM.RECALL" | "MEM.RECALL.AS_OF" | "MEM.NEIGH" | "MEM.TRAV" | "MEM.COUNT" | "MEM.GET" | "MEM.PROC.GET"
+        | "MEM.PROC.LIST" | "MEM.WM_GET" | "MEM.EPISODES" | "MEM.INCOMING" | "RAG.SEARCH" | "RAG.CONTEXT" => &[Memory, Read],
+        "MEM.REMEMBER" | "MEM.REMEMBER.T" | "MEM.FORGET" | "MEM.LINK" | "MEM.UNLINK" | "MEM.CONSOLIDATE"
+        | "MEM.EPISODES_CLEAR" | "MEM.PROC.SET" | "MEM.INVALIDATE" | "MEM.WM_SET" | "MEM.WM_DELETE" | "MEM.EPISODE"
+        | "MEM.EPISODE_FORGET" | "RAG.INGEST" => &[Memory, Write],
+        "CRDT.GET" | "HLC.NOW" | "CACHE.GET" => &[Read],
+        "CRDT.GCOUNTER" | "CRDT.PNCOUNTER" | "CRDT.LWW" | "HLC.UPDATE" | "CACHE.SET" | "CACHE.SRCSET"
+        | "CACHE.SRCDEL" | "CACHE.INVALIDATE" => &[Write],
+        _ => &[Admin, Dangerous],
+    }
+}
+
+/// Positions of key arguments for the KV commands (args exclude the command
+/// name), used to enforce `~pattern` key permissions. Non-KV commands address
+/// their own namespaces and are governed by command/category rules only.
+pub fn command_keys<'a>(cmd: &str, args: &'a [Vec<u8>]) -> Vec<&'a [u8]> {
+    match cmd {
+        "GET" | "SET" | "INCR" | "INCRBY" | "DECR" | "DECRBY" | "APPEND" | "STRLEN" | "TYPE" | "TTL" | "PTTL"
+        | "EXPIRE" | "PEXPIRE" | "PERSIST" | "GETSET" | "GETDEL" | "SETNX" | "GETRANGE" => {
+            args.first().map(|a| vec![a.as_slice()]).unwrap_or_default()
+        }
+        "DEL" | "UNLINK" | "MGET" | "EXISTS" => args.iter().map(|a| a.as_slice()).collect(),
+        "MSET" => args.iter().step_by(2).map(|a| a.as_slice()).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -491,49 +736,81 @@ mod tests {
         let hash = hash_password("secret", &salt);
         assert!(verify_password("secret", &salt, &hash));
         assert!(!verify_password("wrong", &salt, &hash));
+        assert_ne!(generate_salt(), generate_salt());
     }
 
     #[test]
     fn acl_store_default_no_password() {
         let store = AclStore::new(None);
         assert!(!store.requires_auth());
-        // Default user is enabled without auth.
-        assert!(store.can_command("default", "GET", PermCategory::Read));
-        assert!(store.can_command("default", "SET", PermCategory::Write));
+        assert!(store.can_command("default", "GET", command_categories("GET")));
+        assert!(store.can_command("default", "FLUSHALL", command_categories("FLUSHALL")));
     }
 
     #[test]
     fn acl_store_with_password() {
         let store = AclStore::new(Some("mypass".to_string()));
         assert!(store.requires_auth());
-        // Default user disabled until auth.
-        assert!(!store.can_command("default", "GET", PermCategory::Read));
-        // Auth with correct password.
         assert!(store.auth_default("mypass"));
-        // Now enable the user.
-        store.set_user_enabled("default", true);
-        assert!(store.can_command("default", "GET", PermCategory::Read));
+        assert!(!store.auth_default("nope"));
     }
 
     #[test]
-    fn acl_user_create_and_auth() {
+    fn per_command_rules_are_enforced() {
         let store = AclStore::new(None);
-        store.set_user_password("alice", "password123");
-        assert!(store.auth_user("alice", "password123"));
-        assert!(!store.auth_user("alice", "wrong"));
-        assert!(!store.auth_user("bob", "password123"));
+        store.set_user("bob", &["on".into(), ">pw".into(), "+GET".into(), "~*".into()]).unwrap();
+        assert!(store.auth_user("bob", "pw"));
+        let can = |c: &str| store.can_command("bob", c, command_categories(c));
+        assert!(can("GET"));
+        for c in ["SET", "MSET", "FLUSHALL", "ACL", "GPU.MODE", "CHECKPOINT", "SOMETHINGNEW"] {
+            assert!(!can(c), "{c} must be denied");
+        }
     }
 
     #[test]
-    fn acl_user_categories() {
+    fn category_rules_last_match_wins() {
         let store = AclStore::new(None);
-        store.set_user_password("reader", "pass");
-        store.set_user_categories("reader", vec![PermCategory::Read]);
-        assert!(store.can_command("reader", "GET", PermCategory::Read));
-        assert!(!store.can_command("reader", "SET", PermCategory::Write));
-        // AUTH and ACL always allowed.
-        assert!(store.can_command("reader", "AUTH", PermCategory::Admin));
-        assert!(store.can_command("reader", "ACL", PermCategory::Admin));
+        store.set_user("ops", &["on".into(), "nopass".into(), "+@all".into(), "-FLUSHALL".into()]).unwrap();
+        assert!(store.can_command("ops", "SET", command_categories("SET")));
+        assert!(!store.can_command("ops", "FLUSHALL", command_categories("FLUSHALL")));
+        store.set_user("ro", &["on".into(), "nopass".into(), "+@read".into(), "-@all".into(), "+@read".into()]).unwrap();
+        assert!(store.can_command("ro", "GET", command_categories("GET")));
+        assert!(!store.can_command("ro", "SET", command_categories("SET")));
+    }
+
+    #[test]
+    fn new_user_has_nothing_and_disabled_user_cannot_auth() {
+        let store = AclStore::new(None);
+        store.set_user("eve", &[">p".into()]).unwrap();
+        assert!(!store.auth_user("eve", "p"), "new users start off");
+        store.set_user("eve", &["on".into()]).unwrap();
+        assert!(store.auth_user("eve", "p"));
+        assert!(!store.can_command("eve", "GET", command_categories("GET")));
+        store.set_user("eve", &["off".into()]).unwrap();
+        assert!(!store.auth_user("eve", "p"));
+    }
+
+    #[test]
+    fn key_patterns() {
+        let store = AclStore::new(None);
+        store.set_user("k", &["on".into(), "nopass".into(), "+@all".into(), "~user:*".into()]).unwrap();
+        assert!(store.can_keys("k", [&b"user:1"[..]].into_iter()));
+        assert!(!store.can_keys("k", [&b"user:1"[..], &b"admin"[..]].into_iter()));
+    }
+
+    #[test]
+    fn glob() {
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"x*", b"xy"));
+        assert!(glob_match(b"*2", b"x2"));
+        assert!(glob_match(b"x?", b"xy"));
+        assert!(!glob_match(b"x?", b"x"));
+        assert!(glob_match(b"h[ae]llo", b"hello"));
+        assert!(!glob_match(b"h[^e]llo", b"hello"));
+        assert!(glob_match(b"h[a-c]llo", b"hbllo"));
+        assert!(glob_match(b"a\\*b", b"a*b"));
+        assert!(!glob_match(b"a\\*b", b"axb"));
+        assert!(glob_match(b"*a*b*c", b"xxaxxbxxc"));
     }
 
     #[test]
@@ -543,6 +820,7 @@ mod tests {
         assert!(store.del_user("temp"));
         assert!(!store.del_user("temp"));
         assert!(!store.auth_user("temp", "pass"));
+        assert!(!store.del_user("default"));
     }
 
     fn hex(bytes: &[u8]) -> String {

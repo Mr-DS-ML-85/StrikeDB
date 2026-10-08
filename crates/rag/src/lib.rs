@@ -107,6 +107,12 @@ impl Rag {
         // dense and sparse orderings from one pass. Scoped to the requesting
         // agent so cross-agent recall is impossible.
         let blended = self.memory.recall_scoped(scope, query, query_vec, pool);
+        // Evidence score per doc (semantic similarity × salience + BM25), the
+        // value reported to callers. RRF only decides ORDER: its value is a
+        // pure function of rank (1/61, 1/62, ...) and carries no relevance
+        // information, so callers could not threshold on it.
+        let evidence: std::collections::HashMap<u64, f32> =
+            blended.iter().map(|h| (h.id, h.score)).collect();
 
         // dense list (ANN) — semantic ranking (already in blended order by score)
         let dense: Vec<(u64, f32)> = blended
@@ -140,22 +146,25 @@ impl Rag {
         // materialize + lightweight rerank (lexical overlap boost)
         let qtok = tokenize(query);
         let mut out: Vec<Retrieved> = Vec::new();
-        for (id, (mut score, drank, srank)) in fused {
+        let mut order: Vec<(u64, f32)> = Vec::new();
+        for (id, (mut rrf, drank, srank)) in fused {
             if let Some(rec) = self.memory.ltm_get(id) {
                 let doc_tok = tokenize(&rec.text);
                 let overlap = qtok.iter().filter(|t| doc_tok.contains(t)).count() as f32;
-                score += 0.01 * overlap; // small lexical tie-breaker
+                rrf += 0.01 * overlap; // small lexical tie-breaker
+                order.push((id, rrf));
                 out.push(Retrieved {
                     id,
                     text: rec.text,
-                    score,
+                    score: evidence.get(&id).copied().unwrap_or(0.0),
                     source: rec.meta.source,
                     dense_rank: drank,
                     sparse_rank: srank,
                 });
             }
         }
-        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let rank: std::collections::HashMap<u64, f32> = order.into_iter().collect();
+        out.sort_by(|a, b| rank[&b.id].total_cmp(&rank[&a.id]));
         out.truncate(k);
         out
     }
@@ -173,7 +182,16 @@ impl Rag {
         let gen = self.corpus_gen();
         // Scope is part of the cache key: agent A must never be served
         // agent B's cached retrieval.
-        let ckey = format!("rag:q:{gen}:{scope}:{k}:{query}");
+        // The query VECTOR is part of the key too: the same text with a
+        // different embedding (another model, or a refined query) must not be
+        // served the first embedding's cached hits.
+        let mut vh: u64 = 0xcbf29ce484222325;
+        for f in query_vec {
+            for b in f.to_bits().to_le_bytes() {
+                vh = (vh ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        let ckey = format!("rag:q:{gen}:{scope}:{k}:{vh:016x}:{query}");
         let (cached, verdict) = self.cache.cache_get(&ckey);
         if let Some(bytes) = cached {
             if !verdict.is_bug() {

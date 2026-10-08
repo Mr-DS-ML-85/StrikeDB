@@ -35,8 +35,8 @@ fn main() {
         let qi8 = &q[qi];
         let mut f32s: Vec<(usize,f32)> = (0..n).map(|i| (i, f32_cos(qf, &data[i*dim..(i+1)*dim]))).collect();
         let mut i8s: Vec<(usize,f32)> = (0..n).map(|i| (i, cos_dist_q(qi8, &q[i]))).collect();
-        f32s.sort_by(|a,b| a.1.partial_cmp(&b.1).unwrap());
-        i8s.sort_by(|a,b| a.1.partial_cmp(&b.1).unwrap());
+        f32s.sort_by(|a,b| a.1.total_cmp(&b.1));
+        i8s.sort_by(|a,b| a.1.total_cmp(&b.1));
         let ft: Vec<usize> = f32s.iter().take(10).map(|(i,_)| *i).collect();
         let it: Vec<usize> = i8s.iter().take(10).map(|(i,_)| *i).collect();
         overlap += it.iter().filter(|x| ft.contains(x)).count() as u32;

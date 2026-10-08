@@ -1362,7 +1362,7 @@ impl TurboParams {
                     cent[k] = nc;
                 }
             }
-            cent.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            cent.sort_by(|a, b| a.total_cmp(b));
             if !changed {
                 break;
             }
@@ -2283,7 +2283,7 @@ impl Hnsw {
             let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
             if let Some(best) = found
                 .into_iter()
-                .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap())
+                .min_by(|a, b| a.dist.total_cmp(&b.dist))
             {
                 cur = best.idx;
             }
@@ -2292,7 +2292,7 @@ impl Hnsw {
         for lvl in (0..=start_lvl).rev() {
             let mut found =
                 Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, self.ef_construction, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
-            found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+            found.sort_by(|a, b| a.dist.total_cmp(&b.dist));
             // Select the new node's forward neighbors using the HNSW diversity
             // heuristic (Alg. 4, Malkov & Yashunin). This produces a navigable
             // graph with spread-out edges, so ef=128 search reaches ~all nodes
@@ -2319,7 +2319,7 @@ impl Hnsw {
                         .iter()
                         .map(|&x| (cos_dist_q(nvec_ref, &self.all_i8[x * self.dim..x * self.dim + self.dim]), x))
                         .collect();
-                    nn.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    nn.sort_by(|a, b| a.0.total_cmp(&b.0));
                     nn.truncate(self.m_max0);
                     self.nodes[neigh_idx].neighbors[lvl] = nn.into_iter().map(|(_, x)| x).collect();
                 }
@@ -2458,7 +2458,7 @@ impl Hnsw {
             let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
             if let Some(best) = found
                 .into_iter()
-                .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap())
+                .min_by(|a, b| a.dist.total_cmp(&b.dist))
             {
                 cur = best.idx;
             }
@@ -2467,7 +2467,7 @@ impl Hnsw {
         for lvl in (0..=start_lvl).rev() {
             let mut found =
                 Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, &q, cur, self.ef_construction, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
-            found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+            found.sort_by(|a, b| a.dist.total_cmp(&b.dist));
             let selected: Vec<usize> = self.select_neighbors_heuristic(idx, &found, self.m, lvl);
             for &nb in &selected {
                 self.nodes[idx].neighbors[lvl].push(nb);
@@ -2818,7 +2818,7 @@ impl Hnsw {
             let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, nav_qf32, nav_sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
             if let Some(best) = found
                 .into_iter()
-                .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap())
+                .min_by(|a, b| a.dist.total_cmp(&b.dist))
             {
                 if trace.is_some() {
                     let d = node_dist(self.quant, query, &self.all_i8, &self.all_bin, nav_qf32, nav_sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm, best.idx, self.dim);
@@ -2858,10 +2858,10 @@ impl Hnsw {
                     (c.idx, 1.0 - sim)
                 })
                 .collect();
-            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            scored.sort_by(|a, b| a.1.total_cmp(&b.1));
             return scored.into_iter().take(k).map(|c| (c.0, c.1)).collect();
         }
-        found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        found.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         found.into_iter().take(k).map(|c| (c.idx, c.dist)).collect()
     }
 
@@ -2911,7 +2911,7 @@ impl Hnsw {
                     scored.push((idx, d));
                 }
             }
-            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            scored.sort_by(|a, b| a.1.total_cmp(&b.1));
             return scored.into_iter().take(k).collect();
         }
         // Non-selective: gated traversal from a matching entry node.
@@ -2933,13 +2933,13 @@ impl Hnsw {
         for lvl in (1..=self.max_level).rev() {
             epoch = unsafe { self.bump_epoch() };
             let found = Hnsw::search_layer_filtered(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, filter, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
-            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
+            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.total_cmp(&b.dist)) {
                 cur = best.idx;
             }
         }
         epoch = unsafe { self.bump_epoch() };
         let mut found = Hnsw::search_layer_filtered(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, unsafe { &mut *visited_ptr }, epoch, filter, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
-        found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        found.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         found.into_iter().take(k).map(|c| (c.idx, c.dist)).collect()
     }
 
@@ -2993,7 +2993,7 @@ impl Hnsw {
             let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
             if let Some(best) = found
                 .into_iter()
-                .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap())
+                .min_by(|a, b| a.dist.total_cmp(&b.dist))
             {
                 cur = best.idx;
             }
@@ -3016,7 +3016,7 @@ impl Hnsw {
         // Phase 2: real traversal with the difficulty-scaled beam (same buffer).
         epoch = unsafe { self.bump_epoch() };
         let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
-        found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        found.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         found.into_iter().take(k).map(|c| (c.idx, c.dist)).collect()
     }
 
@@ -3039,7 +3039,7 @@ impl Hnsw {
         for lvl in (1..=self.max_level).rev() {
             epoch = unsafe { self.bump_epoch() };
             let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
-            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
+            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.total_cmp(&b.dist)) {
                 cur = best.idx;
             }
         }
@@ -3294,7 +3294,7 @@ impl Hnsw {
         for lvl in (1..=self.max_level).rev() {
             epoch = unsafe { self.bump_epoch() };
             let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
-            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
+            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.total_cmp(&b.dist)) {
                 cur = best.idx;
             }
         }
@@ -3310,7 +3310,7 @@ impl Hnsw {
         let ef = model.predict(spread).max(k).max(ef_min).min(ef_max);
         epoch = unsafe { self.bump_epoch() };
         let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, ef.max(k), 0, unsafe { &mut *visited_ptr }, epoch, qf32, &sq, self.turbo.as_deref(), self.pq.as_deref(), &self.all_norm);
-        found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        found.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         found.into_iter().take(k).map(|c| (c.idx, c.dist)).collect()
     }
 }
@@ -3367,13 +3367,13 @@ impl Hnsw {
         for lvl in (1..=self.max_level).rev() {
             epoch = unsafe { self.bump_epoch() };
             let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
-            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
+            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.total_cmp(&b.dist)) {
                 cur = best.idx;
             }
         }
         epoch = unsafe { self.bump_epoch() };
         let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, k, 0, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
-        found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        found.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         found.into_iter().take(k).map(|c| (c.dist, c.idx)).collect()
     }
 
@@ -3450,7 +3450,7 @@ impl Hnsw {
         for lvl in (1..=top).rev() {
             epoch = unsafe { self.bump_epoch() };
             let found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, 1, lvl, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
-            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap()) {
+            if let Some(best) = found.into_iter().min_by(|a, b| a.dist.total_cmp(&b.dist)) {
                 // only accept if still within [lo, hi)
                 if best.idx >= lo && best.idx < hi {
                     cur = best.idx;
@@ -3460,7 +3460,7 @@ impl Hnsw {
         epoch = unsafe { self.bump_epoch() };
         let mut found = Hnsw::search_layer(&self.nodes, &self.all_i8, &self.all_bin, self.quant, self.dim, query, cur, k, 0, unsafe { &mut *visited_ptr }, epoch, &[], &[], None, None, &[]);
         found.retain(|c| c.idx >= lo && c.idx < hi);
-        found.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        found.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         found.into_iter().take(k).map(|c| (c.dist, c.idx)).collect()
     }
 
@@ -3916,7 +3916,7 @@ impl Hnsw {
                 let d = cos_dist_q(&q, &entries[s]);
                 scored.push((d, s));
             }
-            scored.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+            scored.sort_by(|x, y| x.0.total_cmp(&y.0));
             for &(_, s) in scored.iter().take(2) {
                 // Descend segment `s`; returns GLOBAL indices.
                 let mut gbs: Vec<usize> = if has_base && s == 0 {
@@ -3975,7 +3975,7 @@ impl Hnsw {
                             (cos_dist_q(&nvec, &self.all_i8[x * dim..x * dim + dim]), x)
                         })
                         .collect();
-                    nn.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    nn.sort_by(|a, b| a.0.total_cmp(&b.0));
                     nn.truncate(cap);
                     self.nodes[gi].neighbors[lvl] = nn.into_iter().map(|(_, x)| x).collect();
                 }
@@ -4664,7 +4664,7 @@ impl VectorIndex {
                         cands.push(Cand { dist: d, idx: nb });
                     }
                 }
-                cands.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+                cands.sort_by(|a, b| a.dist.total_cmp(&b.dist));
                 h.nodes[i].neighbors[0] = cands.iter().map(|c| c.idx).collect();
             }
             // Reverse edges: kNN edges are directed (i → its neighbors). HNSW
@@ -5568,6 +5568,11 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
     /// Insert/replace a vector: durable f32 write + graph update with a
     /// quantized (int8) copy in-memory.
     pub fn insert(&self, id: u64, vector: Vec<f32>) -> std::io::Result<()> {
+        // Validate BEFORE the durable write: the graph silently drops a
+        // mismatched-dim vector, so without this the WAL acked a write that
+        // VSEARCH could never return (silent data loss reported as +OK).
+        self.check_dim(vector.len())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         self.engine.put(self.vec_key(id), Value::Vector(vector.clone()))?;
         self.hnsw.write().unwrap().insert(id, vector);
         Ok(())
@@ -5648,11 +5653,12 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
         // The live graph has a fixed dimensionality; a batch must use the same
         // dim as the existing index (or any dim when empty). Merging a different
         // dim would desync the packed i8 storage and panic in merge_into.
-        let existing = self.dim();
-        if existing != 0 && existing != dim {
+        self.check_dim(dim)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        if n.checked_mul(dim) != Some(vectors.len()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("VADDBATCH dim {dim} != existing index dim {existing}"),
+                "vectors length must equal ids length × dim",
             ));
         }
         // Durable substrate writes — batch into one put_batch for a single
@@ -6529,6 +6535,26 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
     /// random rotation is `d×d`, so vectors inserted under a turbo mode must
     /// share this exact dimensionality or quantization desyncs the packed
     /// storage.
+    /// Validate a vector (insert or query) against this index's native
+    /// dimensionality: the first vector inserted fixes it (or the TurboQuant
+    /// codebook's dim when one is fitted). An empty index accepts any
+    /// non-zero dim. Every write and read path calls this so a mismatch is an
+    /// error on the wire instead of a silent drop / cross-dim result.
+    pub fn check_dim(&self, len: usize) -> Result<(), String> {
+        if len == 0 {
+            return Err("vector must have at least one component".into());
+        }
+        let g = self.hnsw.read().unwrap();
+        let native = match &g.turbo {
+            Some(t) => t.dim,
+            None => g.dim,
+        };
+        if native != 0 && len != native {
+            return Err(format!("vector dim {len} != index dim {native}"));
+        }
+        Ok(())
+    }
+
     pub fn quant_dim(&self) -> usize {
         let g = self.hnsw.read().unwrap();
         match &g.turbo {
@@ -6592,7 +6618,7 @@ pub fn open_ns(engine: Arc<Engine>, prefix: String) -> Self {
             .iter()
             .map(|&n| (n, cos_dist_q(&q, &g.all_i8[n * g.dim..n * g.dim + g.dim])))
             .collect();
-        ds.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        ds.sort_by(|a, b| a.1.total_cmp(&b.1));
         for (n, d) in ds.iter().take(10) {
             eprintln!("[MITM]   neigh {n} d_to_query={:.4}", d);
         }
@@ -7024,7 +7050,7 @@ mod tests {
             let d = (1.0 - s).max(0.0).min(2.0);
             truth.push((id, d));
         });
-        truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        truth.sort_by(|a, b| a.1.total_cmp(&b.1));
         let truth: Vec<u64> = truth.iter().take(5).map(|(id, _)| *id).collect();
 
         let fixed = idx.search_ef(&q, 5, 128);

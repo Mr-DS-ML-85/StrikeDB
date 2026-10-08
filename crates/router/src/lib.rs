@@ -63,6 +63,22 @@ impl Router {
             .clone()
     }
 
+    /// Read-only namespace lookup: returns the index only if the namespace is
+    /// already open or has persisted vectors. Unlike `vectors_ns` it never
+    /// registers an empty namespace, so a search/payload read against a typo'd
+    /// name no longer conjures a phantom entry in `VLISTNS`.
+    pub fn vectors_ns_existing(&self, name: &str) -> Option<Arc<VectorIndex>> {
+        if let Some(idx) = self.vectors_ns.read().unwrap().get(name) {
+            return Some(Arc::clone(idx));
+        }
+        let opened = VectorIndex::open_ns(Arc::clone(&self.engine), name.to_string());
+        if opened.len() == 0 {
+            return None;
+        }
+        let mut ns = self.vectors_ns.write().unwrap();
+        Some(ns.entry(name.to_string()).or_insert_with(|| Arc::new(opened)).clone())
+    }
+
     /// Enumerate all open vector indexes as `(name, index)` pairs, default
     /// namespace first. Read-only snapshot for diagnostics (GPU.INFO).
     pub fn vector_indexes(&self) -> Vec<(String, Arc<VectorIndex>)> {
@@ -190,7 +206,7 @@ impl Router {
                         Some(RagHit { id, distance: d, row })
                     })
                     .collect();
-                hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+                hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
                 hits.truncate(k);
                 hits
             }

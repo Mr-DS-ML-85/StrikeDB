@@ -45,7 +45,40 @@ pub type GpuResult<T> = std::result::Result<T, String>;
 
 type NvrtcProgram = *mut std::ffi::c_void;
 
-extern "C" {
+// CUDA driver + NVRTC entry points, resolved at RUNTIME via dlopen/dlsym (the
+// vugva-core loader). This block used to be a plain `extern "C"` with
+// `cargo:rustc-link-lib=cuda/nvrtc` in build.rs, which gave the server binary
+// a hard DT_NEEDED on libcuda.so: it failed to LINK on machines without the
+// CUDA toolkit and failed to START on machines without an NVIDIA driver, even
+// in CPU-only mode. Now a missing library makes every call return an error
+// code, which `init_ctx` already reports as "no usable GPU".
+macro_rules! late_bound {
+    ($resolver:path, $missing:expr; $( $(#[$m:meta])* fn $name:ident( $($arg:ident : $ty:ty),* $(,)? ) -> i32; )*) => {
+        $(
+            $(#[$m])*
+            #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
+            unsafe fn $name( $($arg: $ty),* ) -> i32 {
+                type Fp = unsafe extern "C" fn( $($ty),* ) -> i32;
+                static SLOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let addr = *SLOT.get_or_init(|| $resolver(stringify!($name)));
+                if addr == 0 {
+                    return $missing;
+                }
+                // SAFETY: `addr` is dlsym's result for this exact symbol and
+                // `Fp` mirrors its documented C prototype.
+                let f: Fp = std::mem::transmute(addr);
+                f( $($arg),* )
+            }
+        )*
+    };
+}
+
+/// NVRTC_ERROR_INTERNAL_ERROR — returned when libnvrtc is absent.
+const NVRTC_MISSING: i32 = 11;
+/// CUDA_ERROR_NOT_FOUND — returned when libcuda is absent.
+const CUDA_MISSING: i32 = 500;
+
+late_bound! { vugva_core::ffi::nvrtc_sym_addr, NVRTC_MISSING;
     fn nvrtcCreateProgram(prog: *mut NvrtcProgram, src: *const i8, name: *const i8,
                           numHeaders: i32, headers: *const *const i8,
                           includeNames: *const *const i8) -> i32;
@@ -56,6 +89,9 @@ extern "C" {
     fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> i32;
     fn nvrtcGetProgramLogSize(prog: NvrtcProgram, size: *mut usize) -> i32;
     fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut i8) -> i32;
+}
+
+late_bound! { vugva_core::ffi::cuda_sym_addr, CUDA_MISSING;
     fn cuInit(flags: u32) -> i32;
     fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32;
     fn cuDeviceGetName(name: *mut u8, len: i32, device: i32) -> i32;
@@ -1191,7 +1227,7 @@ pub fn gpu_build_knn_graph(vectors_i8: &[i8], n: usize, dim: usize, k_init: usiz
                         if gid as usize == vid { return None; }
                         Some((distances[qi * k + j], gid, li))
                     }).collect();
-                    cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
                     if let Some(&(d0, _, li0)) = cands.first() {
                         let li1 = cands.get(1).map(|&(_, _, l)| l).unwrap_or(li0);
                         assign[vid] = (li0, li1, d0);
@@ -2501,6 +2537,13 @@ fn gpu_search_batched(
                     let mut distances = vec![2.0f32; out_count];
                     let c1 = cuMemcpyDtoH_v2(indices.as_mut_ptr() as *mut std::ffi::c_void, index.d_idx_buf, out_count * 4);
                     let c2 = cuMemcpyDtoH_v2(distances.as_mut_ptr() as *mut std::ffi::c_void, index.d_odist_buf, out_count * 4);
+                    if c1 != 0 || c2 != 0 {
+                        // A failed copy leaves the -1/2.0 fill values; serving
+                        // them as "results" returned garbage neighbours. Let
+                        // the caller fall back to the CPU path instead.
+                        eprintln!("[GPU] apgc search: result copy failed ({c1}/{c2}); falling back to CPU");
+                        return None;
+                    }
                     let nvalid = indices.iter().take(out_count).filter(|&&v| v >= 0).count();
                     if nvalid < out_count {
                         // Every slot should be a real neighbour; sentinels mean the

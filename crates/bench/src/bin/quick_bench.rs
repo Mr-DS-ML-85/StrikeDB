@@ -55,7 +55,7 @@ fn run_bench(_path: &str, mode: &str, n: usize, dim: usize, norm: Vec<f32>, core
                             for j in 0..dim { dot += q[j] * v[j]; }
                             truth.push(((1.0 - dot).max(0.0).min(2.0), i as u64));
                         }
-                        truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                        truth.sort_by(|a, b| a.0.total_cmp(&b.0));
                         *slot = truth.iter().take(10).map(|(_, id)| *id).collect();
                     }
                 });

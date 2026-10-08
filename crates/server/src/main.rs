@@ -21,6 +21,7 @@
 //!   QUIT                                   -> OK, closes
 
 mod acl;
+mod pubsub;
 
 /// Keep the allocator's books for this process.
 ///
@@ -41,11 +42,11 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use acl::{AclStore, command_category};
+use acl::AclStore;
 use compute::{counter_reducer, vm::{Instr, Program}, ReducerResult, ReducerRuntime};
 use consensus::{hlc::Hlc, crdt::{GCounter, LwwRegister, PnCounter}};
 use mitm::CacheDebugger;
-use protocol::{try_parse, write_resp, write_resp_buf, write_resp_buf_as, Resp};
+use protocol::{try_parse, write_resp_buf_as, Resp};
 use rag::Rag;
 use reactive::Reactive;
 use router::{Router, TieredMemory};
@@ -79,7 +80,22 @@ struct Db {
     quant_mode: Mutex<views::QuantMode>,
     /// ACL store — manages users, passwords, and command permissions.
     acl: Arc<AclStore>,
+    /// Redis pub/sub broker (in-memory, fire-and-forget).
+    pubsub: pubsub::Broker,
+    /// Open SCAN cursors (id → next key to resume from).
+    scan_cursors: Mutex<HashMap<u64, Vec<u8>>>,
 }
+
+/// SCAN cursor ids → resume key. Cursors are server-side so a scan costs
+/// O(COUNT) per call and never repeats or skips keys present throughout.
+static NEXT_SCAN_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+const MAX_SCAN_CURSORS: usize = 10_000;
+
+/// Process start (INFO uptime).
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Monotonic connection id (CLIENT ID / HELLO id / pub/sub subscriber id).
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// In-memory store of all CRDTs, keyed by name. Each variant is merge-able.
 struct ConsensusStore {
@@ -128,6 +144,19 @@ fn main() -> std::io::Result<()> {
     let cache = CacheDebugger::new(Arc::clone(&engine), 4096);
     let memory = TieredMemory::new(300);
     let acl = AclStore::new(requirepass.clone());
+    // Restore an `ACL SAVE`d user table. DBSTRIKE_PASS, when set, still wins
+    // for the default user so an operator can always recover access.
+    if let Some(storage::Value::Bytes(b)) = engine.get(ACL_KEY) {
+        match acl.load(&String::from_utf8_lossy(&b)) {
+            Ok(n) => {
+                if let Some(ref pw) = requirepass {
+                    let _ = acl.set_user("default", &[format!(">{pw}"), "on".into()]);
+                }
+                eprintln!("[ACL] restored {n} users from saved ACL");
+            }
+            Err(e) => eprintln!("[ACL] ignoring unreadable saved ACL: {e}"),
+        }
+    }
 
     // Allocator tracking is opt-in: it is off for ordinary workloads (the
     // shared-line atomics otherwise cost ~3.8× on the pipelined hot path) and
@@ -137,6 +166,7 @@ fn main() -> std::io::Result<()> {
         mitm::memtrack::set_tracking(true);
     }
 
+    let crdts = load_crdts(&engine);
     let db = Arc::new(Db {
         engine,
         reactive,
@@ -148,16 +178,15 @@ fn main() -> std::io::Result<()> {
         cache,
         memory,
         learned: Mutex::new(None),
-        crdt: Mutex::new(ConsensusStore {
-            gc: HashMap::new(),
-            pn: HashMap::new(),
-            lww: HashMap::new(),
-        }),
+        crdt: Mutex::new(crdts),
         hlc: Hlc::new(),
         quant_mode: Mutex::new(views::QuantMode::Int8),
         acl,
+        pubsub: pubsub::Broker::default(),
+        scan_cursors: Mutex::new(HashMap::new()),
     });
 
+    START.get_or_init(std::time::Instant::now);
     let listener = TcpListener::bind(&addr)?;
     // Large backlog so a connection storm (-c800+) queues instead of the
     // kernel dropping SYNs; the real ceiling is the per-process fd limit
@@ -243,6 +272,8 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
     // RESP3 nulls (`_`) the moment HELLO negotiates proto 3 — see
     // `write_resp_buf_as`. Every reply below goes through it.
     let mut resp3_conn = false;
+    let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut client_name: Vec<u8> = Vec::new();
 
     // NOTE: a geometric parse-retry backoff was tried here and REVERTED.
     //
@@ -260,16 +291,31 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
     // always be reached. Until that exists, parse on every read: quadratic on
     // huge frames is a performance problem, and this was a liveness one.
 
+    // Set when leaving subscribe mode with commands already re-queued in
+    // `buf`: parse those first instead of blocking on a socket read.
+    let mut skip_read = false;
     loop {
-        // Block until we have SOMETHING to parse (or the client closes).
-        let n = {
-            let mut s = stream.lock().unwrap();
-            s.read(&mut tmp)?
-        };
-        if n == 0 {
-            return Ok(()); // client closed
+        if !skip_read {
+            // Block until we have SOMETHING to parse (or the client closes).
+            let n = {
+                let mut s = stream.lock().unwrap();
+                s.read(&mut tmp)?
+            };
+            if n == 0 {
+                return Ok(()); // client closed
+            }
+            buf.extend_from_slice(&tmp[..n]);
         }
-        buf.extend_from_slice(&tmp[..n]);
+        skip_read = false;
+        // Redis `client-query-buffer-limit`: a client that streams an
+        // incomplete frame forever must not be able to exhaust server memory.
+        if buf.len() > 1024 * 1024 * 1024 {
+            let _ = write_resp_buf_as(&mut out, &err("Protocol error: query buffer limit exceeded"), resp3_conn);
+            if let Ok(mut s) = stream.lock() {
+                let _ = s.write_all(&out);
+            }
+            return Ok(());
+        }
 
         // ── Drain every complete command from `buf` ────────────────────
         let mut cmds: Vec<Vec<Vec<u8>>> = Vec::new();
@@ -291,7 +337,7 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                     // matched the message and suppressed the log, so the client
                     // saw an unexplained `ConnectionReset` and the server said
                     // nothing at all. Send the reason down the wire first.
-                    let _ = write_resp_buf_as(&mut out, &err(&format!("ERR Protocol error: {e}")), resp3_conn);
+                    let _ = write_resp_buf_as(&mut out, &err(&format!("Protocol error: {e}")), resp3_conn);
                     if let Ok(mut s) = stream.lock() {
                         let _ = s.write_all(&out);
                         let _ = s.flush();
@@ -313,7 +359,9 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
         // other command dispatches individually to preserve read-after-
         // write ordering (e.g. GET must see writes that came before it).
         let mut quit = false;
-        let mut subscribe_after_batch: Option<(String, Vec<Vec<u8>>)> = None;
+        // Commands from a SUBSCRIBE onward (pipelined commands after it must
+        // be processed in subscribe mode, not silently dropped).
+        let mut subscribe_after_batch: Option<Vec<Vec<Vec<u8>>>> = None;
         let mut i = 0usize;
         while i < cmds.len() {
             let name = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
@@ -328,6 +376,22 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                 continue;
             }
             if name == "ACL" {
+                // ACL used to bypass the permission gate entirely, so any
+                // authenticated user could `ACL SETUSER self +@all`. Only
+                // WHOAMI is free; every other subcommand needs ACL permission.
+                let whoami = args.first().is_some_and(|a| a.eq_ignore_ascii_case(b"WHOAMI"));
+                if db.acl.requires_auth() && current_user.is_empty() {
+                    write_resp_buf_as(&mut out, &err("NOAUTH Authentication required"), resp3_conn)?;
+                    i += 1;
+                    continue;
+                }
+                if !whoami && db.acl.needs_permission_check()
+                    && !db.acl.can_command(&current_user, "ACL", acl::command_categories("ACL"))
+                {
+                    write_resp_buf_as(&mut out, &err(&format!("NOPERM User {current_user} has no permissions to run the 'acl' command")), resp3_conn)?;
+                    i += 1;
+                    continue;
+                }
                 let resp = dispatch_acl(&db, args, &current_user);
                 write_resp_buf_as(&mut out, &resp, resp3_conn)?;
                 i += 1;
@@ -351,14 +415,39 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                     }
                 }
                 // Negotiate the connection dialect from `HELLO <proto>`.
-                let asked = args
-                    .first()
-                    .and_then(|a| std::str::from_utf8(a).ok())
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(2)
-                    .clamp(2, 3);
+                // Unsupported versions are refused (they used to be clamped,
+                // so `HELLO 4` silently "succeeded" as RESP3).
+                let asked = match args.first() {
+                    None => if resp3_conn { 3 } else { 2 },
+                    Some(a) => match std::str::from_utf8(a).ok().and_then(|s| s.parse::<i64>().ok()) {
+                        Some(v @ (2 | 3)) => v,
+                        Some(_) => {
+                            write_resp_buf_as(&mut out, &err("NOPROTO unsupported protocol version"), resp3_conn)?;
+                            i += 1;
+                            continue;
+                        }
+                        None => {
+                            write_resp_buf_as(&mut out, &err("Protocol version is not an integer or out of range"), resp3_conn)?;
+                            i += 1;
+                            continue;
+                        }
+                    },
+                };
+                if let Some(ix) = args.iter().position(|a| a.eq_ignore_ascii_case(b"SETNAME")) {
+                    if let Some(n) = args.get(ix + 1) {
+                        client_name = n.clone();
+                    }
+                }
                 resp3_conn = asked == 3;
-                let resp = dispatch(&db, &name, args);
+                let proto_arg = [asked.to_string().into_bytes()];
+                let mut resp = dispatch(&db, &name, &proto_arg);
+                if let Resp::Map(f) | Resp::Array(f) = &mut resp {
+                    if let Some(ix) = f.iter().position(|x| *x == Resp::Bulk(b"id".to_vec())) {
+                        if let Some(slot) = f.get_mut(ix + 1) {
+                            *slot = Resp::Int(conn_id as i64);
+                        }
+                    }
+                }
                 write_resp_buf_as(&mut out, &resp, resp3_conn)?;
                 if name == "QUIT" { quit = true; break; }
                 i += 1;
@@ -376,9 +465,8 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                 continue;
             }
             if db.acl.needs_permission_check() {
-                let cat = command_category(&name);
-                if !db.acl.can_command(&current_user, &name, cat) {
-                    write_resp_buf_as(&mut out, &err("ERR permission denied"), resp3_conn)?;
+                if let Some(e) = acl_denial(&db, &current_user, &name, args) {
+                    write_resp_buf_as(&mut out, &e, resp3_conn)?;
                     i += 1;
                     continue;
                 }
@@ -387,8 +475,32 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
             // SUBSCRIBE hijacks the connection AFTER we finish the current
             // batch (need to write acks + stream events, no more parsing).
             if name == "SUBSCRIBE" || name == "PSUBSCRIBE" {
-                subscribe_after_batch = Some((name.clone(), args.to_vec()));
+                subscribe_after_batch = Some(cmds.drain(i..).collect());
                 break;
+            }
+            // Per-connection CLIENT state (names/ids used to be faked with OK).
+            if name == "CLIENT" && !args.is_empty() {
+                let sub = String::from_utf8_lossy(&args[0]).to_uppercase();
+                let resp = match (sub.as_str(), args.len()) {
+                    ("SETNAME", 2) => {
+                        if args[1].iter().any(|b| *b <= b' ') {
+                            err("Client names cannot contain spaces, newlines or special characters.")
+                        } else {
+                            client_name = args[1].clone();
+                            Resp::Simple("OK".into())
+                        }
+                    }
+                    ("GETNAME", 1) => if client_name.is_empty() { Resp::Nil } else { Resp::Bulk(client_name.clone()) },
+                    ("ID", 1) => Resp::Int(conn_id as i64),
+                    ("INFO", 1) => Resp::Bulk(format!(
+                        "id={conn_id} name={} user={current_user} resp={}\n",
+                        String::from_utf8_lossy(&client_name), if resp3_conn { 3 } else { 2 }
+                    ).into_bytes()),
+                    _ => dispatch(&db, &name, args),
+                };
+                write_resp_buf_as(&mut out, &resp, resp3_conn)?;
+                i += 1;
+                continue;
             }
 
             // Coalesce a run of pure-write commands: `SET k v`, `MSET k v...`,
@@ -413,6 +525,16 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                 let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 let mut cmds_in_run = 0usize;
                 while i < cmds.len() && is_coalescable_set(&cmds[i]) {
+                    // Every command in the run is permission-checked, not just
+                    // the first (the run used to swallow a denied MSET after
+                    // an allowed SET). A denied command ends the run; the
+                    // outer loop then replies NOPERM for it in order.
+                    if cmds_in_run > 0 && db.acl.needs_permission_check() {
+                        let nm = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
+                        if acl_denial(&db, &current_user, &nm, &cmds[i][1..]).is_some() {
+                            break;
+                        }
+                    }
                     // Take ownership of the command so the value bytes can be
                     // MOVED (not cloned) straight into the engine — at 16M ops/s
                     // a per-value heap clone is a measurable allocator tax.
@@ -436,20 +558,69 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                     cmds_in_run += 1;
                     i += 1;
                 }
-                let n = kvs.len();
                 match db.kv.set_batch(kvs) {
                     Ok(_) => {
                         // One "+OK\r\n" per *command* (not per key), so a
                         // coalesced run of SET/SET or a single MSET each emit
                         // exactly one ack — preserving the per-command
                         // reply-count invariant the client relies on.
-                        let _ = n;
                         for _ in 0..cmds_in_run {
                             out.extend_from_slice(b"+OK\r\n");
                         }
                     }
                     Err(e) => {
+                        // One reply per COMMAND, never per key: an MSET of 3
+                        // pairs is one command, and emitting 3 errors here
+                        // shifted every later reply in the pipeline.
                         let e = err(&e.to_string());
+                        for _ in 0..cmds_in_run {
+                            write_resp_buf_as(&mut out, &e, resp3_conn)?;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Coalesce a run of INCR/INCRBY/DECR/DECRBY: each stays its own
+            // atomic commit with its own reply, but the whole run shares one
+            // group-commit fsync instead of paying one fsync per command.
+            fn incr_op(cmd: &[Vec<u8>]) -> Option<(Vec<u8>, i64)> {
+                let n = String::from_utf8_lossy(&cmd[0]).to_ascii_uppercase();
+                let num = |a: &[u8]| std::str::from_utf8(a).ok()?.parse::<i64>().ok();
+                match (n.as_str(), cmd.len()) {
+                    ("INCR", 2) => Some((cmd[1].clone(), 1)),
+                    ("DECR", 2) => Some((cmd[1].clone(), -1)),
+                    ("INCRBY", 3) => Some((cmd[1].clone(), num(&cmd[2])?)),
+                    ("DECRBY", 3) => Some((cmd[1].clone(), num(&cmd[2])?.checked_neg()?)),
+                    _ => None,
+                }
+            }
+            if !trace && i + 1 < cmds.len() && incr_op(&cmds[i]).is_some() && incr_op(&cmds[i + 1]).is_some() {
+                let mut ops = Vec::new();
+                while i < cmds.len() {
+                    let Some(op) = incr_op(&cmds[i]) else { break };
+                    if !ops.is_empty() && db.acl.needs_permission_check() {
+                        let nm = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
+                        if acl_denial(&db, &current_user, &nm, &cmds[i][1..]).is_some() {
+                            break;
+                        }
+                    }
+                    ops.push(op);
+                    i += 1;
+                }
+                let n = ops.len();
+                match db.kv.incr_many(ops) {
+                    Ok(results) => {
+                        for r in results {
+                            let resp = match r {
+                                Ok(v) => Resp::Int(v),
+                                Err(e) => err(&e),
+                            };
+                            write_resp_buf_as(&mut out, &resp, resp3_conn)?;
+                        }
+                    }
+                    Err(e) => {
+                        let e = err(&e);
                         for _ in 0..n {
                             write_resp_buf_as(&mut out, &e, resp3_conn)?;
                         }
@@ -493,68 +664,231 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
         if quit {
             return Ok(());
         }
-        if let Some((name, args)) = subscribe_after_batch {
-            return handle_subscribe(&db, &stream, &name, &args);
+        if let Some(sub_cmds) = subscribe_after_batch {
+            let ctx = SubCtx { conn_id, resp3: resp3_conn, user: current_user.clone() };
+            match subscribe_mode(&db, &stream, &ctx, sub_cmds, &mut buf)? {
+                SubExit::Closed => return Ok(()),
+                SubExit::Resume => {
+                    skip_read = !buf.is_empty();
+                    continue;
+                }
+            }
         }
     }
 }
 
-/// Hijack the connection into push-stream mode after SUBSCRIBE/PSUBSCRIBE.
-/// Factored out of `handle` so the fast-path batched dispatch stays tight.
-/// Shares the single `Arc<Mutex<TcpStream>>` so it still uses just one fd.
-fn handle_subscribe(
-    db: &Arc<Db>,
-    stream: &Arc<Mutex<TcpStream>>,
-    _name: &str,
-    args: &[Vec<u8>],
-) -> std::io::Result<()> {
-    if args.is_empty() {
-        let mut s = stream.lock().unwrap();
-        write_resp(&mut *s, &err("SUBSCRIBE requires at least one channel"))?;
-        return Ok(());
-    }
-    let prefixes: Vec<Vec<u8>> = args
-        .iter()
-        .map(|a| {
-            let mut p = b"chan:".to_vec();
-            p.extend_from_slice(a);
-            p
-        })
-        .collect();
-    let rx = db.reactive.subscribe_prefixes(&prefixes);
-    for (i, ch) in args.iter().enumerate() {
-        let ack = Resp::Array(vec![
-            Resp::Bulk(b"subscribe".to_vec()),
-            Resp::Bulk(ch.clone()),
-            Resp::Int((i as i64) + 1),
-        ]);
-        let mut s = stream.lock().unwrap();
-        write_resp(&mut *s, &ack)?;
-    }
-    for ev in rx.iter() {
-        let channel = ev.key.strip_prefix(b"chan:").unwrap_or(&ev.key).to_vec();
-        let payload: Vec<u8> = match &ev.value {
-            storage::Value::Bytes(b) => b.clone(),
-            storage::Value::Int(i) => i.to_string().into_bytes(),
-            storage::Value::Float(f) => f.to_string().into_bytes(),
-            storage::Value::Tombstone => b"__deleted__".to_vec(),
-            other => format!("{other:?}").into_bytes(),
-        };
-        let msg = Resp::Array(vec![
-            Resp::Bulk(b"message".to_vec()),
-            Resp::Bulk(channel),
-            Resp::Bulk(payload),
-        ]);
-        let mut s = stream.lock().unwrap();
-        if write_resp(&mut *s, &msg).is_err() {
-            break;
+struct SubCtx {
+    conn_id: u64,
+    resp3: bool,
+    user: String,
+}
+
+enum SubExit {
+    /// Client closed the connection or sent QUIT.
+    Closed,
+    /// Last subscription dropped (or RESET): back to normal command mode.
+    /// Any unprocessed commands were re-queued at the front of `buf`.
+    Resume,
+}
+
+/// Re-encode parsed commands as RESP so the normal loop can parse them again.
+fn requeue(cmds: &[Vec<Vec<u8>>], buf: &mut Vec<u8>) {
+    let mut front = Vec::new();
+    for c in cmds {
+        front.extend_from_slice(format!("*{}\r\n", c.len()).as_bytes());
+        for a in c {
+            front.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            front.extend_from_slice(a);
+            front.extend_from_slice(b"\r\n");
         }
     }
-    Ok(())
+    front.extend_from_slice(buf);
+    *buf = front;
+}
+
+/// Redis subscribe mode. A forwarder thread writes broker messages to the
+/// socket while this thread keeps READING commands — the old handler stopped
+/// reading entirely, so PING/UNSUBSCRIBE were ignored and a disconnected
+/// subscriber was only noticed on the next published message.
+fn subscribe_mode(
+    db: &Arc<Db>,
+    stream: &Arc<Mutex<TcpStream>>,
+    ctx: &SubCtx,
+    initial: Vec<Vec<Vec<u8>>>,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<SubExit> {
+    use std::collections::{BTreeSet, VecDeque};
+    let (tx, rx) = std::sync::mpsc::channel::<pubsub::Msg>();
+    let resp3 = ctx.resp3;
+    let wstream = Arc::clone(stream);
+    let forwarder = std::thread::spawn(move || {
+        for m in rx {
+            let push = match m {
+                pubsub::Msg::Message { channel, payload } => Resp::Push(vec![
+                    Resp::Bulk(b"message".to_vec()), Resp::Bulk(channel), Resp::Bulk(payload),
+                ]),
+                pubsub::Msg::PMessage { pattern, channel, payload } => Resp::Push(vec![
+                    Resp::Bulk(b"pmessage".to_vec()), Resp::Bulk(pattern), Resp::Bulk(channel), Resp::Bulk(payload),
+                ]),
+            };
+            let mut s = wstream.lock().unwrap();
+            if s.write_all(&push.encode_as(resp3)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut reader = stream.lock().unwrap().try_clone()?;
+    let mut chans: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut pats: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut queue: VecDeque<Vec<Vec<u8>>> = initial.into();
+    let mut tmp = [0u8; 16 * 1024];
+
+    let cleanup = |chans: &BTreeSet<Vec<u8>>, pats: &BTreeSet<Vec<u8>>| {
+        for c in chans {
+            db.pubsub.unsubscribe(ctx.conn_id, c);
+        }
+        for p in pats {
+            db.pubsub.punsubscribe(ctx.conn_id, p);
+        }
+    };
+
+    let exit = 'outer: loop {
+        while let Some(cmd) = queue.pop_front() {
+            if cmd.is_empty() {
+                continue;
+            }
+            let name = String::from_utf8_lossy(&cmd[0]).to_uppercase();
+            let args = &cmd[1..];
+            let mut out: Vec<Resp> = Vec::new();
+            let denied = if db.acl.needs_permission_check() { acl_denial(db, &ctx.user, &name, args) } else { None };
+            if let Some(e) = denied {
+                out.push(e);
+            } else {
+                match name.as_str() {
+                    "SUBSCRIBE" | "PSUBSCRIBE" if args.is_empty() => {
+                        out.push(err(&format!("wrong number of arguments for '{}' command", name.to_lowercase())));
+                    }
+                    "SUBSCRIBE" => {
+                        for ch in args {
+                            db.pubsub.subscribe(ctx.conn_id, ch, &tx);
+                            chans.insert(ch.clone());
+                            out.push(Resp::Push(vec![
+                                Resp::Bulk(b"subscribe".to_vec()), Resp::Bulk(ch.clone()), Resp::Int((chans.len() + pats.len()) as i64),
+                            ]));
+                        }
+                    }
+                    "PSUBSCRIBE" => {
+                        for p in args {
+                            db.pubsub.psubscribe(ctx.conn_id, p, &tx);
+                            pats.insert(p.clone());
+                            out.push(Resp::Push(vec![
+                                Resp::Bulk(b"psubscribe".to_vec()), Resp::Bulk(p.clone()), Resp::Int((chans.len() + pats.len()) as i64),
+                            ]));
+                        }
+                    }
+                    "UNSUBSCRIBE" | "PUNSUBSCRIBE" => {
+                        let pattern = name == "PUNSUBSCRIBE";
+                        let kind: &[u8] = if pattern { b"punsubscribe" } else { b"unsubscribe" };
+                        let targets: Vec<Vec<u8>> = if args.is_empty() {
+                            if pattern { pats.iter().cloned().collect() } else { chans.iter().cloned().collect() }
+                        } else {
+                            args.to_vec()
+                        };
+                        if targets.is_empty() {
+                            out.push(Resp::Push(vec![Resp::Bulk(kind.to_vec()), Resp::Nil, Resp::Int((chans.len() + pats.len()) as i64)]));
+                        }
+                        for t in targets {
+                            if pattern {
+                                db.pubsub.punsubscribe(ctx.conn_id, &t);
+                                pats.remove(&t);
+                            } else {
+                                db.pubsub.unsubscribe(ctx.conn_id, &t);
+                                chans.remove(&t);
+                            }
+                            out.push(Resp::Push(vec![Resp::Bulk(kind.to_vec()), Resp::Bulk(t), Resp::Int((chans.len() + pats.len()) as i64)]));
+                        }
+                    }
+                    "PING" => {
+                        let msg = args.first().cloned().unwrap_or_default();
+                        out.push(if resp3 {
+                            if args.is_empty() { Resp::Simple("PONG".into()) } else { Resp::Bulk(msg) }
+                        } else {
+                            Resp::Array(vec![Resp::Bulk(b"pong".to_vec()), Resp::Bulk(msg)])
+                        });
+                    }
+                    "QUIT" => {
+                        let mut s = stream.lock().unwrap();
+                        let _ = s.write_all(&Resp::Simple("OK".into()).encode_as(resp3));
+                        break 'outer SubExit::Closed;
+                    }
+                    "RESET" => {
+                        cleanup(&chans, &pats);
+                        chans.clear();
+                        pats.clear();
+                        out.push(Resp::Simple("RESET".into()));
+                    }
+                    other => out.push(err(&format!(
+                        "Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
+                        other.to_lowercase()
+                    ))),
+                }
+            }
+            {
+                let mut bytes = Vec::new();
+                for r in &out {
+                    bytes.extend_from_slice(&r.encode_as(resp3));
+                }
+                let mut s = stream.lock().unwrap();
+                if s.write_all(&bytes).is_err() {
+                    break 'outer SubExit::Closed;
+                }
+            }
+            if chans.is_empty() && pats.is_empty() {
+                let rest: Vec<Vec<Vec<u8>>> = queue.drain(..).collect();
+                requeue(&rest, buf);
+                break 'outer SubExit::Resume;
+            }
+        }
+        // Need more input.
+        let n = match reader.read(&mut tmp) {
+            Ok(0) | Err(_) => break 'outer SubExit::Closed,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        let mut cursor = 0;
+        loop {
+            match try_parse(&buf[cursor..]) {
+                Ok(Some((cmd, used))) => {
+                    cursor += used;
+                    queue.push_back(cmd);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let mut s = stream.lock().unwrap();
+                    let _ = s.write_all(&err(&format!("Protocol error: {e}")).encode_as(resp3));
+                    break 'outer SubExit::Closed;
+                }
+            }
+        }
+        buf.drain(..cursor);
+    };
+    cleanup(&chans, &pats);
+    drop(tx); // broker's clones are gone after cleanup → forwarder exits
+    let _ = forwarder.join();
+    Ok(exit)
 }
 
 fn err(msg: &str) -> Resp {
-    Resp::Error(format!("ERR {msg}"))
+    // Callers may pass a message that already carries a Redis error code
+    // (`NOAUTH ...`, `ERR ...`); prefixing again produced `-ERR ERR ...` /
+    // `-ERR NOAUTH ...`, which clients match on and mis-classify.
+    const CODES: &[&str] = &["ERR", "NOAUTH", "NOPERM", "NOPROTO", "WRONGPASS", "WRONGTYPE", "EXECABORT", "NOSCRIPT", "BUSYKEY"];
+    let first = msg.split(' ').next().unwrap_or("");
+    if CODES.contains(&first) {
+        Resp::Error(msg.to_string())
+    } else {
+        Resp::Error(format!("ERR {msg}"))
+    }
 }
 
 /// Wall-clock milliseconds, used as the TTL reference for Working Memory.
@@ -634,6 +968,27 @@ fn parse_agent_scope(args: &[Vec<u8>]) -> (String, &[Vec<u8>]) {
     }
 }
 
+/// Query-side dimension check shared by every search command: a query whose
+/// dim differs from the index's native dim used to silently return results
+/// computed against the wrong-dimension vectors.
+fn query_dim_err(vi: &views::VectorIndex, q: &[f32]) -> Option<Resp> {
+    if vi.len() == 0 && !q.is_empty() {
+        return None;
+    }
+    vi.check_dim(q.len()).err().map(|e| err(&format!("query {e}")))
+}
+
+/// Vector ids are replied as RESP integers (i64), so an id above i64::MAX came
+/// back negative (`u64::MAX` → `-1`) and could not be matched by the client.
+/// Reject them at write time instead of changing the frozen reply shape.
+fn parse_vec_id(a: &[u8]) -> Option<u64> {
+    std::str::from_utf8(a).ok()?.parse::<u64>().ok().filter(|&id| id <= i64::MAX as u64)
+}
+
+/// Upper bound on a vector dimensionality accepted off the wire. Keeps every
+/// `dim + 1` / `n * dim` size computation far away from overflow.
+const MAX_DIM: usize = 65536;
+
 fn parse_floats(args: &[Vec<u8>]) -> Option<Vec<f32>> {
     // Accept BOTH shapes clients actually send:
     //   * one float per RESP arg   — VADD 11 0.5 0.1 0.9
@@ -646,13 +1001,20 @@ fn parse_floats(args: &[Vec<u8>]) -> Option<Vec<f32>> {
         let s = std::str::from_utf8(a).ok()?;
         if s.contains(' ') || s.contains(',') {
             for tok in s.split([' ', ',']).filter(|t| !t.is_empty()) {
-                out.push(tok.parse::<f32>().ok()?);
+                out.push(finite(tok.parse::<f32>().ok()?)?);
             }
         } else {
-            out.push(s.parse::<f32>().ok()?);
+            out.push(finite(s.parse::<f32>().ok()?)?);
         }
     }
     Some(out)
+}
+
+/// NaN/±inf are rejected at the wire: a NaN embedding is never "near"
+/// anything, used to abort the server in sort comparators, and when it slipped
+/// into the RAG store it ranked as a hit for every later query.
+fn finite(f: f32) -> Option<f32> {
+    f.is_finite().then_some(f)
 }
 
 /// Number of hardware threads — used to size the parallel-ingest shard count.
@@ -728,25 +1090,56 @@ fn derive_attr_and_sparse(vec: &[f32], n_buckets: u32, w: usize) -> (u32, Vec<(u
         }
     }
     let attr = (best_dim as u32) % n_buckets;
-    idxs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    idxs.sort_by(|a, b| b.1.total_cmp(&a.1));
     let sparse: Vec<(u32, f32)> = idxs.iter().take(w).map(|(j, v)| (*j as u32, *v)).collect();
     (attr, sparse)
 }
 
 /// Handle AUTH command: `AUTH password` or `AUTH username password`.
 /// Updates `current_user` on success.
+/// Durable key for a CRDT: `crdt:<kind>:<name>`.
+fn crdt_key(kind: &str, name: &str) -> Vec<u8> {
+    format!("crdt:{kind}:{name}").into_bytes()
+}
+
+/// Rebuild the in-memory CRDT map from the substrate at startup.
+fn load_crdts(engine: &Engine) -> ConsensusStore {
+    let mut st = ConsensusStore { gc: HashMap::new(), pn: HashMap::new(), lww: HashMap::new() };
+    for (k, v) in engine.scan_prefix(b"crdt:", engine.snapshot()) {
+        let storage::Value::Bytes(b) = v else { continue };
+        let key = String::from_utf8_lossy(&k).to_string();
+        let mut parts = key.splitn(3, ':');
+        let (_, kind, name) = (parts.next(), parts.next(), parts.next());
+        let (Some(kind), Some(name)) = (kind, name) else { continue };
+        match kind {
+            "gc" => { if let Some(c) = GCounter::from_bytes(&b) { st.gc.insert(name.to_string(), c); } }
+            "pn" => { if let Some(c) = PnCounter::from_bytes(&b) { st.pn.insert(name.to_string(), c); } }
+            "lww" => { if let Some(r) = LwwRegister::from_bytes(&b) { st.lww.insert(name.to_string(), r); } }
+            _ => {}
+        }
+    }
+    st
+}
+
+/// Engine key holding the `ACL SAVE`d user table.
+const ACL_KEY: &[u8] = b"sys:acl";
+
 fn dispatch_auth(db: &Db, args: &[Vec<u8>], current_user: &mut String) -> Resp {
     match args.len() {
+        1 if !db.acl.requires_auth() => {
+            // Redis: a password for a server with none configured is an error,
+            // not a silent success the client would mistake for real auth.
+            err("AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?")
+        }
         1 => {
             // AUTH password — authenticate as default user.
             let raw = String::from_utf8_lossy(&args[0]);
             let password = raw.strip_prefix('>').unwrap_or(&raw);
             if db.acl.auth_default(password) {
                 *current_user = "default".to_string();
-                db.acl.set_user_enabled("default", true);
                 Resp::Simple("OK".into())
             } else {
-                err("ERR invalid password")
+                err("WRONGPASS invalid username-password pair or user is disabled.")
             }
         }
         2 => {
@@ -759,11 +1152,9 @@ fn dispatch_auth(db: &Db, args: &[Vec<u8>], current_user: &mut String) -> Resp {
                 // run for the rest of this connection (and any other auth path).
                 db.acl.latch_strict();
                 *current_user = username.to_string();
-                // Enable the user after successful auth so commands work.
-                db.acl.set_user_enabled(&username, true);
                 Resp::Simple("OK".into())
             } else {
-                err("ERR invalid username or password")
+                err("WRONGPASS invalid username-password pair or user is disabled.")
             }
         }
         _ => err("AUTH requires a password"),
@@ -787,53 +1178,11 @@ fn dispatch_acl(db: &Db, args: &[Vec<u8>], current_user: &str) -> Resp {
                 return err("ACL SETUSER requires a username");
             }
             let username = String::from_utf8_lossy(&args[1]).to_string();
-            // Parse optional flags: >password, on, off, ~key, +command, +@category, -@category
-            let mut password: Option<String> = None;
-            let mut enabled: Option<bool> = None;
-            let mut categories = Vec::new();
-            let mut key_patterns = Vec::new();
-            let mut i = 2;
-            while i < args.len() {
-                let token = String::from_utf8_lossy(&args[i]).to_string();
-                if token.starts_with('>') {
-                    // >password — set password
-                    password = Some(token[1..].to_string());
-                } else if token == "on" {
-                    enabled = Some(true);
-                } else if token == "off" {
-                    enabled = Some(false);
-                } else if token.starts_with('~') {
-                    // ~pattern — key pattern
-                    key_patterns.push(token[1..].to_string());
-                } else if token.starts_with('+') {
-                    // +command or +@category
-                    let rest = &token[1..];
-                    if rest.starts_with('@') {
-                        if let Some(cat) = acl::PermCategory::from_str(&rest[1..]) {
-                            categories.push(cat);
-                        }
-                    }
-                    // Individual command permissions not yet implemented.
-                } else if token.starts_with('-') {
-                    // -@category — remove category (not yet implemented)
-                } else if token == "reset" {
-                    // Reset user to defaults.
-                    categories.clear();
-                    key_patterns.clear();
-                }
-                i += 1;
+            let toks: Vec<String> = args[2..].iter().map(|a| String::from_utf8_lossy(a).to_string()).collect();
+            match db.acl.set_user(&username, &toks) {
+                Ok(()) => Resp::Simple("OK".into()),
+                Err(e) => err(&e),
             }
-            // Apply changes.
-            if let Some(pw) = password {
-                db.acl.set_user_password(&username, &pw);
-            }
-            if let Some(en) = enabled {
-                db.acl.set_user_enabled(&username, en);
-            }
-            if !categories.is_empty() {
-                db.acl.set_user_categories(&username, categories);
-            }
-            Resp::Simple("OK".into())
         }
         "GETUSER" => {
             if args.len() < 2 {
@@ -841,18 +1190,11 @@ fn dispatch_acl(db: &Db, args: &[Vec<u8>], current_user: &str) -> Resp {
             }
             let username = String::from_utf8_lossy(&args[1]);
             match db.acl.get_user_info(&username) {
-                Some(info) => {
-                    // Parse the info string into a RESP array of alternating key/value.
-                    let parts: Vec<&str> = info.split_whitespace().collect();
-                    let mut out = Vec::new();
-                    let mut j = 0;
-                    while j + 1 < parts.len() {
-                        out.push(Resp::Bulk(parts[j].as_bytes().to_vec()));
-                        out.push(Resp::Bulk(parts[j + 1].as_bytes().to_vec()));
-                        j += 2;
-                    }
-                    Resp::Array(out)
-                }
+                Some(kv) => Resp::Array(
+                    kv.into_iter()
+                        .flat_map(|(k, v)| [Resp::Bulk(k.into_bytes()), Resp::Bulk(v.into_bytes())])
+                        .collect(),
+                ),
                 None => Resp::Nil,
             }
         }
@@ -860,19 +1202,38 @@ fn dispatch_acl(db: &Db, args: &[Vec<u8>], current_user: &str) -> Resp {
             if args.len() < 2 {
                 return err("ACL DELUSER requires a username");
             }
-            let username = String::from_utf8_lossy(&args[1]);
-            if db.acl.del_user(&username) {
-                Resp::Int(1)
-            } else {
-                Resp::Int(0)
-            }
+            let n = args[1..].iter().filter(|u| db.acl.del_user(&String::from_utf8_lossy(u))).count();
+            Resp::Int(n as i64)
         }
-        "SAVE" | "LOAD" => {
-            // In-memory only for now — reply OK.
-            Resp::Simple("OK".into())
-        }
-        _ => err("ACL subcommand not supported (USE WHOAMI LIST SETUSER GETUSER DELUSER SAVE LOAD)"),
+        // SAVE/LOAD used to reply OK and do nothing, so an operator believed
+        // users survived a restart when they did not. They now round-trip the
+        // user table (salted hashes only) through the durable engine.
+        "SAVE" => match db.engine.put(ACL_KEY.to_vec(), storage::Value::Bytes(db.acl.dump().into_bytes())) {
+            Ok(_) => Resp::Simple("OK".into()),
+            Err(e) => err(&e.to_string()),
+        },
+        "LOAD" => match db.engine.get(ACL_KEY) {
+            Some(storage::Value::Bytes(b)) => match db.acl.load(&String::from_utf8_lossy(&b)) {
+                Ok(_) => Resp::Simple("OK".into()),
+                Err(e) => err(&e),
+            },
+            _ => err("no saved ACL (run ACL SAVE first)"),
+        },
+        _ => err("ACL subcommand not supported (WHOAMI LIST SETUSER GETUSER DELUSER SAVE LOAD)"),
     }
+}
+
+/// `Some(NOPERM reply)` if `user` may not run `name args` (command rules or
+/// `~pattern` key rules), else `None`.
+fn acl_denial(db: &Db, user: &str, name: &str, args: &[Vec<u8>]) -> Option<Resp> {
+    if !db.acl.can_command(user, name, acl::command_categories(name)) {
+        return Some(err(&format!("NOPERM User {user} has no permissions to run the '{}' command", name.to_lowercase())));
+    }
+    let keys = acl::command_keys(name, args);
+    if !keys.is_empty() && !db.acl.can_keys(user, keys.into_iter()) {
+        return Some(err("NOPERM No permissions to access a key"));
+    }
+    None
 }
 
 /// Redact sensitive data from command args for logging.
@@ -969,6 +1330,39 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
 
+        "SET" if args.len() > 2 => {
+            // SET key value [NX|XX] [GET]. Expiry options are refused
+            // explicitly: there is no TTL support, and silently ignoring EX
+            // would leave "temporary" keys alive forever.
+            let (mut nx, mut xx, mut get) = (false, false, false);
+            for o in &args[2..] {
+                match String::from_utf8_lossy(o).to_ascii_uppercase().as_str() {
+                    "NX" => nx = true,
+                    "XX" => xx = true,
+                    "GET" => get = true,
+                    "EX" | "PX" | "EXAT" | "PXAT" | "KEEPTTL" => {
+                        return err("key expiry (EX/PX/EXAT/PXAT/KEEPTTL) is not supported by DB-Strike");
+                    }
+                    _ => return err("syntax error"),
+                }
+            }
+            if nx && xx {
+                return err("syntax error");
+            }
+            let v = args[1].clone();
+            match db.kv.update(&args[0], |cur| {
+                let ok = !(nx && cur.is_some()) && !(xx && cur.is_none());
+                (ok.then(|| Some(v.clone())), (ok, cur))
+            }) {
+                Ok((ok, old)) if get => {
+                    let _ = ok;
+                    old.map_or(Resp::Nil, Resp::Bulk)
+                }
+                Ok((true, _)) => Resp::Simple("OK".into()),
+                Ok((false, _)) => Resp::Nil,
+                Err(e) => err(&e.to_string()),
+            }
+        }
         "SET" => {
             if args.len() != 2 {
                 return err("SET requires key value");
@@ -1015,7 +1409,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
         // DBSIZE → :n live keys across every shard. redis-benchmark checks
         // this at startup to size the working set.
-        "DBSIZE" => Resp::Int(db.engine.dbsize() as i64),
+        // User KV keys only, O(1) (was an O(N) walk that counted internals).
+        "DBSIZE" => Resp::Int(db.engine.kv_count() as i64),
         // FLUSHALL / FLUSHDB — REAL full wipe. Backs up the live WAL (and the
         // checkpoint snapshot) with an instant zero-copy rename to
         // `<wal>.bak-<millis>` (`.snap` twin alongside), removes them from the
@@ -1033,6 +1428,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 // their ghost state too, or MEM.COUNT keeps reporting the
                 // wiped corpus and ids continue past deleted records.
                 db.rag.memory().reset_volatile();
+                // CRDT RAM mirror must follow the wiped substrate too.
+                *db.crdt.lock().unwrap() = ConsensusStore { gc: HashMap::new(), pn: HashMap::new(), lww: HashMap::new() };
                 db.rag.invalidate_query_cache();
                 eprintln!("[FLUSH] full wipe OK · pre-flush world backed up at {bak}");
                 Resp::Simple("OK".into())
@@ -1044,7 +1441,72 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         // enough to let it skip probing without erroring.
         "COMMAND" => Resp::Array(Vec::new()),
         // SELECT db — Redis supports N logical DBs; we always use DB 0.
-        "SELECT" => Resp::Simple("OK".into()),
+        // Only database 0 exists. `SELECT n` used to reply OK for any n while
+        // every "database" shared one keyspace — clients isolating tenants or
+        // tests by db index silently read and wrote each other's keys.
+        "SELECT" => match args.first().and_then(|a| std::str::from_utf8(a).ok()).and_then(|s| s.parse::<i64>().ok()) {
+            Some(0) if args.len() == 1 => Resp::Simple("OK".into()),
+            Some(_) if args.len() == 1 => err("DB index is out of range (DB-Strike has a single keyspace: use 0)"),
+            _ => err("invalid DB index"),
+        },
+        "ECHO" => match args {
+            [m] => Resp::Bulk(m.clone()),
+            _ => err("wrong number of arguments for 'echo' command"),
+        },
+        "TIME" => {
+            let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            Resp::Array(vec![
+                Resp::Bulk(d.as_secs().to_string().into_bytes()),
+                Resp::Bulk(d.subsec_micros().to_string().into_bytes()),
+            ])
+        }
+        "EXISTS" => {
+            if args.is_empty() {
+                return err("wrong number of arguments for 'exists' command");
+            }
+            Resp::Int(args.iter().filter(|k| db.kv.get_b(k).is_some()).count() as i64)
+        }
+        "TYPE" => match args {
+            [k] => Resp::Simple(if db.kv.get_b(k).is_some() { "string" } else { "none" }.into()),
+            _ => err("wrong number of arguments for 'type' command"),
+        },
+        "STRLEN" => match args {
+            [k] => Resp::Int(db.kv.get_b(k).map_or(0, |v| v.len()) as i64),
+            _ => err("wrong number of arguments for 'strlen' command"),
+        },
+        "APPEND" => match args {
+            [k, v] => match db.kv.update(k, |cur| {
+                let mut nv = cur.unwrap_or_default();
+                nv.extend_from_slice(v);
+                let n = nv.len();
+                (Some(Some(nv)), n)
+            }) {
+                Ok(n) => Resp::Int(n as i64),
+                Err(e) => err(&e.to_string()),
+            },
+            _ => err("wrong number of arguments for 'append' command"),
+        },
+        "SETNX" => match args {
+            [k, v] => match db.kv.update(k, |cur| if cur.is_some() { (None, 0) } else { (Some(Some(v.clone())), 1) }) {
+                Ok(n) => Resp::Int(n),
+                Err(e) => err(&e.to_string()),
+            },
+            _ => err("wrong number of arguments for 'setnx' command"),
+        },
+        "GETSET" => match args {
+            [k, v] => match db.kv.update(k, |cur| (Some(Some(v.clone())), cur)) {
+                Ok(old) => old.map_or(Resp::Nil, Resp::Bulk),
+                Err(e) => err(&e.to_string()),
+            },
+            _ => err("wrong number of arguments for 'getset' command"),
+        },
+        "GETDEL" => match args {
+            [k] => match db.kv.update(k, |cur| (cur.as_ref().map(|_| None), cur)) {
+                Ok(old) => old.map_or(Resp::Nil, Resp::Bulk),
+                Err(e) => err(&e.to_string()),
+            },
+            _ => err("wrong number of arguments for 'getdel' command"),
+        },
         // CONFIG GET <pattern> / CONFIG SET <k> <v> — redis-benchmark probes
         // `CONFIG GET save` (and others) at startup; an unknown command made
         // its warmup sample divide by zero → "-nan" RPS in the summary. Reply
@@ -1098,33 +1560,33 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 None => Resp::Nil,
             }
         }
-        "DEL" => {
+        "DEL" | "UNLINK" => {
             if args.is_empty() {
                 return err("DEL requires at least one key");
             }
-            let mut deleted = 0i64;
-            for a in args {
-                match db.kv.del_b(a) {
-                    Ok(true) => deleted += 1,
-                    Ok(false) => {}
-                    Err(e) => return err(&e.to_string()),
-                }
+            let keys: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+            match db.kv.del_many(&keys) {
+                Ok(n) => Resp::Int(n as i64),
+                Err(e) => err(&e.to_string()),
             }
-            Resp::Int(deleted)
         }
-        "INCR" | "INCRBY" => {
-            let (key, by) = if name == "INCR" {
+        "INCR" | "INCRBY" | "DECR" | "DECRBY" => {
+            let (key, by) = if name == "INCR" || name == "DECR" {
                 if args.len() != 1 {
-                    return err("INCR requires key");
+                    return err(&format!("wrong number of arguments for '{}' command", name.to_lowercase()));
                 }
-                (args[0].clone(), 1)
+                (args[0].clone(), if name == "INCR" { 1 } else { -1 })
             } else {
                 if args.len() != 2 {
-                    return err("INCRBY requires key n");
+                    return err(&format!("wrong number of arguments for '{}' command", name.to_lowercase()));
                 }
-                let by: i64 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
-                    Some(n) => n,
-                    None => return err("n is not an integer"),
+                let by: i64 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                    Some(n) if name == "INCRBY" => n,
+                    Some(n) => match n.checked_neg() {
+                        Some(n) => n,
+                        None => return err("decrement would overflow"),
+                    },
+                    None => return err("value is not an integer or out of range"),
                 };
                 (args[0].clone(), by)
             };
@@ -1134,11 +1596,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
         }
         "KEYS" => {
-            let prefix = args.first().map(|a| {
-                let s = String::from_utf8_lossy(a);
-                s.trim_end_matches('*').to_string()
-            }).unwrap_or_default();
-            let keys = db.kv.keys_prefix(prefix.as_bytes());
+            let pat: &[u8] = args.first().map(|a| a.as_slice()).unwrap_or(b"*");
+            let keys = db.kv.keys_glob(pat, |k| acl::glob_match(pat, k));
             Resp::Array(keys.into_iter().map(Resp::Bulk).collect())
         }
 
@@ -1146,9 +1605,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if args.len() < 2 {
                 return err("VADD requires id f1 f2 ...");
             }
-            let id: u64 = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let id: u64 = match parse_vec_id(&args[0]) {
                 Some(n) => n,
-                None => return err("id is not a u64"),
+                None => return err("id must be an integer in 0..=9223372036854775807"),
             };
             let vec = match parse_floats(&args[1..]) {
                 Some(v) => v,
@@ -1157,9 +1616,10 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             // TurboQuant fits a d×d rotation; inserting a mismatched dim would
             // desync the packed storage (and panicked before this guard).
             let vi = db.router.vectors();
-            let qd = vi.quant_dim();
-            if qd != 0 && vec.len() != qd {
-                return err(&format!("VADD dim {} != turbo index dim {}", vec.len(), qd));
+            // Reject a mismatched dim BEFORE any write: the graph silently
+            // drops it, so the old code acked a vector VSEARCH never returned.
+            if let Err(e) = vi.check_dim(vec.len()) {
+                return err(&format!("VADD {e}"));
             }
             // UNIFIED write: one command populates the dense HNSW (durable),
             // the MODULE 4 filter-attribute, and the MODULE 5 sparse/BM25 index
@@ -1188,7 +1648,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 return err("VADDNS requires namespace id f1 f2 ...");
             }
             let namespace = String::from_utf8_lossy(&args[0]).to_string();
-            let id: u64 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let id: u64 = match parse_vec_id(&args[1]) {
                 Some(n) => n,
                 None => return err("id is not a u64"),
             };
@@ -1197,9 +1657,10 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 None => return err("bad float in vector"),
             };
             let vi = db.router.vectors_ns(&namespace);
-            let qd = vi.quant_dim();
-            if qd != 0 && vec.len() != qd {
-                return err(&format!("VADDNS dim {} != turbo index dim {}", vec.len(), qd));
+            // Reject a mismatched dim BEFORE any write: the graph silently
+            // drops it, so the old code acked a vector VSEARCH never returned.
+            if let Err(e) = vi.check_dim(vec.len()) {
+                return err(&format!("VADDNS {e}"));
             }
             let (attr, sparse) = derive_attr_and_sparse(&vec, 8, 8);
             vi.insert_graph_only_attr(id, vec.clone(), attr);
@@ -1321,8 +1782,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("dim is not an integer"),
             };
-            if dim == 0 {
-                return err("dim must be > 0");
+            if dim == 0 || dim > MAX_DIM {
+                return err("dim must be between 1 and 65536");
             }
             if (rest.len() - 1) % (dim + 1) != 0 {
                 return err("VADDBATCH float count must be whole number of (id + dim) tuples");
@@ -1334,7 +1795,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let mut errmsg = String::new();
             for t in 0..tuples {
                 let base = 1 + t * (dim + 1);
-                let id: u64 = match std::str::from_utf8(&rest[base]).ok().and_then(|s| s.parse().ok()) {
+                let id: u64 = match parse_vec_id(&rest[base]) {
                     Some(n) => n,
                     None => { ok = false; errmsg = "id is not a u64".into(); break; }
                 };
@@ -1409,8 +1870,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("dim is not an integer"),
             };
-            if dim == 0 {
-                return err("dim must be > 0");
+            if dim == 0 || dim > MAX_DIM {
+                return err("dim must be between 1 and 65536");
             }
             if (rest.len() - 1) % (dim + 1) != 0 {
                 return err("VADDBATCHNS float count must be whole number of (id + dim) tuples");
@@ -1422,7 +1883,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let mut errmsg = String::new();
             for t in 0..tuples {
                 let base = 1 + t * (dim + 1);
-                let id: u64 = match std::str::from_utf8(&rest[base]).ok().and_then(|s| s.parse().ok()) {
+                let id: u64 = match parse_vec_id(&rest[base]) {
                     Some(n) => n,
                     None => { ok = false; errmsg = "id is not a u64".into(); break; }
                 };
@@ -1554,7 +2015,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("n is not an integer"),
             };
-            if args.len() != 2 + n * (dim + 1) {
+            if dim == 0 || dim > MAX_DIM || n.checked_mul(dim + 1).and_then(|x| x.checked_add(2)) != Some(args.len()) {
                 return err("VFITQUANT float count mismatch");
             }
             // fit_quant asserts on an empty index; return a clean error rather
@@ -1595,7 +2056,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("n is not an integer"),
             };
-            if args.len() != 3 + n * (dim + 1) {
+            if dim == 0 || dim > MAX_DIM || n.checked_mul(dim + 1).and_then(|x| x.checked_add(3)) != Some(args.len()) {
                 return err("VFITQUANTNS float count mismatch");
             }
             if db.router.vectors_ns(&namespace).len() > 0 {
@@ -1640,7 +2101,16 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
-            let exp = 3 + nq * dim + nq * k;
+            if dim == 0 || dim > MAX_DIM || nq == 0 || k == 0 {
+                return err("VCALIBRATE dim, nq and k must be > 0");
+            }
+            // Checked: these come off the wire and a wrapped product would
+            // pass the length test and then slice out of bounds.
+            let exp = match nq.checked_mul(dim).zip(nq.checked_mul(k))
+                .and_then(|(a, b)| a.checked_add(b)).and_then(|x| x.checked_add(3)) {
+                Some(e) => e,
+                None => return err("VCALIBRATE sizes overflow"),
+            };
             if args.len() != exp {
                 return err(&format!("VCALIBRATE expects {exp} args, got {}", args.len()));
             }
@@ -1709,7 +2179,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                             Some(n) => n,
                             None => break,
                         };
-                        let w: f32 = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse().ok()) {
+                        let w: f32 = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite()) {
                             Some(n) => n,
                             None => break,
                         };
@@ -1729,6 +2199,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 None => return err("bad float in query"),
             };
             let vi = db.router.vectors();
+            if let Some(e) = query_dim_err(&vi, &q) {
+                return e;
+            }
             let learned = if use_learned {
                 db.learned.lock().unwrap().clone()
             } else {
@@ -1831,7 +2304,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                             Some(n) => n,
                             None => break,
                         };
-                        let w: f32 = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse().ok()) {
+                        let w: f32 = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite()) {
                             Some(n) => n,
                             None => break,
                         };
@@ -1850,7 +2323,13 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
-            let vi = db.router.vectors_ns(&namespace);
+            let vi = match db.router.vectors_ns_existing(&namespace) {
+                Some(vi) => vi,
+                None => return Resp::Array(vec![]),
+            };
+            if let Some(e) = query_dim_err(&vi, &q) {
+                return e;
+            }
             let learned = if use_learned {
                 db.learned.lock().unwrap().clone()
             } else {
@@ -1891,7 +2370,13 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("id is not a u64"),
             };
-            match db.router.vectors_ns(&namespace).set_payload(id, &args[2]) {
+            // A payload for a vector that does not exist is unreachable by any
+            // search; refuse it instead of silently storing an orphan.
+            let vi = match db.router.vectors_ns_existing(&namespace) {
+                Some(vi) if vi.get_vector(id).is_some() => vi,
+                _ => return err(&format!("no vector {id} in namespace {namespace}")),
+            };
+            match vi.set_payload(id, &args[2]) {
                 Ok(_) => Resp::Simple("OK".into()),
                 Err(e) => err(&e.to_string()),
             }
@@ -1906,7 +2391,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("id is not a u64"),
             };
-            match db.router.vectors_ns(&namespace).get_payload_raw(id) {
+            match db.router.vectors_ns_existing(&namespace).and_then(|vi| vi.get_payload_raw(id)) {
                 Some(b) => Resp::Bulk(b),
                 None => Resp::Bulk(b"null".to_vec()),
             }
@@ -1937,7 +2422,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("k is not an integer"),
             };
-            let lambda: f32 = match std::str::from_utf8(&args[2]).ok().and_then(|v| v.parse().ok()) {
+            let lambda: f32 = match std::str::from_utf8(&args[2]).ok().and_then(|v| v.parse::<f32>().ok()).filter(|x| x.is_finite()) {
                 Some(v) => v,
                 None => return err("lambda is not a number"),
             };
@@ -2106,7 +2591,11 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query"),
             };
-            let hits = db.router.vectors().search_adaptive(&q, k, 16, 32, 256);
+            let vi = db.router.vectors();
+            if let Some(e) = query_dim_err(&vi, &q) {
+                return e;
+            }
+            let hits = vi.search_adaptive(&q, k, 16, 32, 256);
             let mut out = Vec::new();
             for (id, dist) in hits {
                 out.push(Resp::Int(id as i64));
@@ -2130,7 +2619,14 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query"),
             };
-            let hits = db.router.vectors_ns(&namespace).search_adaptive(&q, k, 16, 32, 256);
+            let vi = match db.router.vectors_ns_existing(&namespace) {
+                Some(vi) => vi,
+                None => return Resp::Array(vec![]),
+            };
+            if let Some(e) = query_dim_err(&vi, &q) {
+                return e;
+            }
+            let hits = vi.search_adaptive(&q, k, 16, 32, 256);
             let mut out = Vec::new();
             for (id, dist) in hits {
                 out.push(Resp::Int(id as i64));
@@ -2154,8 +2650,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("dim is not an integer"),
             };
-            if dim == 0 {
-                return err("dim must be > 0");
+            if dim == 0 || dim > MAX_DIM {
+                return err("dim must be between 1 and 65536");
             }
             let floats = match parse_floats(&args[2..]) {
                 Some(v) => v,
@@ -2166,7 +2662,13 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
             let queries: Vec<Vec<f32>> =
                 floats.chunks(dim).map(|c| c.to_vec()).collect();
-            let batch = db.router.vectors().search_many(&queries, k);
+            let vi = db.router.vectors();
+            if vi.len() > 0 {
+                if let Err(e) = vi.check_dim(dim) {
+                    return err(&format!("query {e}"));
+                }
+            }
+            let batch = vi.search_many(&queries, k);
             let mut out = Vec::with_capacity(batch.len());
             for hits in batch {
                 let mut inner = Vec::with_capacity(hits.len() * 2);
@@ -2195,8 +2697,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("dim is not an integer"),
             };
-            if dim == 0 {
-                return err("dim must be > 0");
+            if dim == 0 || dim > MAX_DIM {
+                return err("dim must be between 1 and 65536");
             }
             let floats = match parse_floats(&args[3..]) {
                 Some(v) => v,
@@ -2207,7 +2709,14 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
             let queries: Vec<Vec<f32>> =
                 floats.chunks(dim).map(|c| c.to_vec()).collect();
-            let batch = db.router.vectors_ns(&namespace).search_many(&queries, k);
+            let vi = match db.router.vectors_ns_existing(&namespace) {
+                Some(vi) => vi,
+                None => return Resp::Array(queries.iter().map(|_| Resp::Array(vec![])).collect()),
+            };
+            if let Err(e) = vi.check_dim(dim) {
+                return err(&format!("query {e}"));
+            }
+            let batch = vi.search_many(&queries, k);
             let mut out = Vec::with_capacity(batch.len());
             for hits in batch {
                 let mut inner = Vec::with_capacity(hits.len() * 2);
@@ -2235,9 +2744,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Ok(s) => s,
                 Err(_) => return err("val is not a valid utf8 number"),
             };
-            let v: f64 = match v_str.parse() {
-                Ok(f) => f,
-                Err(_) => return err("val is not a number"),
+            let v: f64 = match v_str.parse::<f64>() {
+                Ok(f) if f.is_finite() => f,
+                _ => return err("val is not a finite number"),
             };
             match db.ts.append_f(&series, t, v) {
                 Ok(_) => Resp::Simple("OK".into()),
@@ -2467,28 +2976,26 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
         }
 
-        // PUBLISH ch msg — durable pub/sub. The write lands on `chan:<ch>`;
-        // reactive fires → every SUBSCRIBEr matching the prefix receives it.
-        // Return the number of subscribers matched (Redis semantics).
+        // PUBLISH ch msg — Redis pub/sub via the in-memory broker: exact
+        // channel + glob-pattern subscribers, nothing written to the WAL.
+        // Returns how many subscribers received it (Redis semantics).
         "PUBLISH" => {
             if args.len() != 2 {
                 return err("PUBLISH requires channel message");
             }
-            let mut key = b"chan:".to_vec();
-            key.extend_from_slice(&args[0]);
-            match db.engine.put(key, storage::Value::Bytes(args[1].clone())) {
-                Ok(_) => {
-                    // Approximate subscriber count: number of registered
-                    // prefixes that match `chan:<ch>`. Cheap & Redis-adjacent.
-                    let ch_prefix = {
-                        let mut p = b"chan:".to_vec();
-                        p.extend_from_slice(&args[0]);
-                        p
-                    };
-                    let n = db.reactive.subscribers_matching(&ch_prefix);
-                    Resp::Int(n as i64)
-                }
-                Err(e) => err(&e.to_string()),
+            Resp::Int(db.pubsub.publish(&args[0], &args[1]) as i64)
+        }
+        "PUBSUB" => {
+            let sub = args.first().map(|a| String::from_utf8_lossy(a).to_uppercase()).unwrap_or_default();
+            match sub.as_str() {
+                "CHANNELS" => Resp::Array(
+                    db.pubsub.channels(args.get(1).map(|v| v.as_slice())).into_iter().map(Resp::Bulk).collect(),
+                ),
+                "NUMSUB" => Resp::Array(
+                    args[1..].iter().flat_map(|c| [Resp::Bulk(c.clone()), Resp::Int(db.pubsub.numsub(c) as i64)]).collect(),
+                ),
+                "NUMPAT" => Resp::Int(db.pubsub.numpat() as i64),
+                _ => err("PUBSUB subcommand must be CHANNELS, NUMSUB or NUMPAT"),
             }
         }
 
@@ -2502,7 +3009,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
             let text = String::from_utf8_lossy(&rest[0]).to_string();
             let source = String::from_utf8_lossy(&rest[1]).to_string();
-            let sal: f32 = match std::str::from_utf8(&rest[2]).ok().and_then(|s| s.parse().ok()) {
+            let sal: f32 = match std::str::from_utf8(&rest[2]).ok().and_then(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite()) {
                 Some(n) => n,
                 None => return err("salience is not a float"),
             };
@@ -2542,6 +3049,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
+            if let Err(e) = db.rag.memory().check_embedding(&qvec) {
+                return err(&format!("query {e}"));
+            }
             let hits = db.rag.memory().recall_scoped(&agent, &query, &qvec, k);
             let mut out = Vec::new();
             for h in hits {
@@ -2587,7 +3097,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 None => return err("to is not a u64"),
             };
             let rel = String::from_utf8_lossy(&args[2]).to_string();
-            let w: f32 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            let w: f32 = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite()).unwrap_or(1.0);
             match db.rag.memory().link(from, to, &rel, w) {
                 Ok(_) => Resp::Simple("OK".into()),
                 Err(e) => err(&e.to_string()),
@@ -2666,7 +3176,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
             let text = String::from_utf8_lossy(&rest[0]).to_string();
             let source = String::from_utf8_lossy(&rest[1]).to_string();
-            let sal: f32 = std::str::from_utf8(&rest[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+            let sal: f32 = std::str::from_utf8(&rest[2]).ok().and_then(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite()).unwrap_or(0.5);
             let vf: u64 = std::str::from_utf8(&rest[3]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let vt: u64 = std::str::from_utf8(&rest[4]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let vec = match parse_floats(&rest[5..]) {
@@ -2733,6 +3243,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
+            if let Err(e) = db.rag.memory().check_embedding(&qvec) {
+                return err(&format!("query {e}"));
+            }
             let hits = db.rag.memory().recall_as_of(&agent, &query, &qvec, k, as_of);
             let mut out = Vec::new();
             for h in hits {
@@ -2896,8 +3409,11 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
         // RAG.SEARCH k query f1 f2 ...  -> array of (id, score, source, text)
         "RAG.SEARCH" => {
+            // Strip `AGENT name` first: k used to be parsed from args[0], so the
+            // documented scoped form failed with "k is not an integer".
+            let (agent, args) = parse_agent_scope(args);
             if args.len() < 3 {
-                return err("RAG.SEARCH requires k query f1 f2 ...");
+                return err("RAG.SEARCH requires [AGENT name] k query f1 f2 ...");
             }
             let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
@@ -2908,7 +3424,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
-            let (agent, _) = parse_agent_scope(args);
+            if let Err(e) = db.rag.memory().check_embedding(&qvec) {
+                return err(&format!("query {e}"));
+            }
             let (hits, cached) = db.rag.retrieve_cached(&agent, &query, &qvec, k);
             let mut out = Vec::new();
             out.push(Resp::Bulk(if cached { b"cached".to_vec() } else { b"fresh".to_vec() }));
@@ -3088,10 +3606,17 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("by is not a u64"),
             };
+            // Update a copy, persist it, and only then publish it in memory:
+            // CRDT state used to live only in this map and vanished on restart.
             let mut store = db.crdt.lock().unwrap();
-            let c = store.gc.entry(name).or_default();
+            let mut c = store.gc.get(&name).cloned().unwrap_or_default();
             c.incr(&node, by);
-            Resp::Int(c.value() as i64)
+            if let Err(e) = db.engine.put(crdt_key("gc", &name), storage::Value::Bytes(c.to_bytes())) {
+                return err(&e.to_string());
+            }
+            let v = c.value().min(i64::MAX as u64) as i64;
+            store.gc.insert(name, c);
+            Resp::Int(v)
         }
         // CRDT.PNCOUNTER name node delta  -> :value   (PN counter; delta may be negative)
         "CRDT.PNCOUNTER" => {
@@ -3105,13 +3630,18 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 None => return err("delta is not an i64"),
             };
             let mut store = db.crdt.lock().unwrap();
-            let c = store.pn.entry(name).or_default();
+            let mut c = store.pn.get(&name).cloned().unwrap_or_default();
             if d >= 0 {
                 c.incr(&node, d as u64);
             } else {
-                c.decr(&node, (-d) as u64);
+                c.decr(&node, d.unsigned_abs());
             }
-            Resp::Int(c.value())
+            if let Err(e) = db.engine.put(crdt_key("pn", &name), storage::Value::Bytes(c.to_bytes())) {
+                return err(&e.to_string());
+            }
+            let v = c.value();
+            store.pn.insert(name, c);
+            Resp::Int(v)
         }
         // CRDT.LWW name value ts node  -> OK   (last-write-wins register)
         "CRDT.LWW" => {
@@ -3125,8 +3655,12 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             };
             let node = String::from_utf8_lossy(&args[3]).to_string();
             let mut store = db.crdt.lock().unwrap();
-            let r = store.lww.entry(name).or_insert_with(|| LwwRegister::new(args[1].clone(), 0, &node));
+            let mut r = store.lww.get(&name).cloned().unwrap_or_else(|| LwwRegister::new(args[1].clone(), 0, &node));
             r.set(args[1].clone(), ts, &node);
+            if let Err(e) = db.engine.put(crdt_key("lww", &name), storage::Value::Bytes(r.to_bytes())) {
+                return err(&e.to_string());
+            }
+            store.lww.insert(name, r);
             Resp::Simple("OK".into())
         }
         // CRDT.GET name  -> bulk (value) for GCOUNTER/PnCounter/LWW, or nil
@@ -3293,7 +3827,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("id is not a u64"),
             };
-            let d: f32 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let d: f32 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<f32>().ok()).filter(|x| x.is_finite()) {
                 Some(n) => n,
                 None => return err("delta is not a float"),
             };
@@ -3350,6 +3884,9 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(v) => v,
                 None => return err("bad float in query vector"),
             };
+            if let Err(e) = db.rag.memory().check_embedding(&qvec) {
+                return err(&format!("query {e}"));
+            }
             Resp::Bulk(db.rag.context_block(&agent, &query, &qvec, k).into_bytes())
         }
 
@@ -3363,13 +3900,86 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("snapshot is not a u64"),
             };
-            let v = db.engine.get_at(&args[0], snap);
-            value_to_resp(v)
+            match db.engine.get_at_checked(&args[0], snap) {
+                Ok(v) => value_to_resp(v),
+                Err(()) => err(&format!(
+                    "snapshot {snap} is older than the retained history of this key (last {} versions are kept)",
+                    storage::engine::MAX_VERSIONS_PER_KEY
+                )),
+            }
         }
         // SCAN start end  -> array of (key, value) over all shards, snapshot=now
-        "SCAN" => {
+        // Redis cursor form: SCAN cursor [MATCH pat] [COUNT n] [TYPE t] over
+        // user KV keys. The legacy raw-engine range form `SCAN start end`
+        // stays available (and as SCANRANGE): it used to be the ONLY form, so
+        // a Redis client's `SCAN 0` got an error and `SCAN 0 MATCH x*` too.
+        "SCAN" if args.len() == 1
+            || args.get(1).is_some_and(|a| {
+                let u = String::from_utf8_lossy(a).to_ascii_uppercase();
+                matches!(u.as_str(), "MATCH" | "COUNT" | "TYPE")
+            }) =>
+        {
+            let cursor: u64 = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+                Some(c) => c,
+                None => return err("invalid cursor"),
+            };
+            let (mut pat, mut count, mut ty): (Option<&[u8]>, usize, Option<String>) = (None, 10, None);
+            let mut i = 1;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
+                let Some(val) = args.get(i + 1) else { return err("syntax error") };
+                match opt.as_str() {
+                    "MATCH" => pat = Some(val),
+                    "COUNT" => match std::str::from_utf8(val).ok().and_then(|s| s.parse::<usize>().ok()) {
+                        Some(n) if n > 0 => count = n.min(100_000),
+                        _ => return err("value is not an integer or out of range"),
+                    },
+                    "TYPE" => ty = Some(String::from_utf8_lossy(val).to_ascii_lowercase()),
+                    _ => return err("syntax error"),
+                }
+                i += 2;
+            }
+            // Resume point for this cursor (0 = start of the keyspace).
+            let start: Vec<u8> = if cursor == 0 {
+                b"kv:".to_vec()
+            } else {
+                match db.scan_cursors.lock().unwrap().remove(&cursor) {
+                    Some(k) => k,
+                    None => return err("invalid cursor"),
+                }
+            };
+            let snap = db.engine.snapshot();
+            let page = db.engine.scan_from(&start, b"kv;", count, snap);
+            let next = if page.len() < count {
+                0
+            } else {
+                let mut resume = page.last().map(|(k, _)| k.clone()).unwrap_or_default();
+                resume.push(0); // strictly after the last returned key
+                let id = NEXT_SCAN_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut cur = db.scan_cursors.lock().unwrap();
+                if cur.len() >= MAX_SCAN_CURSORS {
+                    // Abandoned cursors: drop the oldest ids.
+                    let mut ids: Vec<u64> = cur.keys().copied().collect();
+                    ids.sort_unstable();
+                    for old in ids.into_iter().take(MAX_SCAN_CURSORS / 4) {
+                        cur.remove(&old);
+                    }
+                }
+                cur.insert(id, resume);
+                id
+            };
+            let type_ok = ty.as_deref().is_none_or(|t| t == "string");
+            let keys: Vec<Resp> = page
+                .into_iter()
+                .filter_map(|(k, _)| k.strip_prefix(b"kv:").map(|u| u.to_vec()))
+                .filter(|k| type_ok && pat.is_none_or(|p| acl::glob_match(p, k)))
+                .map(Resp::Bulk)
+                .collect();
+            Resp::Array(vec![Resp::Bulk(next.to_string().into_bytes()), Resp::Array(keys)])
+        }
+        "SCAN" | "SCANRANGE" => {
             if args.len() != 2 {
-                return err("SCAN requires start end");
+                return err("SCAN requires a cursor (SCAN 0 [MATCH p] [COUNT n]) or a raw range (SCANRANGE start end)");
             }
             let snap = db.engine.snapshot();
             // BTreeMap::range panics if start > end; tolerate inverted ranges.
@@ -3387,10 +3997,21 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
         "INFO" => {
+            // Redis-style sections so client libraries / exporters that parse
+            // `# Section` + `key:value` lines work. Existing fields are kept.
+            let up = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
             let info = format!(
-                "db-strike\r\nsnapshot:{}\r\ncdc_events:{}\r\nengine:unified-mvcc-wal\r\n",
+                "# Server\r\nredis_version:7.2.0\r\ndbstrike_version:1.0.0\r\nredis_mode:standalone\r\nprocess_id:{}\r\nuptime_in_seconds:{up}\r\n\r\n\
+                 # Clients\r\nconnected_clients_total_seen:{}\r\n\r\n\
+                 # Persistence\r\naof_enabled:1\r\nwal_bytes:{}\r\n\r\n\
+                 # Keyspace\r\ndb0:keys={},expires=0,avg_ttl=0\r\n\r\n\
+                 # DB-Strike\r\nsnapshot:{}\r\ncdc_events:{}\r\nengine:unified-mvcc-wal\r\n",
+                std::process::id(),
+                NEXT_CONN_ID.load(std::sync::atomic::Ordering::Relaxed) - 1,
+                db.engine.wal_bytes(),
+                db.engine.kv_count(),
                 db.engine.snapshot(),
-                db.reactive.cdc_len()
+                db.reactive.cdc_len_peek()
             );
             Resp::Bulk(info.into_bytes())
         }

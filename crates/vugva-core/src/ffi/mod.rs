@@ -158,7 +158,8 @@ pub fn nvrtc_module() -> Result<&'static LoadedLib> {
 /// verbatim first, then fall back to the `_v2`/`_v3` spellings so that a
 /// binding declared as `cuFoo` still resolves against a driver that only ships
 /// `cuFoo_v2`. Names that already carry a version suffix hit on the first try.
-pub(crate) fn cuda_sym_addr(name: &str) -> usize {
+#[doc(hidden)]
+pub fn cuda_sym_addr(name: &str) -> usize {
     let lib = match cuda_module() {
         Ok(l) => l,
         // No driver on this machine: every symbol is "missing", which the
@@ -188,7 +189,8 @@ pub(crate) fn cuda_sym_addr(name: &str) -> usize {
 /// Same `0`-as-sentinel contract as [`cuda_sym_addr`]. No `_v2` fallback: NVRTC
 /// does not version its entry points that way — it ships a whole new SONAME per
 /// CUDA major release instead, which [`nvrtc_module`] already walks.
-pub(crate) fn nvrtc_sym_addr(name: &str) -> usize {
+#[doc(hidden)]
+pub fn nvrtc_sym_addr(name: &str) -> usize {
     let lib = match nvrtc_module() {
         Ok(l) => l,
         Err(_) => return 0,

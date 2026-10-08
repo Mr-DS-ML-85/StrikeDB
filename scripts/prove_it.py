@@ -118,15 +118,43 @@ class Resp:
         raise ValueError(f"bad type {t!r}")
 
 
+def _ss(flags):
+    """`ss` output, or None where iproute2 isn't installed (containers)."""
+    try:
+        return subprocess.run(["ss", flags], capture_output=True, text=True).stdout
+    except FileNotFoundError:
+        return None
+
+
 def port_busy():
-    out = subprocess.run(["ss", "-tln"], capture_output=True, text=True).stdout
+    out = _ss("-tln")
+    if out is None:
+        # Fallback: something accepting connections on PORT means busy.
+        try:
+            socket.create_connection((HOST, PORT), timeout=0.2).close()
+            return True
+        except OSError:
+            return False
     return any(f":{PORT} " in line for line in out.splitlines())
 
 
 @atexit.register
 def _kill_stray_server():
     """Never leak a server on PORT: a zombie would poison later runs."""
-    out = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True).stdout
+    out = _ss("-tlnp")
+    if out is None:
+        # Fallback: find our own dbstrike processes bound to HOST:PORT.
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    argv = f.read().split(b"\0")
+            except OSError:
+                continue
+            if argv and argv[0].endswith(b"dbstrike") and f"{HOST}:{PORT}".encode() in argv:
+                subprocess.run(["kill", "-9", pid])
+        return
     for line in out.splitlines():
         if f":{PORT} " in line and "pid=" in line:
             pid = line.split("pid=")[1].split(",")[0]
@@ -400,6 +428,10 @@ def phase_subsystems():
         check("table row survives", row is not None, f"(got {row})")
         cnt = c.cmd("MEM.COUNT")
         check("agent memory survives", cnt == 1, f"(count={cnt})")
+        # CRDT state was written before the crash but never checked: it was
+        # in-memory only and silently vanished on restart.
+        g = c.cmd("CRDT.GET", "hits")
+        check("CRDT counter survives", g == b"5", f"(got {g!r})")
     finally:
         clean_shutdown(p)
 
