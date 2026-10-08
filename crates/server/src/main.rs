@@ -190,6 +190,25 @@ fn main() -> std::io::Result<()> {
         scan_cursors: Mutex::new(HashMap::new()),
         ks,
     });
+    // Automatic checkpoint: the WAL used to grow without bound unless an
+    // operator ran CHECKPOINT (246 MB after one benchmark session). Now that
+    // a checkpoint no longer blocks writers, compact once the live WAL passes
+    // DBSTRIKE_CHECKPOINT_MB (default 256; 0 disables).
+    {
+        let db = Arc::clone(&db);
+        let mb: u64 = std::env::var("DBSTRIKE_CHECKPOINT_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+        if mb > 0 {
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if db.engine.wal_bytes() > mb * 1024 * 1024 {
+                    match db.engine.checkpoint() {
+                        Ok((n, bytes)) => eprintln!("[CHECKPOINT] auto: {n} keys, {bytes} bytes"),
+                        Err(e) => eprintln!("[CHECKPOINT] auto failed: {e}"),
+                    }
+                }
+            });
+        }
+    }
     // Active expiry: reap keys whose TTL has passed, in deadline order, so
     // expired keys don't linger until someone happens to touch them.
     {

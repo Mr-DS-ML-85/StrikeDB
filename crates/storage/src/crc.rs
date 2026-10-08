@@ -29,6 +29,30 @@ impl Crc32Table {
 
 static TABLE: Crc32Table = Crc32Table::new();
 
+/// Incremental CRC32 (same result as `crc32` over the concatenated input).
+pub struct Crc32Hasher(u32);
+
+impl Default for Crc32Hasher {
+    fn default() -> Self {
+        Crc32Hasher(0xFFFF_FFFF)
+    }
+}
+
+impl Crc32Hasher {
+    pub fn update(&mut self, data: &[u8]) {
+        let mut crc = self.0;
+        for &b in data {
+            let idx = ((crc ^ b as u32) & 0xFF) as usize;
+            crc = (crc >> 8) ^ TABLE.0[idx];
+        }
+        self.0 = crc;
+    }
+
+    pub fn finish(&self) -> u32 {
+        self.0 ^ 0xFFFF_FFFF
+    }
+}
+
 /// Compute the CRC32 of a byte slice.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;

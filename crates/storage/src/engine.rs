@@ -48,8 +48,12 @@ pub const MAX_VERSIONS_PER_KEY: usize = 8;
 
 #[derive(Default)]
 struct Chain {
-    latest: Option<Value>,
+    /// ts of the newest version (== `versions.last().ts`), cached because it
+    /// is read on every OCC validation.
     latest_ts: u64,
+    /// Versions sorted by ts; the last one is the current value. (A separate
+    /// `latest: Option<Value>` cache used to hold a SECOND copy of every
+    /// current value — the single biggest per-key memory cost.)
     versions: Vec<Version>,
     /// ts of the newest version ever pruned (0 = none). A read at a snapshot
     /// below the oldest retained version but at/after this cannot be answered
@@ -62,42 +66,34 @@ struct Chain {
 }
 
 impl Chain {
-    /// Append a committed version and refresh the O(1) cache. Prunes the
-    /// oldest version when the chain exceeds `MAX_VERSIONS_PER_KEY` — bounds
-    /// memory growth on counters and hot keys.
-    fn push(&mut self, ts: u64, value: Value) {
-        // Versions can arrive OUT OF TIMESTAMP ORDER. `commit_batch` reserves
-        // `ts` from the clock and only then takes the write-queue lock, so two
-        // writers can reserve (10, 11) and enqueue (11, 10). The flusher then
-        // applies 11 before 10, and blindly assigning `latest_ts = ts` would
-        // let the OLDER version win — a lost update. Measured at ~3 in 2000
-        // rounds of 32-way same-key contention, so rare but real. WAL replay
-        // has the same exposure: records are replayed in file order, which is
-        // queue order, not timestamp order.
-        //
-        // Nothing is ever lost on disk in that scenario — both records are
-        // durable — so the crash-recovery tests cannot see it. It is a
-        // *visibility* bug, not a durability one.
-        if ts >= self.latest_ts {
-            self.latest_ts = ts;
-            match &value {
-                Value::Tombstone => self.latest = None,
-                v => self.latest = Some(v.clone()),
-            }
-        }
-        // Keep `versions` sorted by ts, because `visible()` relies on a reverse
-        // scan finding the newest version <= snapshot. In the overwhelmingly
-        // common in-order case `partition_point` returns `len()` and this is
-        // exactly the old `push` — no added cost on the fast path.
+    /// Current value (`None` if the newest version is a tombstone).
+    fn latest(&self) -> Option<&Value> {
+        self.versions.last().map(|v| &v.value).filter(|v| !matches!(v, Value::Tombstone))
+    }
+
+    /// Insert a committed version, keeping `versions` sorted by ts (records
+    /// can arrive out of order on WAL replay). Prunes the oldest version past
+    /// `MAX_VERSIONS_PER_KEY`, except one an in-progress checkpoint at `pin`
+    /// still needs (the chain may grow briefly instead).
+    fn push(&mut self, ts: u64, value: Value, pin: u64) {
         if self.first_ts == 0 && self.pruned_ts == 0 && self.versions.is_empty() {
             self.first_ts = ts;
         }
+        if self.versions.capacity() == 0 {
+            // Most keys only ever hold one version: allocate exactly one slot
+            // instead of Vec's default first growth to four.
+            self.versions.reserve_exact(1);
+        }
         let pos = self.versions.partition_point(|v| v.ts <= ts);
         self.versions.insert(pos, Version { ts, value });
-        if self.versions.len() > MAX_VERSIONS_PER_KEY {
-            // O(N) shift once per push, but N is tiny (8) so it's cheap.
-            // Sorted order makes this the genuinely oldest version, which the
-            // previous insertion-ordered vec did not guarantee.
+        self.latest_ts = self.latest_ts.max(ts);
+        while self.versions.len() > MAX_VERSIONS_PER_KEY {
+            let needed_by_pin = pin != 0
+                && self.versions[0].ts <= pin
+                && self.versions[1].ts > pin;
+            if needed_by_pin {
+                break;
+            }
             let gone = self.versions.remove(0);
             self.pruned_ts = self.pruned_ts.max(gone.ts);
         }
@@ -106,11 +102,6 @@ impl Chain {
     /// Newest version visible at `snapshot`, honoring tombstones. O(1) when the
     /// newest version is already <= snapshot (the common case).
     fn visible(&self, snapshot: u64) -> Option<&Value> {
-        if let Some(v) = &self.latest {
-            if self.latest_ts <= snapshot {
-                return Some(v);
-            }
-        }
         for ver in self.versions.iter().rev() {
             if ver.ts <= snapshot {
                 return match &ver.value {
@@ -321,7 +312,7 @@ fn resolve(core: &FlushCore, pw: &PendingWrite, overlay: &BTreeMap<Key, Value>) 
             Some(v) => as_counter(Some(v)),
             None => {
                 let data = core.shards[shard_of(key)].read().unwrap();
-                as_counter(data.get(key).and_then(|c| c.latest.as_ref()))
+                as_counter(data.get(key).and_then(|c| c.latest()))
             }
         };
         let next = match cur.and_then(|c| {
@@ -370,16 +361,17 @@ fn apply_refs_to_shards(core: &FlushCore, muts: &[&Mutation]) {
             continue;
         }
         let mut data = core.shards[i].write().unwrap();
+        let pin = core.pin_ts.load(Ordering::SeqCst);
         let mut delta = 0i64;
         let mut dead: Vec<(Key, u64)> = Vec::new();
         for m in items {
             let chain = data.entry(m.key.clone()).or_default();
-            let before = chain.latest.is_some();
-            chain.push(m.ts, m.value.clone());
+            let before = chain.latest().is_some();
+            chain.push(m.ts, m.value.clone(), pin);
             if m.key.starts_with(b"kv:") {
-                delta += chain.latest.is_some() as i64 - before as i64;
+                delta += chain.latest().is_some() as i64 - before as i64;
             }
-            if chain.latest.is_none() {
+            if chain.latest().is_none() {
                 dead.push((m.key.clone(), chain.latest_ts));
             }
         }
@@ -391,6 +383,14 @@ fn apply_refs_to_shards(core: &FlushCore, muts: &[&Mutation]) {
             core.kv_live.fetch_add(delta, Ordering::Relaxed);
         }
     }
+}
+
+/// WAL segment rotated out by an in-progress checkpoint (`foo.wal.ckpt`).
+/// Recovery replays it between the snapshot and the live WAL.
+fn pending_path_for(wal: &Path) -> PathBuf {
+    let mut s = wal.as_os_str().to_owned();
+    s.push(".ckpt");
+    PathBuf::from(s)
 }
 
 /// Derive the checkpoint-snapshot path from a WAL path (`foo.wal` → `foo.wal.snap`).
@@ -405,48 +405,6 @@ fn snap_path_for(wal: &Path) -> PathBuf {
 ///   For each record: [u32 payload_len][payload bytes]        (payload = Mutation::encode())
 ///   [u32 crc32(entire body)]                                 (trailing checksum)
 ///
-/// Writer path: write to `<path>.tmp`, fsync, atomic-rename into place.
-fn write_snapshot(
-    snap_path: &Path,
-    muts: &[Mutation],
-) -> io::Result<()> {
-    let tmp_path: PathBuf = {
-        let mut s = snap_path.as_os_str().to_owned();
-        s.push(".tmp");
-        PathBuf::from(s)
-    };
-    let mut body = Vec::with_capacity(muts.len() * 32);
-    body.extend_from_slice(&(muts.len() as u64).to_le_bytes());
-    for m in muts {
-        let payload = m.encode();
-        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        body.extend_from_slice(&payload);
-    }
-    let checksum = crate::crc::crc32(&body);
-    body.extend_from_slice(&checksum.to_le_bytes());
-
-    let mut f = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)?;
-    f.write_all(&body)?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp_path, snap_path)?;
-
-    // Durability sandwich: the rename is a directory-entry change. If the
-    // power dies after the WAL is truncated but before this rename reaches
-    // disk, both the snapshot and the log would be gone. fsync the parent
-    // directory so the rename is as durable as the file it points at.
-    if let Some(parent) = snap_path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    Ok(())
-}
-
 fn load_snapshot(snap_path: &Path) -> io::Result<Vec<Mutation>> {
     let mut f = File::open(snap_path)?;
     let mut body = Vec::new();
@@ -577,6 +535,12 @@ struct FlushCore {
     /// Newest tombstone ts whose chain was physically removed: a point read
     /// of a missing key at a snapshot below this cannot be answered exactly.
     gc_horizon: AtomicU64,
+    /// Snapshot ts an in-progress checkpoint is reading (0 = none): version
+    /// pruning keeps whatever that snapshot needs.
+    pin_ts: AtomicU64,
+    /// Highest commit ts written to the WAL so far (the rotation boundary of
+    /// a non-blocking checkpoint).
+    last_appended: AtomicU64,
 }
 
 /// Physically remove chains whose newest version is a tombstone that every
@@ -601,7 +565,7 @@ fn sweep_tombstones(core: &FlushCore) {
     let mut max_removed = 0;
     for (k, ts) in ready {
         let mut data = core.shards[shard_of(&k)].write().unwrap();
-        let dead = data.get(&k).is_some_and(|c| c.latest.is_none() && c.latest_ts == ts);
+        let dead = data.get(&k).is_some_and(|c| c.latest().is_none() && c.latest_ts == ts);
         if dead {
             data.remove(&k);
             max_removed = max_removed.max(ts);
@@ -619,6 +583,8 @@ pub struct Engine {
     clock: AtomicU64,
     /// Owned solely by `Engine`, so `Drop` is the only joiner.
     flusher: Mutex<Option<JoinHandle<()>>>,
+    /// One checkpoint at a time.
+    ckpt_lock: Mutex<()>,
     /// Durability mode. If false (opt-in via `DBSTRIKE_SYNC=0`), commit_batch
     /// applies writes directly to shards and skips the WAL entirely — Redis's
     /// default behavior. Trade-off is honest: a crash loses recent writes.
@@ -660,7 +626,7 @@ impl Engine {
                         // The checkpoint compacted away this key's history:
                         // reads before this version can't be answered.
                         chain.pruned_ts = chain.pruned_ts.max(m.ts.saturating_sub(1).max(1));
-                        chain.push(m.ts, m.value);
+                        chain.push(m.ts, m.value, 0);
                     }
                 }
                 Err(e) => {
@@ -676,6 +642,21 @@ impl Engine {
         }
 
         // Step 2 — WAL on top.
+        // A checkpoint that crashed after rotating left `<wal>.ckpt`: those
+        // commits are not in any snapshot yet, so replay them first. (If the
+        // crash came after the new snapshot was written, re-applying these
+        // older versions is harmless: chains order versions by ts.)
+        let pending = pending_path_for(&wal_path);
+        if pending.exists() {
+            let mut seg = Wal::open(&pending)?;
+            seg.replay_with(|rec| {
+                for m in decode_records(&rec) {
+                    max_ts = max_ts.max(m.ts);
+                    let s = shard_of(&m.key);
+                    shard_data[s].entry(m.key).or_default().push(m.ts, m.value, 0);
+                }
+            })?;
+        }
         // Streamed: frames are applied as they are read instead of first
         // materializing the entire log (a 246 MB WAL used to need ~2× that
         // in RAM just to boot).
@@ -684,7 +665,7 @@ impl Engine {
             for m in decode_records(&rec) {
                 max_ts = max_ts.max(m.ts);
                 let s = shard_of(&m.key);
-                shard_data[s].entry(m.key).or_default().push(m.ts, m.value);
+                shard_data[s].entry(m.key).or_default().push(m.ts, m.value, 0);
             }
         })?;
 
@@ -692,7 +673,7 @@ impl Engine {
         let mut gc_horizon = 0u64;
         for m in shard_data.iter_mut() {
             m.retain(|_, c| {
-                let keep = c.latest.is_some();
+                let keep = c.latest().is_some();
                 if !keep {
                     gc_horizon = gc_horizon.max(c.latest_ts);
                 }
@@ -701,7 +682,7 @@ impl Engine {
         }
         let kv_live: i64 = shard_data
             .iter()
-            .map(|m| m.range(b"kv:".to_vec()..b"kv;".to_vec()).filter(|(_, c)| c.latest.is_some()).count() as i64)
+            .map(|m| m.range(b"kv:".to_vec()..b"kv;".to_vec()).filter(|(_, c)| c.latest().is_some()).count() as i64)
             .sum();
         let shards: Vec<RwLock<BTreeMap<Key, Chain>>> =
             shard_data.into_iter().map(RwLock::new).collect();
@@ -726,6 +707,8 @@ impl Engine {
             active: Mutex::new(BTreeMap::new()),
             graveyard: Mutex::new(Vec::new()),
             gc_horizon: AtomicU64::new(gc_horizon),
+            pin_ts: AtomicU64::new(0),
+            last_appended: AtomicU64::new(max_ts),
         });
 
         // Start the background group-commit flusher. It wakes on new writes or
@@ -739,6 +722,7 @@ impl Engine {
             wal_path,
             clock: AtomicU64::new(max_ts),
             flusher: Mutex::new(Some(handle)),
+            ckpt_lock: Mutex::new(()),
             sync_writes,
         }))
     }
@@ -1325,8 +1309,10 @@ fn spawn_flusher(core: Arc<FlushCore>, wal_path: PathBuf) -> JoinHandle<()> {
             if frames.is_empty() {
                 return Ok(());
             }
+            let max_ts = batch.iter().map(|pw| pw.ts).max().unwrap_or(0);
             let mut wal = core.wal.lock().unwrap();
             wal.append_frames(&frames)?;
+            core.last_appended.fetch_max(max_ts, Ordering::SeqCst);
             wal.sync()
         })();
 
@@ -1472,49 +1458,127 @@ fn perform_flush_all(core: &FlushCore, wal_path: &Path, bak: &str) -> io::Result
     ///
     /// Returns (records_snapshotted, snap_file_bytes).
     pub fn checkpoint(&self) -> io::Result<(u64, u64)> {
-        // Hold the WAL mutex for the whole checkpoint. New commits queue on
-        // `write_queue` and are drained by the flusher — but the flusher can't
-        // touch the WAL file while we hold this lock, so no writes race the
-        // snapshot boundary.
-        let mut wal_g = self.core.wal.lock().unwrap();
-
-        // Collect one mutation per live key from the CURRENT visible state.
-        let snapshot_ts = self.clock.load(Ordering::SeqCst);
-        let mut muts: Vec<Mutation> = Vec::new();
-        for shard in &self.core.shards {
-            let data = shard.read().unwrap();
-            for (key, chain) in data.iter() {
-                // Take the latest (post-prune) view; skip pure tombstones with
-                // no live successor — they were never durable state anyway.
-                // Tombstones are dropped: the snapshot IS the whole world at
-                // this point and the WAL is truncated right after, so there is
-                // nothing older for a tombstone to shadow. Writing them kept
-                // every key ever deleted in the snapshot forever.
-                if let Some(last) = chain.versions.last().filter(|v| !matches!(v.value, Value::Tombstone)) {
-                    muts.push(Mutation {
-                        key: key.clone(),
-                        value: last.value.clone(),
-                        ts: last.ts,
-                    });
+        // NON-BLOCKING. The old checkpoint held the WAL mutex while copying
+        // the entire dataset and writing the snapshot, stalling every commit
+        // for the duration. Now writers are blocked only for the instant it
+        // takes to rotate the log:
+        //   1. Under the WAL lock: rename the live WAL to `<wal>.ckpt` and
+        //      open a fresh one. S = highest ts in the rotated segment; every
+        //      later commit has a larger ts and lands in the new WAL.
+        //   2. Pin S: register it as an open snapshot (tombstone GC keeps
+        //      what S needs) and as `pin_ts` (version pruning keeps the
+        //      version S reads).
+        //   3. Stream the state visible at S into `<snap>.tmp`, one shard at
+        //      a time, fsync, atomically rename over `<snap>`.
+        //   4. Delete `<wal>.ckpt` — the snapshot now covers it.
+        // Crash at any point: recovery = snapshot + `.ckpt` (if present) +
+        // live WAL, which is complete either way.
+        let _one = self.ckpt_lock.lock().unwrap();
+        let pending = pending_path_for(&self.wal_path);
+        let snap_ts = {
+            let mut wal = self.core.wal.lock().unwrap();
+            wal.sync()?;
+            if pending.exists() {
+                // An earlier checkpoint died after rotating. Its segment is
+                // still uncovered: fold the live WAL into it (keeping the
+                // order snapshot → .ckpt → live) instead of overwriting it.
+                let mut seg = OpenOptions::new().append(true).open(&pending)?;
+                let mut live = File::open(&self.wal_path)?;
+                io::copy(&mut live, &mut seg)?;
+                seg.sync_all()?;
+                wal.truncate()?;
+            } else {
+                std::fs::rename(&self.wal_path, &pending)?;
+                *wal = Wal::open(&self.wal_path)?;
+                crate::wal::sync_parent_dir(&self.wal_path);
+            }
+            self.core.last_appended.load(Ordering::SeqCst)
+        };
+        // Pin S (register under the GC lock, like `begin`).
+        {
+            let mut a = self.core.active.lock().unwrap();
+            *a.entry(snap_ts).or_insert(0) += 1;
+        }
+        self.core.pin_ts.store(snap_ts, Ordering::SeqCst);
+        let result = (|| -> io::Result<(u64, u64)> {
+            // Everything up to S was appended; wait until it is also applied.
+            while self.core.visible_ts.load(Ordering::SeqCst) < snap_ts {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let snap_path = snap_path_for(&self.wal_path);
+            let n = self.write_snapshot_at(&snap_path, snap_ts)?;
+            std::fs::remove_file(&pending)?;
+            crate::wal::sync_parent_dir(&self.wal_path);
+            let bytes = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
+            Ok((n, bytes))
+        })();
+        self.core.pin_ts.store(0, Ordering::SeqCst);
+        {
+            let mut a = self.core.active.lock().unwrap();
+            if let Some(c) = a.get_mut(&snap_ts) {
+                *c -= 1;
+                if *c == 0 {
+                    a.remove(&snap_ts);
                 }
             }
         }
-        let n = muts.len() as u64;
+        result
+    }
 
-        // Durable snapshot write (tmp + fsync + atomic rename).
-        let snap_path = snap_path_for(&self.wal_path);
-        write_snapshot(&snap_path, &muts)?;
-
-        // WAL truncate — safe now that the snapshot is durable on disk.
-        wal_g.truncate()?;
-
-        // Nudge the clock so the next commit's ts > any snapshotted ts.
-        // (Snapshot uses per-record ts, but the trailing marker also matters
-        // if we ever want to skip WAL records with ts <= snapshot_ts.)
-        self.clock.fetch_max(snapshot_ts, Ordering::SeqCst);
-
-        let bytes = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
-        Ok((n, bytes))
+    /// Stream every live key visible at `snap` into the snapshot file
+    /// (format: `[count u64][len u32, mutation]*[crc32 u32]`), holding each
+    /// shard's read lock only while copying that shard. The state at a
+    /// pinned snapshot is immutable, so the counting pass and the writing
+    /// pass agree.
+    fn write_snapshot_at(&self, snap_path: &Path, snap: u64) -> io::Result<u64> {
+        let tmp_path: PathBuf = {
+            let mut s = snap_path.as_os_str().to_owned();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        let count: u64 = self
+            .core
+            .shards
+            .iter()
+            .map(|sh| sh.read().unwrap().values().filter(|c| c.visible(snap).is_some()).count() as u64)
+            .sum();
+        let f = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp_path)?;
+        let mut w = io::BufWriter::with_capacity(1 << 20, f);
+        let mut crc = crate::crc::Crc32Hasher::default();
+        let mut emit = |w: &mut io::BufWriter<File>, b: &[u8]| -> io::Result<()> {
+            crc.update(b);
+            w.write_all(b)
+        };
+        emit(&mut w, &count.to_le_bytes())?;
+        let mut written = 0u64;
+        for sh in &self.core.shards {
+            let page: Vec<Vec<u8>> = {
+                let data = sh.read().unwrap();
+                data.iter()
+                    .filter_map(|(k, c)| {
+                        let v = c.visible(snap)?;
+                        let ts = c.versions.iter().rev().find(|x| x.ts <= snap).map_or(0, |x| x.ts);
+                        Some(Mutation { key: k.clone(), value: v.clone(), ts }.encode())
+                    })
+                    .collect()
+            };
+            for rec in page {
+                emit(&mut w, &(rec.len() as u32).to_le_bytes())?;
+                emit(&mut w, &rec)?;
+                written += 1;
+            }
+        }
+        if written != count {
+            return Err(io::Error::new(io::ErrorKind::Other, "snapshot changed while pinned (bug)"));
+        }
+        let sum = crc.finish();
+        w.write_all(&sum.to_le_bytes())?;
+        let f = w.into_inner().map_err(|e| e.into_error())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp_path, snap_path)?;
+        crate::wal::sync_parent_dir(snap_path);
+        Ok(written)
     }
 
     /// Current WAL size in bytes — callers use this to decide whether a
@@ -1659,7 +1723,7 @@ impl Store for OpStore<'_> {
             return live(v);
         }
         let data = self.core.shards[shard_of(key)].read().unwrap();
-        data.get(key).and_then(|c| c.latest.clone())
+        data.get(key).and_then(|c| c.latest().cloned())
     }
 
     fn put(&mut self, key: Key, value: Value) {
@@ -1684,7 +1748,7 @@ impl Store for OpStore<'_> {
         let mk = |rev: bool| -> [It<'_>; 3] {
             let w = self.writes.range(range.clone()).map(|(k, v)| (k, Some(v)));
             let o = self.overlay.range(range.clone()).map(|(k, v)| (k, Some(v)));
-            let d = data.range(range.clone()).map(|(k, c)| (k, c.latest.as_ref()));
+            let d = data.range(range.clone()).map(|(k, c)| (k, c.latest()));
             if rev {
                 [Box::new(w.rev()), Box::new(o.rev()), Box::new(d.rev())]
             } else {
@@ -2163,6 +2227,70 @@ mod tests {
         assert!(e.get_at_checked(b"k", stamps[1]).is_err());
         let last = *stamps.last().unwrap();
         assert!(matches!(e.get_at_checked(b"k", last), Ok(Some(Value::Int(_)))));
+    }
+
+    /// Writes that land while a checkpoint is running are neither blocked
+    /// nor lost, and recovery = snapshot + live WAL reproduces everything.
+    #[test]
+    fn checkpoint_does_not_lose_concurrent_writes() {
+        let p = tmp("ckpt_conc.wal");
+        let _ = std::fs::remove_file(snap_path_for(&p));
+        {
+            let e = Engine::open(&p).unwrap();
+            for i in 0..5000u32 {
+                e.put(format!("pre{i}").into_bytes(), Value::Int(i as i64)).unwrap();
+            }
+            let w = {
+                let e = Arc::clone(&e);
+                std::thread::spawn(move || {
+                    for i in 0..2000u32 {
+                        e.put(format!("during{i}").into_bytes(), Value::Int(i as i64)).unwrap();
+                        e.put(b"hot".to_vec(), Value::Int(i as i64)).unwrap();
+                    }
+                })
+            };
+            for _ in 0..3 {
+                e.checkpoint().unwrap();
+            }
+            w.join().unwrap();
+            assert!(!pending_path_for(&p).exists());
+        }
+        let e = Engine::open(tmp_keep("ckpt_conc.wal")).unwrap();
+        for i in (0..5000u32).step_by(97) {
+            assert!(matches!(e.get(format!("pre{i}").as_bytes()), Some(Value::Int(v)) if v == i as i64));
+        }
+        for i in (0..2000u32).step_by(37) {
+            assert!(e.get(format!("during{i}").as_bytes()).is_some(), "during{i} lost");
+        }
+        assert!(matches!(e.get(b"hot"), Some(Value::Int(1999))));
+    }
+
+    /// A checkpoint that died after rotating leaves `<wal>.ckpt`; recovery
+    /// must replay it, and the next checkpoint must fold into it.
+    #[test]
+    fn crashed_checkpoint_rotation_recovers() {
+        let p = tmp("ckpt_crash.wal");
+        let _ = std::fs::remove_file(snap_path_for(&p));
+        let _ = std::fs::remove_file(pending_path_for(&p));
+        {
+            let e = Engine::open(&p).unwrap();
+            e.put(b"a".to_vec(), Value::Int(1)).unwrap();
+            e.put(b"b".to_vec(), Value::Int(2)).unwrap();
+        }
+        // Simulate "rotated, then crashed before the snapshot".
+        std::fs::rename(&p, pending_path_for(&p)).unwrap();
+        {
+            let e = Engine::open(tmp_keep("ckpt_crash.wal")).unwrap();
+            assert!(matches!(e.get(b"a"), Some(Value::Int(1))), "pending segment replayed");
+            e.put(b"c".to_vec(), Value::Int(3)).unwrap();
+            e.checkpoint().unwrap(); // folds live WAL into the pending segment
+            assert!(!pending_path_for(&p).exists());
+            e.delete(b"b".to_vec()).unwrap();
+        }
+        let e = Engine::open(tmp_keep("ckpt_crash.wal")).unwrap();
+        assert!(matches!(e.get(b"a"), Some(Value::Int(1))));
+        assert!(e.get(b"b").is_none());
+        assert!(matches!(e.get(b"c"), Some(Value::Int(3))));
     }
 
     #[test]
