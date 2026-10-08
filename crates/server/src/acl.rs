@@ -672,8 +672,19 @@ pub fn command_categories(cmd: &str) -> &'static [PermCategory] {
         "PING" | "ECHO" | "QUIT" | "HELLO" | "AUTH" | "CLIENT" | "SELECT" | "RESET" | "TIME" | "COMMAND" => &[Connection],
         "INFO" | "DBSIZE" | "CDCLEN" => &[Admin, Read],
         "GET" | "MGET" | "KEYS" | "EXISTS" | "TYPE" | "TTL" | "PTTL" | "STRLEN" | "GETAT" | "SCAN" | "GETRANGE" => &[Read],
-        "SET" | "MSET" | "DEL" | "UNLINK" | "INCR" | "INCRBY" | "DECR" | "DECRBY" | "APPEND" | "GETSET" | "GETDEL"
-        | "SETNX" | "EXPIRE" | "PEXPIRE" | "PERSIST" => &[Write],
+        "SET" | "MSET" | "MSETNX" | "DEL" | "UNLINK" | "INCR" | "INCRBY" | "INCRBYFLOAT" | "DECR" | "DECRBY"
+        | "APPEND" | "GETSET" | "GETDEL" | "GETEX" | "SETNX" | "SETEX" | "PSETEX" | "SETRANGE" | "RENAME" | "RENAMENX"
+        | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" => &[Write],
+        "EXPIRETIME" | "PEXPIRETIME" => &[Read],
+        "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" => &[Connection],
+        "HGET" | "HMGET" | "HEXISTS" | "HLEN" | "HGETALL" | "HKEYS" | "HVALS" | "HSTRLEN" | "LLEN" | "LINDEX"
+        | "LRANGE" | "LPOS" | "SISMEMBER" | "SMISMEMBER" | "SCARD" | "SMEMBERS" | "SRANDMEMBER" | "SINTER"
+        | "SUNION" | "SDIFF" | "ZSCORE" | "ZMSCORE" | "ZCARD" | "ZCOUNT" | "ZRANK" | "ZREVRANK" | "ZRANGE"
+        | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" => &[Read],
+        "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX"
+        | "LPOP" | "RPOP" | "BLPOP" | "BRPOP" | "LSET" | "LTRIM" | "LREM" | "LINSERT" | "RPOPLPUSH" | "LMOVE"
+        | "SADD" | "SREM" | "SPOP" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "SMOVE" | "ZADD" | "ZREM"
+        | "ZINCRBY" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZPOPMIN" | "ZPOPMAX" => &[Write],
         "FLUSHALL" | "FLUSHDB" | "CONFIG" | "CHECKPOINT" | "MEMTRACK" | "SHUTDOWN" | "ACL" | "VSNAPSHOT"
         | "GPU.LOAD" | "GPU.UNLOAD" | "GPU.MODE" | "GPU.SWEEP" | "CACHE.CLEAR" | "CACHE.BUGS" | "CACHE.TRACES" => &[Admin, Dangerous],
         "GPU.INFO" => &[Admin, Read],
@@ -710,8 +721,17 @@ pub fn command_keys<'a>(cmd: &str, args: &'a [Vec<u8>]) -> Vec<&'a [u8]> {
         | "EXPIRE" | "PEXPIRE" | "PERSIST" | "GETSET" | "GETDEL" | "SETNX" | "GETRANGE" => {
             args.first().map(|a| vec![a.as_slice()]).unwrap_or_default()
         }
-        "DEL" | "UNLINK" | "MGET" | "EXISTS" => args.iter().map(|a| a.as_slice()).collect(),
-        "MSET" => args.iter().step_by(2).map(|a| a.as_slice()).collect(),
+        "DEL" | "UNLINK" | "MGET" | "EXISTS" | "WATCH" | "SINTER" | "SUNION" | "SDIFF" | "SINTERSTORE"
+        | "SUNIONSTORE" | "SDIFFSTORE" => args.iter().map(|a| a.as_slice()).collect(),
+        "MSET" | "MSETNX" => args.iter().step_by(2).map(|a| a.as_slice()).collect(),
+        "RENAME" | "RENAMENX" | "SMOVE" | "RPOPLPUSH" | "LMOVE" => args.iter().take(2).map(|a| a.as_slice()).collect(),
+        "BLPOP" | "BRPOP" => args.iter().take(args.len().saturating_sub(1)).map(|a| a.as_slice()).collect(),
+        "SETEX" | "PSETEX" | "GETEX" | "SETRANGE" | "INCRBYFLOAT" | "EXPIREAT" | "PEXPIREAT" | "EXPIRETIME"
+        | "PEXPIRETIME" => args.first().map(|a| vec![a.as_slice()]).unwrap_or_default(),
+        // Every hash/list/set/zset command takes its key first.
+        c if crate::keyspace::is_keyspace_cmd(c) && !matches!(c, "PING" | "ECHO" | "TIME") => {
+            args.first().map(|a| vec![a.as_slice()]).unwrap_or_default()
+        }
         _ => Vec::new(),
     }
 }

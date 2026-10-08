@@ -22,6 +22,7 @@
 
 mod acl;
 mod pubsub;
+mod keyspace;
 
 /// Keep the allocator's books for this process.
 ///
@@ -84,6 +85,8 @@ struct Db {
     pubsub: pubsub::Broker,
     /// Open SCAN cursors (id → next key to resume from).
     scan_cursors: Mutex<HashMap<u64, Vec<u8>>>,
+    /// Redis keyspace executor (strings, TTL, hash/list/set/zset, MULTI).
+    ks: keyspace::Keyspace,
 }
 
 /// SCAN cursor ids → resume key. Cursors are server-side so a scan costs
@@ -167,6 +170,7 @@ fn main() -> std::io::Result<()> {
     }
 
     let crdts = load_crdts(&engine);
+    let ks = keyspace::Keyspace::open(Arc::clone(&engine));
     let db = Arc::new(Db {
         engine,
         reactive,
@@ -184,7 +188,19 @@ fn main() -> std::io::Result<()> {
         acl,
         pubsub: pubsub::Broker::default(),
         scan_cursors: Mutex::new(HashMap::new()),
+        ks,
     });
+    // Active expiry: reap keys whose TTL has passed, in deadline order, so
+    // expired keys don't linger until someone happens to touch them.
+    {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if db.ks.expiry.any() {
+                while db.ks.reap(1000) == 1000 {}
+            }
+        });
+    }
 
     START.get_or_init(std::time::Instant::now);
     let listener = TcpListener::bind(&addr)?;
@@ -274,6 +290,11 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
     let mut resp3_conn = false;
     let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut client_name: Vec<u8> = Vec::new();
+    // MULTI/EXEC state: queued commands, whether queuing hit an error (→
+    // EXECABORT), and WATCHed keys with the snapshot they were watched at.
+    let mut multi: Option<Vec<Vec<Vec<u8>>>> = None;
+    let mut multi_err = false;
+    let mut watches: Vec<(Vec<u8>, u64)> = Vec::new();
 
     // NOTE: a geometric parse-retry backoff was tried here and REVERTED.
     //
@@ -466,7 +487,75 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
             }
             if db.acl.needs_permission_check() {
                 if let Some(e) = acl_denial(&db, &current_user, &name, args) {
+                    if multi.is_some() {
+                        multi_err = true;
+                    }
                     write_resp_buf_as(&mut out, &e, resp3_conn)?;
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // ── Transactions ──────────────────────────────────────────
+            // EXEC runs the queue inside ONE engine transaction (see
+            // keyspace::exec_multi): atomic, isolated and durable. Only
+            // keyspace commands can be queued; anything else is refused at
+            // queue time and aborts the EXEC, as Redis does for bad commands.
+            {
+                let reply: Option<Resp> = match name.as_str() {
+                    "MULTI" if multi.is_some() => Some(err("MULTI calls can not be nested")),
+                    "MULTI" => {
+                        multi = Some(Vec::new());
+                        multi_err = false;
+                        Some(Resp::Simple("OK".into()))
+                    }
+                    "EXEC" | "DISCARD" if multi.is_none() => Some(err(&format!("{name} without MULTI"))),
+                    "DISCARD" => {
+                        multi = None;
+                        watches.clear();
+                        Some(Resp::Simple("OK".into()))
+                    }
+                    "EXEC" => {
+                        let queue = multi.take().unwrap_or_default();
+                        let r = if multi_err {
+                            err("EXECABORT Transaction discarded because of previous errors.")
+                        } else {
+                            match db.ks.exec_multi(&queue, &watches) {
+                                keyspace::ExecResult::Aborted => Resp::Nil,
+                                keyspace::ExecResult::Done(v) => Resp::Array(v),
+                            }
+                        };
+                        watches.clear();
+                        multi_err = false;
+                        Some(r)
+                    }
+                    "WATCH" if multi.is_some() => Some(err("WATCH inside MULTI is not allowed")),
+                    "WATCH" if args.is_empty() => Some(err("wrong number of arguments for 'watch' command")),
+                    "WATCH" => {
+                        let snap = db.engine.snapshot();
+                        watches.extend(args.iter().map(|k| (k.clone(), snap)));
+                        Some(Resp::Simple("OK".into()))
+                    }
+                    "UNWATCH" => {
+                        watches.clear();
+                        Some(Resp::Simple("OK".into()))
+                    }
+                    _ if multi.is_some() && name != "QUIT" => {
+                        if keyspace::is_keyspace_cmd(&name) {
+                            multi.as_mut().unwrap().push(cmds[i].clone());
+                            Some(Resp::Simple("QUEUED".into()))
+                        } else {
+                            multi_err = true;
+                            Some(err(&format!(
+                                "Command '{}' cannot be queued: only keyspace commands (strings, keys, TTL, hash, list, set, zset) are transactional",
+                                name.to_lowercase()
+                            )))
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(r) = reply {
+                    write_resp_buf_as(&mut out, &r, resp3_conn)?;
                     i += 1;
                     continue;
                 }
@@ -521,10 +610,28 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                         && cmd.len() >= 3
                         && (cmd.len() - 1) % 2 == 0)
             }
-            if is_coalescable_set(&cmds[i]) {
+            // A SET over a key that currently holds a hash/list/set/zset must
+            // delete its elements, which only the executor does; such a
+            // command ends the run and goes through the normal path.
+            let over_collection = |cmd: &[Vec<u8>]| -> bool {
+                if !db.ks.has_collections() {
+                    return false;
+                }
+                let keys: Vec<&Vec<u8>> = if cmd[0].eq_ignore_ascii_case(b"SET") {
+                    vec![&cmd[1]]
+                } else {
+                    cmd[1..].iter().step_by(2).collect()
+                };
+                keys.into_iter().any(|k| {
+                    let mut kk = b"kv:".to_vec();
+                    kk.extend_from_slice(k);
+                    matches!(db.engine.get(&kk), Some(Value::Meta(_)))
+                })
+            };
+            if is_coalescable_set(&cmds[i]) && !over_collection(&cmds[i]) {
                 let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 let mut cmds_in_run = 0usize;
-                while i < cmds.len() && is_coalescable_set(&cmds[i]) {
+                while i < cmds.len() && is_coalescable_set(&cmds[i]) && !over_collection(&cmds[i]) {
                     // Every command in the run is permission-checked, not just
                     // the first (the run used to swallow a denied MSET after
                     // an allowed SET). A denied command ends the run; the
@@ -558,7 +665,24 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                     cmds_in_run += 1;
                     i += 1;
                 }
-                match db.kv.set_batch(kvs) {
+                // SET drops any TTL (Redis): clear it in the SAME commit.
+                let mut cleared: Vec<Vec<u8>> = Vec::new();
+                let mut entries: Vec<(Vec<u8>, Value)> = Vec::with_capacity(kvs.len());
+                for (k, v) in kvs {
+                    if db.ks.expiry.any() && db.ks.expiry.get(&k[3..]).is_some() {
+                        let mut ek = b"exp:".to_vec();
+                        ek.extend_from_slice(&k[3..]);
+                        entries.push((ek, Value::Tombstone));
+                        cleared.push(k[3..].to_vec());
+                    }
+                    entries.push((k, Value::Bytes(v)));
+                }
+                let res = db.engine.put_batch(entries);
+                if res.is_ok() && !cleared.is_empty() {
+                    let ch: Vec<(Vec<u8>, Option<u64>)> = cleared.into_iter().map(|k| (k, None)).collect();
+                    db.ks.expiry.apply(&ch);
+                }
+                match res {
                     Ok(_) => {
                         // One "+OK\r\n" per *command* (not per key), so a
                         // coalesced run of SET/SET or a single MSET each emit
@@ -586,7 +710,7 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
             // group-commit fsync instead of paying one fsync per command.
             fn incr_op(cmd: &[Vec<u8>]) -> Option<(Vec<u8>, i64)> {
                 let n = String::from_utf8_lossy(&cmd[0]).to_ascii_uppercase();
-                let num = |a: &[u8]| std::str::from_utf8(a).ok()?.parse::<i64>().ok();
+                let num = |a: &[u8]| storage::engine::parse_strict_i64(a);
                 match (n.as_str(), cmd.len()) {
                     ("INCR", 2) => Some((cmd[1].clone(), 1)),
                     ("DECR", 2) => Some((cmd[1].clone(), -1)),
@@ -609,6 +733,11 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                     i += 1;
                 }
                 let n = ops.len();
+                if db.ks.expiry.any() {
+                    for (k, _) in &ops {
+                        db.ks.reap_if_expired(k);
+                    }
+                }
                 match db.kv.incr_many(ops) {
                     Ok(results) => {
                         for r in results {
@@ -625,6 +754,29 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                             write_resp_buf_as(&mut out, &e, resp3_conn)?;
                         }
                     }
+                }
+                continue;
+            }
+
+            // Coalesce a pipelined run of other keyspace WRITES (LPUSH, HSET,
+            // SADD, ZADD, EXPIRE, ...): each still executes on the commit path
+            // in order with its own reply, but the run shares one fsync.
+            fn batchable(cmd: &[Vec<u8>]) -> Option<String> {
+                let n = String::from_utf8_lossy(&cmd[0]).to_ascii_uppercase();
+                (keyspace::is_keyspace_write(&n) && !matches!(n.as_str(), "SET" | "MSET" | "INCR" | "DECR" | "INCRBY" | "DECRBY")).then_some(n)
+            }
+            if !trace && i + 1 < cmds.len() && batchable(&cmds[i]).is_some() && batchable(&cmds[i + 1]).is_some() {
+                let mut run: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+                while i < cmds.len() {
+                    let Some(nm) = batchable(&cmds[i]) else { break };
+                    if !run.is_empty() && db.acl.needs_permission_check() && acl_denial(&db, &current_user, &nm, &cmds[i][1..]).is_some() {
+                        break;
+                    }
+                    run.push((nm, cmds[i][1..].to_vec()));
+                    i += 1;
+                }
+                for r in db.ks.run_writes(&run) {
+                    write_resp_buf_as(&mut out, &r, resp3_conn)?;
                 }
                 continue;
             }
@@ -1073,6 +1225,7 @@ fn value_to_resp(v: Option<Value>) -> Resp {
         ),
         Some(Value::Row(row)) => Resp::Array(row_to_resp(row)),
         Some(Value::Tombstone) => Resp::Nil,
+        Some(Value::Meta(_)) => Resp::Simple("<collection header>".into()),
     }
 }
 
@@ -1100,6 +1253,76 @@ fn derive_attr_and_sparse(vec: &[f32], n_buckets: u32, w: usize) -> (u32, Vec<(u
 
 /// Handle AUTH command: `AUTH password` or `AUTH username password`.
 /// Updates `current_user` on success.
+/// Fast paths for the hottest keyspace commands. `None` = use the executor.
+/// They stay exact under TTLs and collections: GET/MGET check the expiry
+/// index and the value type; SET/DEL only bypass the executor while no TTL
+/// or collection exists anywhere (then there is nothing to clear or cascade).
+fn fast_keyspace(db: &Db, name: &str, args: &[Vec<u8>]) -> Option<Resp> {
+    let live = |k: &[u8]| -> Result<Option<Vec<u8>>, ()> {
+        let mut key = b"kv:".to_vec();
+        key.extend_from_slice(k);
+        match db.engine.get(&key) {
+            None => Ok(None),
+            Some(Value::Meta(_)) => Err(()),
+            Some(v) => {
+                if db.ks.expiry.any() && db.ks.expiry.is_expired(k, keyspace::now_ms()) {
+                    return Ok(None);
+                }
+                Ok(Some(match v {
+                    Value::Bytes(b) => b,
+                    Value::Int(i) => i.to_string().into_bytes(),
+                    _ => return Err(()),
+                }))
+            }
+        }
+    };
+    let plain = !db.ks.has_collections() && !db.ks.expiry.any();
+    match (name, args.len()) {
+        ("GET", 1) => Some(match live(&args[0]) {
+            Ok(Some(v)) => Resp::Bulk(v),
+            Ok(None) => Resp::Nil,
+            Err(()) => err(keyspace::WRONGTYPE),
+        }),
+        ("MGET", n) if n >= 1 => Some(Resp::Array(
+            args.iter().map(|k| live(k).ok().flatten().map_or(Resp::Nil, Resp::Bulk)).collect(),
+        )),
+        ("SET", 2) if plain => Some(match db.kv.set_b(&args[0], &args[1]) {
+            Ok(_) => Resp::Simple("OK".into()),
+            Err(e) => err(&e.to_string()),
+        }),
+        ("DEL" | "UNLINK", n) if n >= 1 && plain => {
+            let keys: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+            Some(match db.kv.del_many(&keys) {
+                Ok(n) => Resp::Int(n as i64),
+                Err(e) => err(&e.to_string()),
+            })
+        }
+        ("INCR" | "DECR", 1) | ("INCRBY" | "DECRBY", 2) => {
+            let by = match name {
+                "INCR" => 1,
+                "DECR" => -1,
+                _ => {
+                    let v = storage::engine::parse_strict_i64(&args[1]);
+                    match (name, v) {
+                        ("INCRBY", Some(v)) => v,
+                        ("DECRBY", Some(v)) => match v.checked_neg() {
+                            Some(v) => v,
+                            None => return Some(err("decrement would overflow")),
+                        },
+                        _ => return Some(err("value is not an integer or out of range")),
+                    }
+                }
+            };
+            db.ks.reap_if_expired(&args[0]);
+            Some(match db.kv.incr_by_lossy(&args[0], by) {
+                Ok(n) => Resp::Int(n),
+                Err(e) => err(&e),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Durable key for a CRDT: `crdt:<kind>:<name>`.
 fn crdt_key(kind: &str, name: &str) -> Vec<u8> {
     format!("crdt:{kind}:{name}").into_bytes()
@@ -1277,6 +1500,14 @@ fn redact_cmd(name: &str, args: &[Vec<u8>]) -> String {
 }
 
 fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
+    // Redis keyspace commands (strings, TTL, hash/list/set/zset) run in the
+    // transactional executor; the hottest shapes keep zero-overhead paths.
+    if keyspace::is_keyspace_cmd(name) {
+        if let Some(r) = fast_keyspace(db, name, args) {
+            return r;
+        }
+        return db.ks.run(name, args);
+    }
     match name {
         "PING" => Resp::Simple("PONG".into()),
         "QUIT" => Resp::Simple("OK".into()),
@@ -1333,48 +1564,6 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
 
 
-        "SET" if args.len() > 2 => {
-            // SET key value [NX|XX] [GET]. Expiry options are refused
-            // explicitly: there is no TTL support, and silently ignoring EX
-            // would leave "temporary" keys alive forever.
-            let (mut nx, mut xx, mut get) = (false, false, false);
-            for o in &args[2..] {
-                match String::from_utf8_lossy(o).to_ascii_uppercase().as_str() {
-                    "NX" => nx = true,
-                    "XX" => xx = true,
-                    "GET" => get = true,
-                    "EX" | "PX" | "EXAT" | "PXAT" | "KEEPTTL" => {
-                        return err("key expiry (EX/PX/EXAT/PXAT/KEEPTTL) is not supported by DB-Strike");
-                    }
-                    _ => return err("syntax error"),
-                }
-            }
-            if nx && xx {
-                return err("syntax error");
-            }
-            let v = args[1].clone();
-            match db.kv.update(&args[0], |cur| {
-                let ok = !(nx && cur.is_some()) && !(xx && cur.is_none());
-                (ok.then(|| Some(v.clone())), (ok, cur))
-            }) {
-                Ok((ok, old)) if get => {
-                    let _ = ok;
-                    old.map_or(Resp::Nil, Resp::Bulk)
-                }
-                Ok((true, _)) => Resp::Simple("OK".into()),
-                Ok((false, _)) => Resp::Nil,
-                Err(e) => err(&e.to_string()),
-            }
-        }
-        "SET" => {
-            if args.len() != 2 {
-                return err("SET requires key value");
-            }
-            match db.kv.set_b(&args[0], &args[1]) {
-                Ok(_) => Resp::Simple("OK".into()),
-                Err(e) => err(&e.to_string()),
-            }
-        }
         // MSET k1 v1 k2 v2 ...  → one put_batch, one fsync for the whole set.
         // Standard Redis multi-set; benchmark tools + real clients depend on it.
         "MSET" => {
@@ -1397,19 +1586,6 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
         // MGET k1 k2 ...  → array of bulk values (or Nil for missing).
         // Companion to MSET; also expected by redis-benchmark.
-        "MGET" => {
-            if args.is_empty() {
-                return err("MGET requires at least one key");
-            }
-            let out: Vec<Resp> = args
-                .iter()
-                .map(|a| match db.kv.get_b(a) {
-                    Some(v) => Resp::Bulk(v),
-                    None => Resp::Nil,
-                })
-                .collect();
-            Resp::Array(out)
-        }
         // DBSIZE → :n live keys across every shard. redis-benchmark checks
         // this at startup to size the working set.
         // User KV keys only, O(1) (was an O(N) walk that counted internals).
@@ -1431,6 +1607,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 // their ghost state too, or MEM.COUNT keeps reporting the
                 // wiped corpus and ids continue past deleted records.
                 db.rag.memory().reset_volatile();
+                db.ks.reload();
                 // CRDT RAM mirror must follow the wiped substrate too.
                 *db.crdt.lock().unwrap() = ConsensusStore { gc: HashMap::new(), pn: HashMap::new(), lww: HashMap::new() };
                 db.rag.invalidate_query_cache();
@@ -1451,64 +1628,6 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             Some(0) if args.len() == 1 => Resp::Simple("OK".into()),
             Some(_) if args.len() == 1 => err("DB index is out of range (DB-Strike has a single keyspace: use 0)"),
             _ => err("invalid DB index"),
-        },
-        "ECHO" => match args {
-            [m] => Resp::Bulk(m.clone()),
-            _ => err("wrong number of arguments for 'echo' command"),
-        },
-        "TIME" => {
-            let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-            Resp::Array(vec![
-                Resp::Bulk(d.as_secs().to_string().into_bytes()),
-                Resp::Bulk(d.subsec_micros().to_string().into_bytes()),
-            ])
-        }
-        "EXISTS" => {
-            if args.is_empty() {
-                return err("wrong number of arguments for 'exists' command");
-            }
-            Resp::Int(args.iter().filter(|k| db.kv.get_b(k).is_some()).count() as i64)
-        }
-        "TYPE" => match args {
-            [k] => Resp::Simple(if db.kv.get_b(k).is_some() { "string" } else { "none" }.into()),
-            _ => err("wrong number of arguments for 'type' command"),
-        },
-        "STRLEN" => match args {
-            [k] => Resp::Int(db.kv.get_b(k).map_or(0, |v| v.len()) as i64),
-            _ => err("wrong number of arguments for 'strlen' command"),
-        },
-        "APPEND" => match args {
-            [k, v] => match db.kv.update(k, |cur| {
-                let mut nv = cur.unwrap_or_default();
-                nv.extend_from_slice(v);
-                let n = nv.len();
-                (Some(Some(nv)), n)
-            }) {
-                Ok(n) => Resp::Int(n as i64),
-                Err(e) => err(&e.to_string()),
-            },
-            _ => err("wrong number of arguments for 'append' command"),
-        },
-        "SETNX" => match args {
-            [k, v] => match db.kv.update(k, |cur| if cur.is_some() { (None, 0) } else { (Some(Some(v.clone())), 1) }) {
-                Ok(n) => Resp::Int(n),
-                Err(e) => err(&e.to_string()),
-            },
-            _ => err("wrong number of arguments for 'setnx' command"),
-        },
-        "GETSET" => match args {
-            [k, v] => match db.kv.update(k, |cur| (Some(Some(v.clone())), cur)) {
-                Ok(old) => old.map_or(Resp::Nil, Resp::Bulk),
-                Err(e) => err(&e.to_string()),
-            },
-            _ => err("wrong number of arguments for 'getset' command"),
-        },
-        "GETDEL" => match args {
-            [k] => match db.kv.update(k, |cur| (cur.as_ref().map(|_| None), cur)) {
-                Ok(old) => old.map_or(Resp::Nil, Resp::Bulk),
-                Err(e) => err(&e.to_string()),
-            },
-            _ => err("wrong number of arguments for 'getdel' command"),
         },
         // CONFIG GET <pattern> / CONFIG SET <k> <v> — redis-benchmark probes
         // `CONFIG GET save` (and others) at startup; an unknown command made
@@ -1554,53 +1673,36 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 err("CONFIG subcommand must be GET or SET")
             }
         }
-        "GET" => {
-            if args.len() != 1 {
-                return err("GET requires key");
+        // Blocking pops. Connections are thread-per-client, so waiting here
+        // only parks this client's thread; it polls every 10 ms.
+        "BLPOP" | "BRPOP" => {
+            if args.len() < 2 {
+                return err(&format!("wrong number of arguments for '{}' command", name.to_lowercase()));
             }
-            match db.kv.get_b(&args[0]) {
-                Some(v) => Resp::Bulk(v),
-                None => Resp::Nil,
-            }
-        }
-        "DEL" | "UNLINK" => {
-            if args.is_empty() {
-                return err("DEL requires at least one key");
-            }
-            let keys: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
-            match db.kv.del_many(&keys) {
-                Ok(n) => Resp::Int(n as i64),
-                Err(e) => err(&e.to_string()),
-            }
-        }
-        "INCR" | "INCRBY" | "DECR" | "DECRBY" => {
-            let (key, by) = if name == "INCR" || name == "DECR" {
-                if args.len() != 1 {
-                    return err(&format!("wrong number of arguments for '{}' command", name.to_lowercase()));
-                }
-                (args[0].clone(), if name == "INCR" { 1 } else { -1 })
-            } else {
-                if args.len() != 2 {
-                    return err(&format!("wrong number of arguments for '{}' command", name.to_lowercase()));
-                }
-                let by: i64 = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
-                    Some(n) if name == "INCRBY" => n,
-                    Some(n) => match n.checked_neg() {
-                        Some(n) => n,
-                        None => return err("decrement would overflow"),
-                    },
-                    None => return err("value is not an integer or out of range"),
-                };
-                (args[0].clone(), by)
+            let timeout = match std::str::from_utf8(&args[args.len() - 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                Some(t) if t >= 0.0 && t.is_finite() => t,
+                _ => return err("timeout is not a float or out of range"),
             };
-            match db.kv.incr_by_lossy(&key, by) {
-                Ok(n) => Resp::Int(n),
-                Err(e) => err(&e),
+            let pop = if name == "BLPOP" { "LPOP" } else { "RPOP" };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout);
+            loop {
+                for k in &args[..args.len() - 1] {
+                    match db.ks.run(pop, std::slice::from_ref(k)) {
+                        Resp::Bulk(v) => return Resp::Array(vec![Resp::Bulk(k.clone()), Resp::Bulk(v)]),
+                        e @ Resp::Error(_) => return e,
+                        _ => {}
+                    }
+                }
+                if timeout > 0.0 && std::time::Instant::now() >= deadline {
+                    return Resp::Nil;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         "KEYS" => {
             let pat: &[u8] = args.first().map(|a| a.as_slice()).unwrap_or(b"*");
-            let keys = db.kv.keys_glob(pat, |k| acl::glob_match(pat, k));
+            let now = keyspace::now_ms();
+            let keys = db.kv.keys_glob(pat, |k| acl::glob_match(pat, k) && !db.ks.expiry.is_expired(k, now));
             Resp::Array(keys.into_iter().map(Resp::Bulk).collect())
         }
 
@@ -3971,12 +4073,23 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 cur.insert(id, resume);
                 id
             };
-            let type_ok = ty.as_deref().is_none_or(|t| t == "string");
+            let now = keyspace::now_ms();
             let keys: Vec<Resp> = page
                 .into_iter()
-                .filter_map(|(k, _)| k.strip_prefix(b"kv:").map(|u| u.to_vec()))
-                .filter(|k| type_ok && pat.is_none_or(|p| acl::glob_match(p, k)))
-                .map(Resp::Bulk)
+                .filter_map(|(k, v)| {
+                    let user = k.strip_prefix(b"kv:")?.to_vec();
+                    let t = match &v {
+                        Value::Meta(_) => match db.ks.run("TYPE", std::slice::from_ref(&user)) {
+                            Resp::Simple(t) => t,
+                            _ => String::new(),
+                        },
+                        _ => "string".to_string(),
+                    };
+                    let keep = ty.as_deref().is_none_or(|w| w == t)
+                        && pat.is_none_or(|p| acl::glob_match(p, &user))
+                        && !db.ks.expiry.is_expired(&user, now);
+                    keep.then_some(Resp::Bulk(user))
+                })
                 .collect();
             Resp::Array(vec![Resp::Bulk(next.to_string().into_bytes()), Resp::Array(keys)])
         }
@@ -4007,12 +4120,13 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 "# Server\r\nredis_version:7.2.0\r\ndbstrike_version:1.0.0\r\nredis_mode:standalone\r\nprocess_id:{}\r\nuptime_in_seconds:{up}\r\n\r\n\
                  # Clients\r\nconnected_clients_total_seen:{}\r\n\r\n\
                  # Persistence\r\naof_enabled:1\r\nwal_bytes:{}\r\n\r\n\
-                 # Keyspace\r\ndb0:keys={},expires=0,avg_ttl=0\r\n\r\n\
+                 # Keyspace\r\ndb0:keys={},expires={},avg_ttl=0\r\n\r\n\
                  # DB-Strike\r\nsnapshot:{}\r\ncdc_events:{}\r\nengine:unified-mvcc-wal\r\n",
                 std::process::id(),
                 NEXT_CONN_ID.load(std::sync::atomic::Ordering::Relaxed) - 1,
                 db.engine.wal_bytes(),
                 db.engine.kv_count(),
+                db.ks.expiry.len(),
                 db.engine.snapshot(),
                 db.reactive.cdc_len_peek()
             );

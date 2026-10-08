@@ -9,5 +9,5 @@ pub mod engine;
 pub mod value;
 pub mod wal;
 
-pub use engine::{Engine, Key, Mutation, Subscriber, Txn, TxnError, Version};
+pub use engine::{Engine, Key, Mutation, OpFn, OpStore, Store, Subscriber, Txn, TxnError, Version};
 pub use value::Value;
