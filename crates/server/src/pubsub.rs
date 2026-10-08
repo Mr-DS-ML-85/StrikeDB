@@ -10,8 +10,22 @@
 
 use crate::acl::glob_match;
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
+use std::net::TcpStream;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::RwLock;
+
+/// Messages a subscriber may have queued before it is considered too slow
+/// and disconnected (Redis `client-output-buffer-limit pubsub`). Without a
+/// bound, a subscriber that stops reading made the server buffer every
+/// published message in RAM forever. Override with DBSTRIKE_PUBSUB_QUEUE.
+pub fn queue_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("DBSTRIKE_PUBSUB_QUEUE").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(100_000)
+    })
+}
+
+pub type Sender<T> = SyncSender<T>;
 
 #[derive(Clone, Debug)]
 pub enum Msg {
@@ -25,9 +39,34 @@ pub struct Broker {
     channels: RwLock<HashMap<Vec<u8>, HashMap<u64, Sender<Msg>>>>,
     /// pattern -> (subscriber id -> sender)
     patterns: RwLock<HashMap<Vec<u8>, HashMap<u64, Sender<Msg>>>>,
+    /// subscriber id -> a handle on its socket, used to disconnect it when
+    /// its queue overflows (its reader then sees EOF and cleans up).
+    sockets: RwLock<HashMap<u64, TcpStream>>,
 }
 
 impl Broker {
+    pub fn register(&self, id: u64, sock: TcpStream) {
+        self.sockets.write().unwrap().insert(id, sock);
+    }
+
+    pub fn deregister(&self, id: u64) {
+        self.sockets.write().unwrap().remove(&id);
+    }
+
+    /// Drop every subscription of `id` and shut its socket down.
+    fn evict(&self, id: u64) {
+        for map in [&self.channels, &self.patterns] {
+            let mut m = map.write().unwrap();
+            for subs in m.values_mut() {
+                subs.remove(&id);
+            }
+            m.retain(|_, v| !v.is_empty());
+        }
+        if let Some(sock) = self.sockets.write().unwrap().remove(&id) {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     pub fn subscribe(&self, id: u64, channel: &[u8], tx: &Sender<Msg>) {
         self.channels.write().unwrap().entry(channel.to_vec()).or_default().insert(id, tx.clone());
     }
@@ -60,36 +99,29 @@ impl Broker {
     /// received it (the Redis PUBLISH reply). Dead receivers are removed.
     pub fn publish(&self, channel: &[u8], payload: &[u8]) -> usize {
         let mut delivered = 0;
-        let mut dead_exact: Vec<u64> = Vec::new();
+        // Subscribers whose receiver is gone, or whose queue is full.
+        let mut evict: Vec<u64> = Vec::new();
+        let mut deliver = |id: u64, tx: &Sender<Msg>, msg: Msg| match tx.try_send(msg) {
+            Ok(()) => delivered += 1,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => evict.push(id),
+        };
         if let Some(subs) = self.channels.read().unwrap().get(channel) {
             for (id, tx) in subs {
-                let msg = Msg::Message { channel: channel.to_vec(), payload: payload.to_vec() };
-                if tx.send(msg).is_ok() {
-                    delivered += 1;
-                } else {
-                    dead_exact.push(*id);
-                }
+                deliver(*id, tx, Msg::Message { channel: channel.to_vec(), payload: payload.to_vec() });
             }
         }
-        let mut dead_pat: Vec<(Vec<u8>, u64)> = Vec::new();
         for (pat, subs) in self.patterns.read().unwrap().iter() {
             if !glob_match(pat, channel) {
                 continue;
             }
             for (id, tx) in subs {
-                let msg = Msg::PMessage { pattern: pat.clone(), channel: channel.to_vec(), payload: payload.to_vec() };
-                if tx.send(msg).is_ok() {
-                    delivered += 1;
-                } else {
-                    dead_pat.push((pat.clone(), *id));
-                }
+                deliver(*id, tx, Msg::PMessage { pattern: pat.clone(), channel: channel.to_vec(), payload: payload.to_vec() });
             }
         }
-        for id in dead_exact {
-            self.unsubscribe(id, channel);
-        }
-        for (p, id) in dead_pat {
-            self.punsubscribe(id, &p);
+        evict.sort_unstable();
+        evict.dedup();
+        for id in evict {
+            self.evict(id);
         }
         delivered
     }
@@ -122,7 +154,10 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
+    use std::sync::mpsc::sync_channel;
+    fn channel() -> (Sender<Msg>, std::sync::mpsc::Receiver<Msg>) {
+        sync_channel(4)
+    }
 
     #[test]
     fn exact_channels_and_patterns() {
@@ -136,6 +171,18 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), Msg::PMessage { .. }));
         b.unsubscribe(1, b"news");
         assert_eq!(b.publish(b"news", b"z"), 1);
+    }
+
+    #[test]
+    fn slow_subscriber_is_evicted_when_its_queue_fills() {
+        let b = Broker::default();
+        let (tx, _rx) = channel(); // never drained, capacity 4
+        b.subscribe(9, b"c", &tx);
+        for _ in 0..4 {
+            assert_eq!(b.publish(b"c", b"m"), 1);
+        }
+        assert_eq!(b.publish(b"c", b"m"), 0, "5th message overflows");
+        assert_eq!(b.numsub(b"c"), 0, "evicted");
     }
 
     #[test]

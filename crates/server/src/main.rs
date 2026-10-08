@@ -718,7 +718,7 @@ fn subscribe_mode(
     buf: &mut Vec<u8>,
 ) -> std::io::Result<SubExit> {
     use std::collections::{BTreeSet, VecDeque};
-    let (tx, rx) = std::sync::mpsc::channel::<pubsub::Msg>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<pubsub::Msg>(pubsub::queue_limit());
     let resp3 = ctx.resp3;
     let wstream = Arc::clone(stream);
     let forwarder = std::thread::spawn(move || {
@@ -738,6 +738,8 @@ fn subscribe_mode(
         }
     });
     let mut reader = stream.lock().unwrap().try_clone()?;
+    // Lets the broker disconnect this client if it stops reading.
+    db.pubsub.register(ctx.conn_id, reader.try_clone()?);
     let mut chans: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut pats: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut queue: VecDeque<Vec<Vec<u8>>> = initial.into();
@@ -873,6 +875,7 @@ fn subscribe_mode(
         buf.drain(..cursor);
     };
     cleanup(&chans, &pats);
+    db.pubsub.deregister(ctx.conn_id);
     drop(tx); // broker's clones are gone after cleanup → forwarder exits
     let _ = forwarder.join();
     Ok(exit)
