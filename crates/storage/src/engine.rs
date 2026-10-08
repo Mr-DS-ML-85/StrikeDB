@@ -886,6 +886,12 @@ impl Engine {
         }
     }
 
+    /// True when commits wait for an fsync (the default; `DBSTRIKE_SYNC=0`
+    /// turns it off). Network layers use it to decide what can run inline.
+    pub fn is_durable(&self) -> bool {
+        self.sync_writes
+    }
+
     /// Commit ts of the newest version of `key` (0 if never written).
     pub fn key_version(&self, key: &[u8]) -> u64 {
         let data = self.core.shards[shard_of(key)].read().unwrap();

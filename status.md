@@ -266,6 +266,7 @@ GPU.MODE turbo|hybrid|cpu                       GETAT key snap
 
 | Path | Contents |
 |---|---|
+| `crates/server/src/eventloop.rs` | Linux default network layer: one edge-triggered epoll loop per core (`DBSTRIKE_IO_THREADS`), round-robin placement, read-only batches inline, durable batches on a growing blocking pool that writes replies directly and keeps a busy connection until it goes quiet (`DBSTRIKE_NET=threads` = old thread-per-connection) |
 | `crates/server/src/main.rs` | RESP dispatch (~2100 lines of handlers), HELLO, FLUSHALL arm, GPU.MODE, parse_agent_scope, parse_floats |
 | `crates/views/src/vector.rs` | HNSW core: open_ns (parallel rebuild), bulk_load_fbin, merge_segments, quant modes, upload_to_gpu(_if_enabled), vec_at_f32/tier reads, tiered=false mitigation comment (~4728) |
 | `crates/storage/src/engine.rs` | MVCC+WAL, flushall_with_backup, perform_flush_all, PendingWrite.flush_all |

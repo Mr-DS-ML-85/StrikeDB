@@ -24,6 +24,8 @@ mod acl;
 mod pubsub;
 mod keyspace;
 mod replication;
+#[cfg(target_os = "linux")]
+mod eventloop;
 
 /// Keep the allocator's books for this process.
 ///
@@ -142,6 +144,7 @@ fn main() -> std::io::Result<()> {
     if let Some(ref lf) = log_file {
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let _ = writeln!(lf.lock().unwrap(), "[{ts}] DB-Strike starting on {addr}");
+        let _ = LOG_FILE.set(Arc::clone(lf));
     }
 
     let engine = Engine::open(&data_path)?;
@@ -279,6 +282,18 @@ fn main() -> std::io::Result<()> {
     // Rate-limit accept-error logging: under EMFILE the accept loop would
     // otherwise spew thousands of identical lines per second. Print at most
     // once per second, keeping the last error for the periodic line.
+    // Networking: one epoll event loop per core (default), or the original
+    // thread-per-connection server with DBSTRIKE_NET=threads.
+    #[cfg(target_os = "linux")]
+    if std::env::var("DBSTRIKE_NET").map(|v| v != "threads").unwrap_or(true) {
+        let n = std::env::var("DBSTRIKE_IO_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        eprintln!("[NET] event loop: {n} I/O threads");
+        return eventloop::run(db, listener, n);
+    }
     let mut last_accept_err: Option<String> = None;
     let mut last_log = std::time::Instant::now();
 for stream in listener.incoming() {
@@ -287,7 +302,7 @@ for stream in listener.incoming() {
                  let db = Arc::clone(&db);
                  let lf = log_file.clone();
                  std::thread::spawn(move || {
-                     if let Err(e) = handle(s, db, &lf) {
+                     if let Err(e) = handle(s, db) {
                          if !is_benign_disconnect(&e) {
                              log_msg(&lf, &format!("connection error: {e}"));
                          }
@@ -312,69 +327,591 @@ for stream in listener.incoming() {
     Ok(())
 }
 
-fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>) -> std::io::Result<()> {
+/// Per-connection protocol state, owned by whichever thread is currently
+/// serving the connection (an event-loop worker, a blocking-pool thread
+/// running one of its batches, or a dedicated thread in threaded mode).
+struct ConnState {
+    conn_id: u64,
+    /// ACL user this connection is authenticated as ("" = not yet).
+    current_user: String,
+    /// RESP3 negotiated via HELLO 3.
+    resp3: bool,
+    client_name: Vec<u8>,
+    /// MULTI/EXEC: queued commands, whether queuing hit an error (→
+    /// EXECABORT), and WATCHed keys with the snapshot they were watched at.
+    multi: Option<Vec<Vec<Vec<u8>>>>,
+    multi_err: bool,
+    watches: Vec<(Vec<u8>, u64)>,
+    trace: bool,
+}
+
+impl ConnState {
+    fn new(db: &Db) -> Self {
+        ConnState {
+            conn_id: NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            current_user: if db.acl.requires_auth() { String::new() } else { "default".to_string() },
+            resp3: false,
+            client_name: Vec::new(),
+            multi: None,
+            multi_err: false,
+            watches: Vec::new(),
+            trace: std::env::var("DBSTRIKE_TRACE").is_ok_and(|v| v != "0"),
+        }
+    }
+}
+
+/// How a batch left the connection.
+enum BatchEnd {
+    Continue,
+    Quit,
+    /// SUBSCRIBE/PSUBSCRIBE: these commands (and anything pipelined after
+    /// them) must run in subscribe mode.
+    Subscribe(Vec<Vec<Vec<u8>>>),
+    /// REPLSYNC: the connection now carries the replication stream.
+    ReplSync,
+}
+
+/// Process-wide log file (set once at startup; read by `DBSTRIKE_TRACE`).
+static LOG_FILE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+
+/// Drain every complete command from `buf`. `Err` = protocol violation (the
+/// caller replies and closes); an incomplete trailing frame stays in `buf`.
+/// Largest result count / sample size a command accepts; larger requests
+/// are clamped. Counts feed straight into allocations (`with_capacity(k)`,
+/// candidate heaps sized from k), so an unchecked `k 9223372036854775807`
+/// aborted the whole server with a capacity overflow.
+const MAX_COUNT: usize = 1 << 20;
+
+/// Parse a non-negative count argument, clamped to [`MAX_COUNT`].
+fn parse_count(s: &str) -> Option<usize> {
+    s.parse::<usize>().ok().map(|n| n.min(MAX_COUNT))
+}
+
+fn parse_commands(buf: &mut Vec<u8>) -> std::io::Result<Vec<Vec<Vec<u8>>>> {
+    let mut cmds = Vec::new();
+    let mut cursor = 0usize;
+    loop {
+        match try_parse(&buf[cursor..]) {
+            Ok(Some((cmd, consumed))) => {
+                cursor += consumed;
+                if !cmd.is_empty() {
+                    cmds.push(cmd);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                // Run the complete commands before the malformed one first
+                // (as Redis does); the error surfaces on the next call.
+                if !cmds.is_empty() {
+                    break;
+                }
+                return Err(e);
+            }
+        }
+    }
+    if cursor > 0 {
+        buf.drain(..cursor);
+    }
+    Ok(cmds)
+}
+
+/// Execute one parsed batch for a connection, appending every reply to
+/// `out`. This is ALL of the per-command semantics (auth, ACL, replication
+/// read-only, MULTI, coalesced write runs, dispatch); the network layers
+/// (event loop, threaded) only move bytes and call this.
+fn process_batch(db: &Arc<Db>, st: &mut ConnState, mut cmds: Vec<Vec<Vec<u8>>>, out: &mut Vec<u8>) -> std::io::Result<BatchEnd> {
+    let mut quit = false;
+    // Commands from a SUBSCRIBE onward (pipelined commands after it must
+    // be processed in subscribe mode, not silently dropped).
+    let mut subscribe_after_batch: Option<Vec<Vec<Vec<u8>>>> = None;
+    let mut replsync_after_batch = false;
+    let mut i = 0usize;
+    while i < cmds.len() {
+        let name = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
+        let args = &cmds[i][1..];
+
+        // ── ACL: handle AUTH/ACL before permission check ──────────
+        if name == "AUTH" {
+            let resp = dispatch_auth(&db, args, &mut st.current_user);
+            write_resp_buf_as(out, &resp, st.resp3)?;
+            i += 1;
+            continue;
+        }
+        if name == "ACL" {
+            // ACL used to bypass the permission gate entirely, so any
+            // authenticated user could `ACL SETUSER self +@all`. Only
+            // WHOAMI is free; every other subcommand needs ACL permission.
+            let whoami = args.first().is_some_and(|a| a.eq_ignore_ascii_case(b"WHOAMI"));
+            if db.acl.requires_auth() && st.current_user.is_empty() {
+                write_resp_buf_as(out, &err("NOAUTH Authentication required"), st.resp3)?;
+                i += 1;
+                continue;
+            }
+            if !whoami && db.acl.needs_permission_check()
+                && !db.acl.can_command(&st.current_user, "ACL", acl::command_categories("ACL"))
+            {
+                write_resp_buf_as(out, &err(&format!("NOPERM User {} has no permissions to run the 'acl' command", st.current_user)), st.resp3)?;
+                i += 1;
+                continue;
+            }
+            let resp = dispatch_acl(&db, args, &st.current_user);
+            write_resp_buf_as(out, &resp, st.resp3)?;
+            i += 1;
+            continue;
+        }
+        // HELLO is handshake: real Redis answers it BEFORE authentication
+        // so clients can discover the server and learn they need to AUTH.
+        // Gating it behind NOAUTH broke redis-py/go-redis connects on
+        // auth-enabled installs. Embedded `HELLO proto AUTH user pass`
+        // (what RESP3 clients send) is honored here via dispatch_auth —
+        // an auth failure surfaces as the reply; success falls through
+        // to the normal hello map.
+        if name == "HELLO" {
+            if let Some(ix) = args.iter().position(|a| a.eq_ignore_ascii_case(b"AUTH")) {
+                let rest: &[Vec<u8>] = &args[ix + 1..];
+                let r = dispatch_auth(&db, rest, &mut st.current_user);
+                if matches!(r, Resp::Error(_)) {
+                    write_resp_buf_as(out, &r, st.resp3)?;
+                    i += 1;
+                    continue;
+                }
+            }
+            // Negotiate the connection dialect from `HELLO <proto>`.
+            // Unsupported versions are refused (they used to be clamped,
+            // so `HELLO 4` silently "succeeded" as RESP3).
+            let asked = match args.first() {
+                None => if st.resp3 { 3 } else { 2 },
+                Some(a) => match std::str::from_utf8(a).ok().and_then(|s| s.parse::<i64>().ok()) {
+                    Some(v @ (2 | 3)) => v,
+                    Some(_) => {
+                        write_resp_buf_as(out, &err("NOPROTO unsupported protocol version"), st.resp3)?;
+                        i += 1;
+                        continue;
+                    }
+                    None => {
+                        write_resp_buf_as(out, &err("Protocol version is not an integer or out of range"), st.resp3)?;
+                        i += 1;
+                        continue;
+                    }
+                },
+            };
+            if let Some(ix) = args.iter().position(|a| a.eq_ignore_ascii_case(b"SETNAME")) {
+                if let Some(n) = args.get(ix + 1) {
+                    st.client_name = n.clone();
+                }
+            }
+            st.resp3 = asked == 3;
+            let proto_arg = [asked.to_string().into_bytes()];
+            let mut resp = dispatch(&db, &name, &proto_arg);
+            if let Resp::Map(f) | Resp::Array(f) = &mut resp {
+                if let Some(ix) = f.iter().position(|x| *x == Resp::Bulk(b"id".to_vec())) {
+                    if let Some(slot) = f.get_mut(ix + 1) {
+                        *slot = Resp::Int(st.conn_id as i64);
+                    }
+                }
+            }
+            write_resp_buf_as(out, &resp, st.resp3)?;
+            if name == "QUIT" { quit = true; break; }
+            i += 1;
+            continue;
+        }
+
+        // ── ACL: permission check ─────────────────────────────────
+        // Fast path: in the default no-auth install `strict` is false and
+        // nothing can deny a command, so this collapses to one relaxed
+        // load. It only latches true once auth/restrictions are configured
+        // (DBSTRIKE_PASS, ACL SETUSER/DELUSER, disabling a user).
+        if db.acl.requires_auth() && st.current_user.is_empty() {
+            write_resp_buf_as(out, &err("NOAUTH Authentication required"), st.resp3)?;
+            i += 1;
+            continue;
+        }
+        if db.acl.needs_permission_check() {
+            if let Some(e) = acl_denial(&db, &st.current_user, &name, args) {
+                if st.multi.is_some() {
+                    st.multi_err = true;
+                }
+                write_resp_buf_as(out, &e, st.resp3)?;
+                i += 1;
+                continue;
+            }
+        }
+
+        // ── Replication ───────────────────────────────────────────
+        if db.replica.is_replica() && replication::is_write_command(&name) {
+            if st.multi.is_some() {
+                st.multi_err = true;
+            }
+            write_resp_buf_as(out, &err("READONLY You can't write against a read only replica."), st.resp3)?;
+            i += 1;
+            continue;
+        }
+        if name == "REPLICAOF" || name == "SLAVEOF" {
+            let r = replication::replicaof(&db, args);
+            write_resp_buf_as(out, &r, st.resp3)?;
+            i += 1;
+            continue;
+        }
+        if name == "REPLSYNC" {
+            replsync_after_batch = true;
+            break;
+        }
+
+        // ── Transactions ──────────────────────────────────────────
+        // EXEC runs the queue inside ONE engine transaction (see
+        // keyspace::exec_multi): atomic, isolated and durable. Only
+        // keyspace commands can be queued; anything else is refused at
+        // queue time and aborts the EXEC, as Redis does for bad commands.
+        {
+            let reply: Option<Resp> = match name.as_str() {
+                "MULTI" if st.multi.is_some() => Some(err("MULTI calls can not be nested")),
+                "MULTI" => {
+                    st.multi = Some(Vec::new());
+                    st.multi_err = false;
+                    Some(Resp::Simple("OK".into()))
+                }
+                "EXEC" | "DISCARD" if st.multi.is_none() => Some(err(&format!("{name} without MULTI"))),
+                "DISCARD" => {
+                    st.multi = None;
+                    st.watches.clear();
+                    Some(Resp::Simple("OK".into()))
+                }
+                "EXEC" => {
+                    let queue = st.multi.take().unwrap_or_default();
+                    let r = if st.multi_err {
+                        err("EXECABORT Transaction discarded because of previous errors.")
+                    } else {
+                        match db.ks.exec_multi(&queue, &st.watches) {
+                            keyspace::ExecResult::Aborted => Resp::Nil,
+                            keyspace::ExecResult::Done(v) => Resp::Array(v),
+                        }
+                    };
+                    st.watches.clear();
+                    st.multi_err = false;
+                    Some(r)
+                }
+                "WATCH" if st.multi.is_some() => Some(err("WATCH inside MULTI is not allowed")),
+                "WATCH" if args.is_empty() => Some(err("wrong number of arguments for 'watch' command")),
+                "WATCH" => {
+                    let snap = db.engine.snapshot();
+                    st.watches.extend(args.iter().map(|k| (k.clone(), snap)));
+                    Some(Resp::Simple("OK".into()))
+                }
+                "UNWATCH" => {
+                    st.watches.clear();
+                    Some(Resp::Simple("OK".into()))
+                }
+                _ if st.multi.is_some() && name != "QUIT" => {
+                    if keyspace::is_keyspace_cmd(&name) {
+                        st.multi.as_mut().unwrap().push(cmds[i].clone());
+                        Some(Resp::Simple("QUEUED".into()))
+                    } else {
+                        st.multi_err = true;
+                        Some(err(&format!(
+                            "Command '{}' cannot be queued: only keyspace commands (strings, keys, TTL, hash, list, set, zset) are transactional",
+                            name.to_lowercase()
+                        )))
+                    }
+                }
+                _ => None,
+            };
+            if let Some(r) = reply {
+                write_resp_buf_as(out, &r, st.resp3)?;
+                i += 1;
+                continue;
+            }
+        }
+
+        // SUBSCRIBE hijacks the connection AFTER we finish the current
+        // batch (need to write acks + stream events, no more parsing).
+        if name == "SUBSCRIBE" || name == "PSUBSCRIBE" {
+            subscribe_after_batch = Some(cmds.drain(i..).collect());
+            break;
+        }
+        // Per-connection CLIENT state (names/ids used to be faked with OK).
+        if name == "CLIENT" && !args.is_empty() {
+            let sub = String::from_utf8_lossy(&args[0]).to_uppercase();
+            let resp = match (sub.as_str(), args.len()) {
+                ("SETNAME", 2) => {
+                    if args[1].iter().any(|b| *b <= b' ') {
+                        err("Client names cannot contain spaces, newlines or special characters.")
+                    } else {
+                        st.client_name = args[1].clone();
+                        Resp::Simple("OK".into())
+                    }
+                }
+                ("GETNAME", 1) => if st.client_name.is_empty() { Resp::Nil } else { Resp::Bulk(st.client_name.clone()) },
+                ("ID", 1) => Resp::Int(st.conn_id as i64),
+                ("INFO", 1) => Resp::Bulk(format!(
+                    "id={} name={} user={} resp={}\n",
+                        st.conn_id, String::from_utf8_lossy(&st.client_name), st.current_user, if st.resp3 { 3 } else { 2 }
+                    ).into_bytes()),
+                _ => dispatch(&db, &name, args),
+            };
+            write_resp_buf_as(out, &resp, st.resp3)?;
+            i += 1;
+            continue;
+        }
+
+        // Coalesce a run of pure-write commands: `SET k v`, `MSET k v...`,
+        // `TSADD ts val`. Each command emits ONE `+OK` reply preserving
+        // per-command reply-count invariant. The whole run lands in ONE
+        // `put_batch` → ONE fsync = the pipelined-throughput win.
+        //
+        // Semantics: `SET x 1; SET x 2` in one pipeline is equivalent to
+        // just `SET x 2` (BTreeMap dedup keeps the last write), matching
+        // Redis's own pipeline behavior — no client observes the interim.
+        fn is_coalescable_set(cmd: &[Vec<u8>]) -> bool {
+            if cmd.is_empty() {
+                return false;
+            }
+            let name = &cmd[0];
+            (name.eq_ignore_ascii_case(b"SET") && cmd.len() == 3)
+                || (name.eq_ignore_ascii_case(b"MSET")
+                    && cmd.len() >= 3
+                    && (cmd.len() - 1) % 2 == 0)
+        }
+        // A SET over a key that currently holds a hash/list/set/zset must
+        // delete its elements, which only the executor does; such a
+        // command ends the run and goes through the normal path.
+        let over_collection = |cmd: &[Vec<u8>]| -> bool {
+            if !db.ks.has_collections() {
+                return false;
+            }
+            let keys: Vec<&Vec<u8>> = if cmd[0].eq_ignore_ascii_case(b"SET") {
+                vec![&cmd[1]]
+            } else {
+                cmd[1..].iter().step_by(2).collect()
+            };
+            keys.into_iter().any(|k| {
+                let mut kk = b"kv:".to_vec();
+                kk.extend_from_slice(k);
+                matches!(db.engine.get(&kk), Some(Value::Meta(_)))
+            })
+        };
+        if is_coalescable_set(&cmds[i]) && !over_collection(&cmds[i]) {
+            let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut cmds_in_run = 0usize;
+            while i < cmds.len() && is_coalescable_set(&cmds[i]) && !over_collection(&cmds[i]) {
+                // Every command in the run is permission-checked, not just
+                // the first (the run used to swallow a denied MSET after
+                // an allowed SET). A denied command ends the run; the
+                // outer loop then replies NOPERM for it in order.
+                if cmds_in_run > 0 && db.acl.needs_permission_check() {
+                    let nm = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
+                    if acl_denial(&db, &st.current_user, &nm, &cmds[i][1..]).is_some() {
+                        break;
+                    }
+                }
+                // Take ownership of the command so the value bytes can be
+                // MOVED (not cloned) straight into the engine — at 16M ops/s
+                // a per-value heap clone is a measurable allocator tax.
+                let mut cmd = std::mem::take(&mut cmds[i]);
+                let cargs = &cmd[1..];
+                if cmd[0].eq_ignore_ascii_case(b"SET") {
+                    let mut kb = Vec::with_capacity(3 + cargs[0].len());
+                    kb.extend_from_slice(b"kv:");
+                    kb.extend_from_slice(&cargs[0]);
+                    let val = std::mem::take(&mut cmd[2]);
+                    kvs.push((kb, val));
+                } else {
+                    // MSET k v k v ...
+                    for pair in cargs.chunks(2) {
+                        let mut kb = Vec::with_capacity(3 + pair[0].len());
+                        kb.extend_from_slice(b"kv:");
+                        kb.extend_from_slice(&pair[0]);
+                        kvs.push((kb, pair[1].clone()));
+                    }
+                }
+                cmds_in_run += 1;
+                i += 1;
+            }
+            // SET drops any TTL (Redis): clear it in the SAME commit.
+            let mut cleared: Vec<Vec<u8>> = Vec::new();
+            let mut entries: Vec<(Vec<u8>, Value)> = Vec::with_capacity(kvs.len());
+            for (k, v) in kvs {
+                if db.ks.expiry.any() && db.ks.expiry.get(&k[3..]).is_some() {
+                    let mut ek = b"exp:".to_vec();
+                    ek.extend_from_slice(&k[3..]);
+                    entries.push((ek, Value::Tombstone));
+                    cleared.push(k[3..].to_vec());
+                }
+                entries.push((k, Value::Bytes(v)));
+            }
+            let res = db.engine.put_batch(entries);
+            if res.is_ok() && !cleared.is_empty() {
+                let ch: Vec<(Vec<u8>, Option<u64>)> = cleared.into_iter().map(|k| (k, None)).collect();
+                db.ks.expiry.apply(&ch);
+            }
+            match res {
+                Ok(_) => {
+                    // One "+OK\r\n" per *command* (not per key), so a
+                    // coalesced run of SET/SET or a single MSET each emit
+                    // exactly one ack — preserving the per-command
+                    // reply-count invariant the client relies on.
+                    for _ in 0..cmds_in_run {
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                }
+                Err(e) => {
+                    // One reply per COMMAND, never per key: an MSET of 3
+                    // pairs is one command, and emitting 3 errors here
+                    // shifted every later reply in the pipeline.
+                    let e = err(&e.to_string());
+                    for _ in 0..cmds_in_run {
+                        write_resp_buf_as(out, &e, st.resp3)?;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Coalesce a run of INCR/INCRBY/DECR/DECRBY: each stays its own
+        // atomic commit with its own reply, but the whole run shares one
+        // group-commit fsync instead of paying one fsync per command.
+        fn incr_op(cmd: &[Vec<u8>]) -> Option<(Vec<u8>, i64)> {
+            let n = String::from_utf8_lossy(&cmd[0]).to_ascii_uppercase();
+            let num = |a: &[u8]| storage::engine::parse_strict_i64(a);
+            match (n.as_str(), cmd.len()) {
+                ("INCR", 2) => Some((cmd[1].clone(), 1)),
+                ("DECR", 2) => Some((cmd[1].clone(), -1)),
+                ("INCRBY", 3) => Some((cmd[1].clone(), num(&cmd[2])?)),
+                ("DECRBY", 3) => Some((cmd[1].clone(), num(&cmd[2])?.checked_neg()?)),
+                _ => None,
+            }
+        }
+        if !st.trace && i + 1 < cmds.len() && incr_op(&cmds[i]).is_some() && incr_op(&cmds[i + 1]).is_some() {
+            let mut ops = Vec::new();
+            while i < cmds.len() {
+                let Some(op) = incr_op(&cmds[i]) else { break };
+                if !ops.is_empty() && db.acl.needs_permission_check() {
+                    let nm = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
+                    if acl_denial(&db, &st.current_user, &nm, &cmds[i][1..]).is_some() {
+                        break;
+                    }
+                }
+                ops.push(op);
+                i += 1;
+            }
+            let n = ops.len();
+            if db.ks.expiry.any() {
+                for (k, _) in &ops {
+                    db.ks.reap_if_expired(k);
+                }
+            }
+            match db.kv.incr_many(ops) {
+                Ok(results) => {
+                    for r in results {
+                        let resp = match r {
+                            Ok(v) => Resp::Int(v),
+                            Err(e) => err(&e),
+                        };
+                        write_resp_buf_as(out, &resp, st.resp3)?;
+                    }
+                }
+                Err(e) => {
+                    let e = err(&e);
+                    for _ in 0..n {
+                        write_resp_buf_as(out, &e, st.resp3)?;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Coalesce a pipelined run of other keyspace WRITES (LPUSH, HSET,
+        // SADD, ZADD, EXPIRE, ...): each still executes on the commit path
+        // in order with its own reply, but the run shares one fsync.
+        fn batchable(cmd: &[Vec<u8>]) -> Option<String> {
+            let n = String::from_utf8_lossy(&cmd[0]).to_ascii_uppercase();
+            (keyspace::is_keyspace_write(&n) && !matches!(n.as_str(), "SET" | "MSET" | "INCR" | "DECR" | "INCRBY" | "DECRBY")).then_some(n)
+        }
+        if !st.trace && i + 1 < cmds.len() && batchable(&cmds[i]).is_some() && batchable(&cmds[i + 1]).is_some() {
+            let mut run: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+            while i < cmds.len() {
+                let Some(nm) = batchable(&cmds[i]) else { break };
+                if !run.is_empty() && db.acl.needs_permission_check() && acl_denial(&db, &st.current_user, &nm, &cmds[i][1..]).is_some() {
+                    break;
+                }
+                run.push((nm, cmds[i][1..].to_vec()));
+                i += 1;
+            }
+            for r in db.ks.run_writes(&run) {
+                write_resp_buf_as(out, &r, st.resp3)?;
+            }
+            continue;
+        }
+
+        // Per-command st.trace, OFF by default (`DBSTRIKE_TRACE=1` to enable).
+        // This used to be unconditional, and it is not a cheap line: it
+        // formats every argument, so a single 384-dim VSEARCH prints ~5 KB.
+        // One 1.7s bench section produced a 160 MB log, and the formatting
+        // plus the write syscall sat directly in the command hot path.
+        let resp = if st.trace {
+            let t_start = std::time::Instant::now();
+            let resp = dispatch(&db, &name, args);
+            let elapsed_ms = t_start.elapsed().as_micros() as f64 / 1000.0;
+            // Redacts passwords — see `redact_cmd`.
+            eprintln!("[CMD] {:>6.1}ms {}", elapsed_ms, redact_cmd(&name, args));
+            if let Some(lf) = LOG_FILE.get() {
+                let _ = writeln!(lf.lock().unwrap(), "[CMD] {:>6.1}ms {}", elapsed_ms, redact_cmd(&name, args));
+            }
+            resp
+        } else {
+            dispatch(&db, &name, args)
+        };
+        write_resp_buf_as(out, &resp, st.resp3)?;
+        if name == "QUIT" {
+            quit = true;
+            break;
+        }
+        i += 1;
+    }
+    if quit {
+        return Ok(BatchEnd::Quit);
+    }
+    if replsync_after_batch {
+        return Ok(BatchEnd::ReplSync);
+    }
+    if let Some(sub_cmds) = subscribe_after_batch {
+        return Ok(BatchEnd::Subscribe(sub_cmds));
+    }
+    Ok(BatchEnd::Continue)
+}
+
+fn handle(stream: TcpStream, db: Arc<Db>) -> std::io::Result<()> {
+    let st = ConnState::new(&db);
+    THREADED_CLIENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let r = serve_threaded(stream, db, st, Vec::new());
+    THREADED_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+/// Clients served by the threaded network mode (INFO connected_clients).
+static THREADED_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn connected_clients() -> usize {
+    let t = THREADED_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "linux")]
+    let t = t + eventloop::CONNECTED.load(std::sync::atomic::Ordering::Relaxed);
+    t
+}
+
+/// Thread-per-connection serving loop (DBSTRIKE_NET=threads, and the home of
+/// a connection after it leaves subscribe mode in event-loop mode).
+fn serve_threaded(stream: TcpStream, db: Arc<Db>, mut st: ConnState, mut buf: Vec<u8>) -> std::io::Result<()> {
     // TCP_NODELAY: disable Nagle so per-batch flushes actually go on the wire
     // immediately (matters for latency-sensitive workloads like signaling).
     let _ = stream.set_nodelay(true);
-    // Single shared stream behind a Mutex. We deliberately AVOID `try_clone()`
-    // here: cloning dups the fd, so every connection would burn *two* fds and
-    // the per-process fd ceiling (ulimit -n) would be hit at half the real
-    // connection count — causing "Too many open files" storms under a high -c
-    // benchmark. One Arc<Mutex<TcpStream>> = one fd per connection.
+    // One Arc<Mutex<TcpStream>> = one fd per connection (subscribe mode
+    // shares it with its forwarder thread).
     let stream = Arc::new(Mutex::new(stream));
-    // Accumulate all replies for a parsed batch into this buffer, then do a
-    // single locked write + flush. Keeps the hot path lock-free except for the
-    // one flush per pipeline batch (matching the old BufWriter throughput).
     let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
-    // Manual read buffer so we can peek pipelined commands without going
-    // command-at-a-time. BufRead's fill_buf has capacity semantics that make
-    // the "keep parsing until short" pattern awkward; a plain Vec<u8> is
-    // clearer and just as fast.
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut tmp = [0u8; 32 * 1024];
-    // Read once per connection, not once per command.
-    let trace = std::env::var("DBSTRIKE_TRACE").is_ok_and(|v| v != "0");
-    // ACL: track which user this connection is authenticated as.
-    // If no requirepass, default user is pre-authenticated.
-    let mut current_user: String = if db.acl.requires_auth() {
-        String::new() // not authenticated yet
-    } else {
-        "default".to_string()
-    };
-    // Wire dialect for THIS connection. RESP2 everywhere by default; flips to
-    // RESP3 nulls (`_`) the moment HELLO negotiates proto 3 — see
-    // `write_resp_buf_as`. Every reply below goes through it.
-    let mut resp3_conn = false;
-    let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut client_name: Vec<u8> = Vec::new();
-    // MULTI/EXEC state: queued commands, whether queuing hit an error (→
-    // EXECABORT), and WATCHed keys with the snapshot they were watched at.
-    let mut multi: Option<Vec<Vec<Vec<u8>>>> = None;
-    let mut multi_err = false;
-    let mut watches: Vec<(Vec<u8>, u64)> = Vec::new();
-
-    // NOTE: a geometric parse-retry backoff was tried here and REVERTED.
-    //
-    // The intent was sound — `try_parse` restarts from byte zero, so retrying
-    // after each 64 KiB read makes a large frame quadratic in its own size.
-    // The implementation deadlocked. It waited for the buffer to grow by
-    // `max(remaining/2, 64 KiB)` before parsing again, but a command split
-    // across reads whose remainder is under 64 KiB never reaches that
-    // threshold: the client has sent everything and is waiting for a reply
-    // while the server waits for bytes that will never arrive. Any payload
-    // large enough to straddle a read boundary could hang the connection.
-    //
-    // A correct version must derive the *actual* bytes the frame needs from
-    // its RESP headers rather than guessing, so the threshold is exact and can
-    // always be reached. Until that exists, parse on every read: quadratic on
-    // huge frames is a performance problem, and this was a liveness one.
-
-    // Set when leaving subscribe mode with commands already re-queued in
-    // `buf`: parse those first instead of blocking on a socket read.
-    let mut skip_read = false;
+    // Commands may already be buffered (handed over from another loop).
+    let mut skip_read = !buf.is_empty();
     loop {
         if !skip_read {
-            // Block until we have SOMETHING to parse (or the client closes).
             let n = {
                 let mut s = stream.lock().unwrap();
                 s.read(&mut tmp)?
@@ -387,527 +924,72 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
         skip_read = false;
         // Redis `client-query-buffer-limit`: a client that streams an
         // incomplete frame forever must not be able to exhaust server memory.
-        if buf.len() > 1024 * 1024 * 1024 {
-            let _ = write_resp_buf_as(&mut out, &err("Protocol error: query buffer limit exceeded"), resp3_conn);
+        if buf.len() > QUERY_BUFFER_LIMIT {
+            let _ = write_resp_buf_as(&mut out, &err("Protocol error: query buffer limit exceeded"), st.resp3);
             if let Ok(mut s) = stream.lock() {
                 let _ = s.write_all(&out);
             }
             return Ok(());
         }
-
-        // ── Drain every complete command from `buf` ────────────────────
-        let mut cmds: Vec<Vec<Vec<u8>>> = Vec::new();
-        let mut cursor = 0usize;
-        loop {
-            match try_parse(&buf[cursor..]) {
-                Ok(Some((cmd, consumed))) => {
-                    cursor += consumed;
-                    if !cmd.is_empty() {
-                        cmds.push(cmd);
-                    }
+        let cmds = match parse_commands(&mut buf) {
+            Ok(c) => c,
+            Err(e) => {
+                // Reply the way Redis does, then close.
+                let _ = write_resp_buf_as(&mut out, &err(&format!("Protocol error: {e}")), st.resp3);
+                if let Ok(mut s) = stream.lock() {
+                    let _ = s.write_all(&out);
+                    let _ = s.flush();
                 }
-                Ok(None) => break, // partial command; wait for more bytes
-                Err(e) => {
-                    // A genuine protocol error (NOT a truncated frame —
-                    // `try_parse` reports those as `Ok(None)`). Reply the way
-                    // Redis does, then close. Previously this bare `return
-                    // Err(e)` dropped the socket, and `is_benign_disconnect`
-                    // matched the message and suppressed the log, so the client
-                    // saw an unexplained `ConnectionReset` and the server said
-                    // nothing at all. Send the reason down the wire first.
-                    let _ = write_resp_buf_as(&mut out, &err(&format!("Protocol error: {e}")), resp3_conn);
-                    if let Ok(mut s) = stream.lock() {
-                        let _ = s.write_all(&out);
-                        let _ = s.flush();
-                    }
-                    return Err(e);
-                }
+                return Err(e);
             }
-        }
-        if cursor > 0 {
-            buf.drain(..cursor);
-        }
+        };
         if cmds.is_empty() {
             continue;
         }
-
-        // ── Dispatch batch. Consecutive `SET k v` commands get coalesced
-        // into ONE engine.put_batch — one fsync per burst, not one per
-        // command. This is the "Redis-class pipelined SET" fix. Every
-        // other command dispatches individually to preserve read-after-
-        // write ordering (e.g. GET must see writes that came before it).
-        let mut quit = false;
-        // Commands from a SUBSCRIBE onward (pipelined commands after it must
-        // be processed in subscribe mode, not silently dropped).
-        let mut subscribe_after_batch: Option<Vec<Vec<Vec<u8>>>> = None;
-        let mut replsync_after_batch = false;
-        let mut i = 0usize;
-        while i < cmds.len() {
-            let name = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
-            let args = &cmds[i][1..];
-
-            // ── ACL: handle AUTH/ACL before permission check ──────────
-            if name == "AUTH" {
-                let resp = dispatch_auth(&db, args, &mut current_user);
-                write_resp_buf_as(&mut out, &resp, resp3_conn)?;
-                if name == "QUIT" { quit = true; break; }
-                i += 1;
-                continue;
-            }
-            if name == "ACL" {
-                // ACL used to bypass the permission gate entirely, so any
-                // authenticated user could `ACL SETUSER self +@all`. Only
-                // WHOAMI is free; every other subcommand needs ACL permission.
-                let whoami = args.first().is_some_and(|a| a.eq_ignore_ascii_case(b"WHOAMI"));
-                if db.acl.requires_auth() && current_user.is_empty() {
-                    write_resp_buf_as(&mut out, &err("NOAUTH Authentication required"), resp3_conn)?;
-                    i += 1;
-                    continue;
-                }
-                if !whoami && db.acl.needs_permission_check()
-                    && !db.acl.can_command(&current_user, "ACL", acl::command_categories("ACL"))
-                {
-                    write_resp_buf_as(&mut out, &err(&format!("NOPERM User {current_user} has no permissions to run the 'acl' command")), resp3_conn)?;
-                    i += 1;
-                    continue;
-                }
-                let resp = dispatch_acl(&db, args, &current_user);
-                write_resp_buf_as(&mut out, &resp, resp3_conn)?;
-                i += 1;
-                continue;
-            }
-            // HELLO is handshake: real Redis answers it BEFORE authentication
-            // so clients can discover the server and learn they need to AUTH.
-            // Gating it behind NOAUTH broke redis-py/go-redis connects on
-            // auth-enabled installs. Embedded `HELLO proto AUTH user pass`
-            // (what RESP3 clients send) is honored here via dispatch_auth —
-            // an auth failure surfaces as the reply; success falls through
-            // to the normal hello map.
-            if name == "HELLO" {
-                if let Some(ix) = args.iter().position(|a| a.eq_ignore_ascii_case(b"AUTH")) {
-                    let rest: &[Vec<u8>] = &args[ix + 1..];
-                    let r = dispatch_auth(&db, rest, &mut current_user);
-                    if matches!(r, Resp::Error(_)) {
-                        write_resp_buf_as(&mut out, &r, resp3_conn)?;
-                        i += 1;
-                        continue;
-                    }
-                }
-                // Negotiate the connection dialect from `HELLO <proto>`.
-                // Unsupported versions are refused (they used to be clamped,
-                // so `HELLO 4` silently "succeeded" as RESP3).
-                let asked = match args.first() {
-                    None => if resp3_conn { 3 } else { 2 },
-                    Some(a) => match std::str::from_utf8(a).ok().and_then(|s| s.parse::<i64>().ok()) {
-                        Some(v @ (2 | 3)) => v,
-                        Some(_) => {
-                            write_resp_buf_as(&mut out, &err("NOPROTO unsupported protocol version"), resp3_conn)?;
-                            i += 1;
-                            continue;
-                        }
-                        None => {
-                            write_resp_buf_as(&mut out, &err("Protocol version is not an integer or out of range"), resp3_conn)?;
-                            i += 1;
-                            continue;
-                        }
-                    },
-                };
-                if let Some(ix) = args.iter().position(|a| a.eq_ignore_ascii_case(b"SETNAME")) {
-                    if let Some(n) = args.get(ix + 1) {
-                        client_name = n.clone();
-                    }
-                }
-                resp3_conn = asked == 3;
-                let proto_arg = [asked.to_string().into_bytes()];
-                let mut resp = dispatch(&db, &name, &proto_arg);
-                if let Resp::Map(f) | Resp::Array(f) = &mut resp {
-                    if let Some(ix) = f.iter().position(|x| *x == Resp::Bulk(b"id".to_vec())) {
-                        if let Some(slot) = f.get_mut(ix + 1) {
-                            *slot = Resp::Int(conn_id as i64);
-                        }
-                    }
-                }
-                write_resp_buf_as(&mut out, &resp, resp3_conn)?;
-                if name == "QUIT" { quit = true; break; }
-                i += 1;
-                continue;
-            }
-
-            // ── ACL: permission check ─────────────────────────────────
-            // Fast path: in the default no-auth install `strict` is false and
-            // nothing can deny a command, so this collapses to one relaxed
-            // load. It only latches true once auth/restrictions are configured
-            // (DBSTRIKE_PASS, ACL SETUSER/DELUSER, disabling a user).
-            if db.acl.requires_auth() && current_user.is_empty() {
-                write_resp_buf_as(&mut out, &err("NOAUTH Authentication required"), resp3_conn)?;
-                i += 1;
-                continue;
-            }
-            if db.acl.needs_permission_check() {
-                if let Some(e) = acl_denial(&db, &current_user, &name, args) {
-                    if multi.is_some() {
-                        multi_err = true;
-                    }
-                    write_resp_buf_as(&mut out, &e, resp3_conn)?;
-                    i += 1;
-                    continue;
-                }
-            }
-
-            // ── Replication ───────────────────────────────────────────
-            if db.replica.is_replica() && replication::is_write_command(&name) {
-                if multi.is_some() {
-                    multi_err = true;
-                }
-                write_resp_buf_as(&mut out, &err("READONLY You can't write against a read only replica."), resp3_conn)?;
-                i += 1;
-                continue;
-            }
-            if name == "REPLICAOF" || name == "SLAVEOF" {
-                let r = replication::replicaof(&db, args);
-                write_resp_buf_as(&mut out, &r, resp3_conn)?;
-                i += 1;
-                continue;
-            }
-            if name == "REPLSYNC" {
-                replsync_after_batch = true;
-                break;
-            }
-
-            // ── Transactions ──────────────────────────────────────────
-            // EXEC runs the queue inside ONE engine transaction (see
-            // keyspace::exec_multi): atomic, isolated and durable. Only
-            // keyspace commands can be queued; anything else is refused at
-            // queue time and aborts the EXEC, as Redis does for bad commands.
-            {
-                let reply: Option<Resp> = match name.as_str() {
-                    "MULTI" if multi.is_some() => Some(err("MULTI calls can not be nested")),
-                    "MULTI" => {
-                        multi = Some(Vec::new());
-                        multi_err = false;
-                        Some(Resp::Simple("OK".into()))
-                    }
-                    "EXEC" | "DISCARD" if multi.is_none() => Some(err(&format!("{name} without MULTI"))),
-                    "DISCARD" => {
-                        multi = None;
-                        watches.clear();
-                        Some(Resp::Simple("OK".into()))
-                    }
-                    "EXEC" => {
-                        let queue = multi.take().unwrap_or_default();
-                        let r = if multi_err {
-                            err("EXECABORT Transaction discarded because of previous errors.")
-                        } else {
-                            match db.ks.exec_multi(&queue, &watches) {
-                                keyspace::ExecResult::Aborted => Resp::Nil,
-                                keyspace::ExecResult::Done(v) => Resp::Array(v),
-                            }
-                        };
-                        watches.clear();
-                        multi_err = false;
-                        Some(r)
-                    }
-                    "WATCH" if multi.is_some() => Some(err("WATCH inside MULTI is not allowed")),
-                    "WATCH" if args.is_empty() => Some(err("wrong number of arguments for 'watch' command")),
-                    "WATCH" => {
-                        let snap = db.engine.snapshot();
-                        watches.extend(args.iter().map(|k| (k.clone(), snap)));
-                        Some(Resp::Simple("OK".into()))
-                    }
-                    "UNWATCH" => {
-                        watches.clear();
-                        Some(Resp::Simple("OK".into()))
-                    }
-                    _ if multi.is_some() && name != "QUIT" => {
-                        if keyspace::is_keyspace_cmd(&name) {
-                            multi.as_mut().unwrap().push(cmds[i].clone());
-                            Some(Resp::Simple("QUEUED".into()))
-                        } else {
-                            multi_err = true;
-                            Some(err(&format!(
-                                "Command '{}' cannot be queued: only keyspace commands (strings, keys, TTL, hash, list, set, zset) are transactional",
-                                name.to_lowercase()
-                            )))
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(r) = reply {
-                    write_resp_buf_as(&mut out, &r, resp3_conn)?;
-                    i += 1;
-                    continue;
-                }
-            }
-
-            // SUBSCRIBE hijacks the connection AFTER we finish the current
-            // batch (need to write acks + stream events, no more parsing).
-            if name == "SUBSCRIBE" || name == "PSUBSCRIBE" {
-                subscribe_after_batch = Some(cmds.drain(i..).collect());
-                break;
-            }
-            // Per-connection CLIENT state (names/ids used to be faked with OK).
-            if name == "CLIENT" && !args.is_empty() {
-                let sub = String::from_utf8_lossy(&args[0]).to_uppercase();
-                let resp = match (sub.as_str(), args.len()) {
-                    ("SETNAME", 2) => {
-                        if args[1].iter().any(|b| *b <= b' ') {
-                            err("Client names cannot contain spaces, newlines or special characters.")
-                        } else {
-                            client_name = args[1].clone();
-                            Resp::Simple("OK".into())
-                        }
-                    }
-                    ("GETNAME", 1) => if client_name.is_empty() { Resp::Nil } else { Resp::Bulk(client_name.clone()) },
-                    ("ID", 1) => Resp::Int(conn_id as i64),
-                    ("INFO", 1) => Resp::Bulk(format!(
-                        "id={conn_id} name={} user={current_user} resp={}\n",
-                        String::from_utf8_lossy(&client_name), if resp3_conn { 3 } else { 2 }
-                    ).into_bytes()),
-                    _ => dispatch(&db, &name, args),
-                };
-                write_resp_buf_as(&mut out, &resp, resp3_conn)?;
-                i += 1;
-                continue;
-            }
-
-            // Coalesce a run of pure-write commands: `SET k v`, `MSET k v...`,
-            // `TSADD ts val`. Each command emits ONE `+OK` reply preserving
-            // per-command reply-count invariant. The whole run lands in ONE
-            // `put_batch` → ONE fsync = the pipelined-throughput win.
-            //
-            // Semantics: `SET x 1; SET x 2` in one pipeline is equivalent to
-            // just `SET x 2` (BTreeMap dedup keeps the last write), matching
-            // Redis's own pipeline behavior — no client observes the interim.
-            fn is_coalescable_set(cmd: &[Vec<u8>]) -> bool {
-                if cmd.is_empty() {
-                    return false;
-                }
-                let name = &cmd[0];
-                (name.eq_ignore_ascii_case(b"SET") && cmd.len() == 3)
-                    || (name.eq_ignore_ascii_case(b"MSET")
-                        && cmd.len() >= 3
-                        && (cmd.len() - 1) % 2 == 0)
-            }
-            // A SET over a key that currently holds a hash/list/set/zset must
-            // delete its elements, which only the executor does; such a
-            // command ends the run and goes through the normal path.
-            let over_collection = |cmd: &[Vec<u8>]| -> bool {
-                if !db.ks.has_collections() {
-                    return false;
-                }
-                let keys: Vec<&Vec<u8>> = if cmd[0].eq_ignore_ascii_case(b"SET") {
-                    vec![&cmd[1]]
-                } else {
-                    cmd[1..].iter().step_by(2).collect()
-                };
-                keys.into_iter().any(|k| {
-                    let mut kk = b"kv:".to_vec();
-                    kk.extend_from_slice(k);
-                    matches!(db.engine.get(&kk), Some(Value::Meta(_)))
-                })
-            };
-            if is_coalescable_set(&cmds[i]) && !over_collection(&cmds[i]) {
-                let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                let mut cmds_in_run = 0usize;
-                while i < cmds.len() && is_coalescable_set(&cmds[i]) && !over_collection(&cmds[i]) {
-                    // Every command in the run is permission-checked, not just
-                    // the first (the run used to swallow a denied MSET after
-                    // an allowed SET). A denied command ends the run; the
-                    // outer loop then replies NOPERM for it in order.
-                    if cmds_in_run > 0 && db.acl.needs_permission_check() {
-                        let nm = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
-                        if acl_denial(&db, &current_user, &nm, &cmds[i][1..]).is_some() {
-                            break;
-                        }
-                    }
-                    // Take ownership of the command so the value bytes can be
-                    // MOVED (not cloned) straight into the engine — at 16M ops/s
-                    // a per-value heap clone is a measurable allocator tax.
-                    let mut cmd = std::mem::take(&mut cmds[i]);
-                    let cargs = &cmd[1..];
-                    if cmd[0].eq_ignore_ascii_case(b"SET") {
-                        let mut kb = Vec::with_capacity(3 + cargs[0].len());
-                        kb.extend_from_slice(b"kv:");
-                        kb.extend_from_slice(&cargs[0]);
-                        let val = std::mem::take(&mut cmd[2]);
-                        kvs.push((kb, val));
-                    } else {
-                        // MSET k v k v ...
-                        for pair in cargs.chunks(2) {
-                            let mut kb = Vec::with_capacity(3 + pair[0].len());
-                            kb.extend_from_slice(b"kv:");
-                            kb.extend_from_slice(&pair[0]);
-                            kvs.push((kb, pair[1].clone()));
-                        }
-                    }
-                    cmds_in_run += 1;
-                    i += 1;
-                }
-                // SET drops any TTL (Redis): clear it in the SAME commit.
-                let mut cleared: Vec<Vec<u8>> = Vec::new();
-                let mut entries: Vec<(Vec<u8>, Value)> = Vec::with_capacity(kvs.len());
-                for (k, v) in kvs {
-                    if db.ks.expiry.any() && db.ks.expiry.get(&k[3..]).is_some() {
-                        let mut ek = b"exp:".to_vec();
-                        ek.extend_from_slice(&k[3..]);
-                        entries.push((ek, Value::Tombstone));
-                        cleared.push(k[3..].to_vec());
-                    }
-                    entries.push((k, Value::Bytes(v)));
-                }
-                let res = db.engine.put_batch(entries);
-                if res.is_ok() && !cleared.is_empty() {
-                    let ch: Vec<(Vec<u8>, Option<u64>)> = cleared.into_iter().map(|k| (k, None)).collect();
-                    db.ks.expiry.apply(&ch);
-                }
-                match res {
-                    Ok(_) => {
-                        // One "+OK\r\n" per *command* (not per key), so a
-                        // coalesced run of SET/SET or a single MSET each emit
-                        // exactly one ack — preserving the per-command
-                        // reply-count invariant the client relies on.
-                        for _ in 0..cmds_in_run {
-                            out.extend_from_slice(b"+OK\r\n");
-                        }
-                    }
-                    Err(e) => {
-                        // One reply per COMMAND, never per key: an MSET of 3
-                        // pairs is one command, and emitting 3 errors here
-                        // shifted every later reply in the pipeline.
-                        let e = err(&e.to_string());
-                        for _ in 0..cmds_in_run {
-                            write_resp_buf_as(&mut out, &e, resp3_conn)?;
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Coalesce a run of INCR/INCRBY/DECR/DECRBY: each stays its own
-            // atomic commit with its own reply, but the whole run shares one
-            // group-commit fsync instead of paying one fsync per command.
-            fn incr_op(cmd: &[Vec<u8>]) -> Option<(Vec<u8>, i64)> {
-                let n = String::from_utf8_lossy(&cmd[0]).to_ascii_uppercase();
-                let num = |a: &[u8]| storage::engine::parse_strict_i64(a);
-                match (n.as_str(), cmd.len()) {
-                    ("INCR", 2) => Some((cmd[1].clone(), 1)),
-                    ("DECR", 2) => Some((cmd[1].clone(), -1)),
-                    ("INCRBY", 3) => Some((cmd[1].clone(), num(&cmd[2])?)),
-                    ("DECRBY", 3) => Some((cmd[1].clone(), num(&cmd[2])?.checked_neg()?)),
-                    _ => None,
-                }
-            }
-            if !trace && i + 1 < cmds.len() && incr_op(&cmds[i]).is_some() && incr_op(&cmds[i + 1]).is_some() {
-                let mut ops = Vec::new();
-                while i < cmds.len() {
-                    let Some(op) = incr_op(&cmds[i]) else { break };
-                    if !ops.is_empty() && db.acl.needs_permission_check() {
-                        let nm = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
-                        if acl_denial(&db, &current_user, &nm, &cmds[i][1..]).is_some() {
-                            break;
-                        }
-                    }
-                    ops.push(op);
-                    i += 1;
-                }
-                let n = ops.len();
-                if db.ks.expiry.any() {
-                    for (k, _) in &ops {
-                        db.ks.reap_if_expired(k);
-                    }
-                }
-                match db.kv.incr_many(ops) {
-                    Ok(results) => {
-                        for r in results {
-                            let resp = match r {
-                                Ok(v) => Resp::Int(v),
-                                Err(e) => err(&e),
-                            };
-                            write_resp_buf_as(&mut out, &resp, resp3_conn)?;
-                        }
-                    }
-                    Err(e) => {
-                        let e = err(&e);
-                        for _ in 0..n {
-                            write_resp_buf_as(&mut out, &e, resp3_conn)?;
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Coalesce a pipelined run of other keyspace WRITES (LPUSH, HSET,
-            // SADD, ZADD, EXPIRE, ...): each still executes on the commit path
-            // in order with its own reply, but the run shares one fsync.
-            fn batchable(cmd: &[Vec<u8>]) -> Option<String> {
-                let n = String::from_utf8_lossy(&cmd[0]).to_ascii_uppercase();
-                (keyspace::is_keyspace_write(&n) && !matches!(n.as_str(), "SET" | "MSET" | "INCR" | "DECR" | "INCRBY" | "DECRBY")).then_some(n)
-            }
-            if !trace && i + 1 < cmds.len() && batchable(&cmds[i]).is_some() && batchable(&cmds[i + 1]).is_some() {
-                let mut run: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
-                while i < cmds.len() {
-                    let Some(nm) = batchable(&cmds[i]) else { break };
-                    if !run.is_empty() && db.acl.needs_permission_check() && acl_denial(&db, &current_user, &nm, &cmds[i][1..]).is_some() {
-                        break;
-                    }
-                    run.push((nm, cmds[i][1..].to_vec()));
-                    i += 1;
-                }
-                for r in db.ks.run_writes(&run) {
-                    write_resp_buf_as(&mut out, &r, resp3_conn)?;
-                }
-                continue;
-            }
-
-            // Per-command trace, OFF by default (`DBSTRIKE_TRACE=1` to enable).
-            // This used to be unconditional, and it is not a cheap line: it
-            // formats every argument, so a single 384-dim VSEARCH prints ~5 KB.
-            // One 1.7s bench section produced a 160 MB log, and the formatting
-            // plus the write syscall sat directly in the command hot path.
-            let resp = if trace {
-                let t_start = std::time::Instant::now();
-                let resp = dispatch(&db, &name, args);
-                let elapsed_ms = t_start.elapsed().as_micros() as f64 / 1000.0;
-                // Redacts passwords — see `redact_cmd`.
-                eprintln!("[CMD] {:>6.1}ms {}", elapsed_ms, redact_cmd(&name, args));
-                if let Some(ref lf) = log_file {
-                    let _ = writeln!(lf.lock().unwrap(), "[CMD] {:>6.1}ms {}", elapsed_ms, redact_cmd(&name, args));
-                }
-                resp
-            } else {
-                dispatch(&db, &name, args)
-            };
-            write_resp_buf_as(&mut out, &resp, resp3_conn)?;
-            if name == "QUIT" {
-                quit = true;
-                break;
-            }
-            i += 1;
-        }
-        // Single locked flush of the whole batch.
+        let end = process_batch(&db, &mut st, cmds, &mut out)?;
         {
             let mut s = stream.lock().unwrap();
             s.write_all(&out)?;
             s.flush()?;
         }
         out.clear();
-        if quit {
-            return Ok(());
-        }
-        if replsync_after_batch {
-            // This connection now carries the replication stream.
-            let s = stream.lock().unwrap().try_clone()?;
-            return replication::serve_replica(&db, s, conn_id);
-        }
-        if let Some(sub_cmds) = subscribe_after_batch {
-            let ctx = SubCtx { conn_id, resp3: resp3_conn, user: current_user.clone() };
-            match subscribe_mode(&db, &stream, &ctx, sub_cmds, &mut buf)? {
-                SubExit::Closed => return Ok(()),
-                SubExit::Resume => {
-                    skip_read = !buf.is_empty();
-                    continue;
+        match end {
+            // Bytes left over may already hold the next command (or the
+            // malformed frame that cut this batch short): parse before reading.
+            BatchEnd::Continue => skip_read = !buf.is_empty(),
+            BatchEnd::Quit => return Ok(()),
+            BatchEnd::ReplSync => {
+                let s = stream.lock().unwrap().try_clone()?;
+                return replication::serve_replica(&db, s, st.conn_id);
+            }
+            BatchEnd::Subscribe(sub_cmds) => {
+                let ctx = SubCtx { conn_id: st.conn_id, resp3: st.resp3, user: st.current_user.clone() };
+                match subscribe_mode(&db, &stream, &ctx, sub_cmds, &mut buf)? {
+                    SubExit::Closed => return Ok(()),
+                    SubExit::Resume => skip_read = !buf.is_empty(),
                 }
             }
+        }
+    }
+}
+
+/// Redis `client-query-buffer-limit`.
+const QUERY_BUFFER_LIMIT: usize = 1024 * 1024 * 1024;
+
+/// Run a connection that entered subscribe mode on its own thread; if it
+/// later unsubscribes from everything it keeps being served here.
+#[allow(dead_code)] // unused on non-Linux builds (threaded mode only)
+fn continue_subscribed(stream: TcpStream, db: Arc<Db>, st: ConnState, cmds: Vec<Vec<Vec<u8>>>, mut buf: Vec<u8>) -> std::io::Result<()> {
+    let shared = Arc::new(Mutex::new(stream));
+    let ctx = SubCtx { conn_id: st.conn_id, resp3: st.resp3, user: st.current_user.clone() };
+    match subscribe_mode(&db, &shared, &ctx, cmds, &mut buf)? {
+        SubExit::Closed => Ok(()),
+        SubExit::Resume => {
+            let stream = Arc::try_unwrap(shared)
+                .map_err(|_| std::io::Error::other("subscriber stream still shared"))?
+                .into_inner()
+                .unwrap_or_else(|p| p.into_inner());
+            serve_threaded(stream, db, st, buf)
         }
     }
 }
@@ -1813,7 +1895,8 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 _ => return err("timeout is not a float or out of range"),
             };
             let pop = if name == "BLPOP" { "LPOP" } else { "RPOP" };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout);
+            // A timeout too large for Duration/Instant blocks forever (no panic).
+            let deadline = std::time::Duration::try_from_secs_f64(timeout).ok().and_then(|d| std::time::Instant::now().checked_add(d));
             loop {
                 for k in &args[..args.len() - 1] {
                     match db.ks.run(pop, std::slice::from_ref(k)) {
@@ -1822,7 +1905,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                         _ => {}
                     }
                 }
-                if timeout > 0.0 && std::time::Instant::now() >= deadline {
+                if timeout > 0.0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                     return Resp::Nil;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2245,7 +2328,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("dim is not an integer"),
             };
-            let n: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let n: usize = match std::str::from_utf8(&args[1]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("n is not an integer"),
             };
@@ -2286,7 +2369,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("dim is not an integer"),
             };
-            let n: usize = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+            let n: usize = match std::str::from_utf8(&args[2]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("n is not an integer"),
             };
@@ -2331,7 +2414,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("nq is not an integer"),
             };
-            let k: usize = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&args[2]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -2376,7 +2459,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if args.len() < 2 {
                 return err("VSEARCH requires k [F cat | L | H t w ...] f1 f2 ...");
             }
-            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -2468,7 +2551,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 return err("VSEARCHNS requires namespace k [F cat | L | H t w ...] f1 f2 ...");
             }
             let namespace = String::from_utf8_lossy(&args[0]).to_string();
-            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -2652,7 +2735,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 return err("VRECOMMEND requires namespace k lambda POS n id... [NEG n id...]");
             }
             let namespace = String::from_utf8_lossy(&args[0]).to_string();
-            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(|v| v.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(parse_count) {
                 Some(v) => v,
                 None => return err("k is not an integer"),
             };
@@ -2698,7 +2781,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
             let namespace = String::from_utf8_lossy(&args[0]).to_string();
             let field = String::from_utf8_lossy(&args[1]).to_string();
-            let k: usize = std::str::from_utf8(&args[2]).ok().and_then(|v| v.parse().ok())
+            let k: usize = std::str::from_utf8(&args[2]).ok().and_then(parse_count)
                 .unwrap_or(10);
             let out: Vec<Resp> = db.router.vectors_ns(&namespace).facet(&field, k)
                 .into_iter()
@@ -2817,7 +2900,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if args.len() < 2 {
                 return err("VSEARCHA requires k f1 f2 ...");
             }
-            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -2845,7 +2928,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 return err("VSEARCHANS requires namespace k f1 f2 ...");
             }
             let namespace = String::from_utf8_lossy(&args[0]).to_string();
-            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -2876,7 +2959,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if args.len() < 3 {
                 return err("VSEARCH.MANY requires k dim f1 f2 ...");
             }
-            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -2923,7 +3006,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 return err("VSEARCH.MANYNS requires namespace k dim f1 f2 ...");
             }
             let namespace = String::from_utf8_lossy(&args[0]).to_string();
-            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&args[1]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -2996,7 +3079,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 return err("TSRANGE.LATEST requires series n");
             }
             let series = String::from_utf8_lossy(&args[0]).to_string();
-            let n: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let n: usize = match std::str::from_utf8(&args[1]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("n is not an integer"),
             };
@@ -3274,7 +3357,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if body.len() < 3 {
                 return err("MEM.RECALL requires [AGENT name] k query f1 f2 ... [WITHMETA]");
             }
-            let k: usize = match std::str::from_utf8(&body[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&body[0]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -3388,7 +3471,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Some(n) => n,
                 None => return err("start is not a u64"),
             };
-            let depth: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let depth: usize = match std::str::from_utf8(&args[1]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("depth is not a usize"),
             };
@@ -3464,7 +3547,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                     "MEM.RECALL.AS_OF requires [AGENT name] k query as_of f1 f2 ... [WITHMETA]",
                 );
             }
-            let k: usize = match std::str::from_utf8(&body[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&body[0]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -3590,7 +3673,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 return err("MEM.EPISODES requires agent limit");
             }
             let agent = String::from_utf8_lossy(&args[0]).to_string();
-            let limit: usize = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse().ok()) {
+            let limit: usize = match std::str::from_utf8(&args[1]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("limit is not a usize"),
             };
@@ -3649,7 +3732,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if args.len() < 3 {
                 return err("RAG.SEARCH requires [AGENT name] k query f1 f2 ...");
             }
-            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&args[0]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -4109,7 +4192,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             if rest.len() < 3 {
                 return err("RAG.CONTEXT requires [AGENT name] k query f1 f2 ...");
             }
-            let k: usize = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
+            let k: usize = match std::str::from_utf8(&rest[0]).ok().and_then(parse_count) {
                 Some(n) => n,
                 None => return err("k is not an integer"),
             };
@@ -4247,12 +4330,13 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             let up = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
             let info = format!(
                 "# Server\r\nredis_version:7.2.0\r\ndbstrike_version:1.0.0\r\nredis_mode:standalone\r\nprocess_id:{}\r\nuptime_in_seconds:{up}\r\n\r\n\
-                 # Clients\r\nconnected_clients_total_seen:{}\r\n\r\n\
+                 # Clients\r\nconnected_clients:{}\r\ntotal_connections_received:{}\r\n\r\n\
                  # Persistence\r\naof_enabled:1\r\nwal_bytes:{}\r\n\r\n\
                  # Keyspace\r\ndb0:keys={},expires={},avg_ttl=0\r\n\r\n\
                  # Replication\r\n{}\r\n\
                  # DB-Strike\r\nsnapshot:{}\r\ncdc_events:{}\r\nengine:unified-mvcc-wal\r\n",
                 std::process::id(),
+                connected_clients(),
                 NEXT_CONN_ID.load(std::sync::atomic::Ordering::Relaxed) - 1,
                 db.engine.wal_bytes(),
                 db.engine.kv_count(),

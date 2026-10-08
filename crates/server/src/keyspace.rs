@@ -549,7 +549,8 @@ pub fn is_keyspace_cmd(name: &str) -> bool {
             | "SINTER" | "SUNION" | "SDIFF" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "SMOVE"
             | "ZADD" | "ZREM" | "ZSCORE" | "ZMSCORE" | "ZINCRBY" | "ZCARD" | "ZCOUNT" | "ZRANK"
             | "ZREVRANK" | "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE"
-            | "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZPOPMIN" | "ZPOPMAX"
+            | "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZPOPMIN" | "ZPOPMAX" | "ZRANGEBYLEX"
+            | "ZREVRANGEBYLEX" | "ZLEXCOUNT" | "ZREMRANGEBYLEX"
             | "PING" | "ECHO" | "TIME"
     )
 }
@@ -564,7 +565,7 @@ pub fn is_keyspace_write(name: &str) -> bool {
                 | "HSTRLEN" | "LLEN" | "LINDEX" | "LRANGE" | "LPOS" | "SISMEMBER" | "SMISMEMBER" | "SCARD"
                 | "SMEMBERS" | "SRANDMEMBER" | "SINTER" | "SUNION" | "SDIFF" | "ZSCORE" | "ZMSCORE" | "ZCARD"
                 | "ZCOUNT" | "ZRANK" | "ZREVRANK" | "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE"
-                | "ZREVRANGEBYSCORE" | "PING" | "ECHO" | "TIME"
+                | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "ZREVRANGEBYLEX" | "ZLEXCOUNT" | "PING" | "ECHO" | "TIME"
         )
 }
 
@@ -867,7 +868,8 @@ fn exec_inner(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
             if v <= 0 {
                 return Err(err(&format!("invalid expire time in '{}' command", name.to_lowercase())));
             }
-            let at = abs_deadline(if name == "SETEX" { "EX" } else { "PX" }, v, cx.now).ok_or_else(not_int)?;
+            let at = abs_deadline(if name == "SETEX" { "EX" } else { "PX" }, v, cx.now)
+                .ok_or_else(|| err(&format!("invalid expire time in '{}' command", name.to_lowercase())))?;
             let old = cx.load(&a[0])?;
             cx.put_str(&a[0], a[2].clone(), &old, Some(at));
             Ok(ok())
@@ -908,9 +910,12 @@ fn exec_inner(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
                 let o = String::from_utf8_lossy(&a[1]).to_ascii_uppercase();
                 if o == "PERSIST" && n == 2 {
                     cx.set_ttl(&a[0], old.ttl, None);
-                } else if n == 3 {
-                    let t = parse_i64(&a[2]).filter(|&t| t > 0).ok_or_else(|| err("invalid expire time in 'getex' command"))?;
-                    let at = abs_deadline(&o, t, cx.now).ok_or_else(|| err("syntax error"))?;
+                } else if n == 3 && matches!(o.as_str(), "EX" | "PX" | "EXAT" | "PXAT") {
+                    let t = parse_i64(&a[2]).ok_or_else(not_int)?;
+                    let at = Some(t)
+                        .filter(|&t| t > 0)
+                        .and_then(|t| abs_deadline(&o, t, cx.now))
+                        .ok_or_else(|| err("invalid expire time in 'getex' command"))?;
                     cx.set_ttl(&a[0], old.ttl, Some(at));
                 } else {
                     return Err(err("syntax error"));
@@ -1010,7 +1015,7 @@ fn exec_inner(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
         }
         "INCRBYFLOAT" => {
             need(n == 2)?;
-            let by = parse_f64(&a[1]).filter(|f| f.is_finite()).ok_or_else(not_float)?;
+            let by = parse_f64(&a[1]).ok_or_else(not_float)?;
             let old = cx.load(&a[0])?;
             let cur = match &old.ent {
                 Ent::None => 0.0,
@@ -1299,7 +1304,7 @@ fn exec_inner(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
                 cx.tx.put(k, Value::Bytes(nv.to_string().into_bytes()));
                 int(nv)
             } else {
-                let by = parse_f64(&a[2]).filter(|f| f.is_finite()).ok_or_else(not_float)?;
+                let by = parse_f64(&a[2]).ok_or_else(not_float)?;
                 let c = match &cur_b {
                     None => 0.0,
                     Some(b) => parse_f64(b).ok_or_else(|| err("hash value is not a float"))?,
@@ -1487,9 +1492,57 @@ fn exec_inner(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
         }
         "LPOS" => {
             need(n >= 2)?;
-            let Some(_) = cx.coll(&a[0], T_LIST)? else { return Ok(Resp::Nil) };
-            let pos = cx.elements(&a[0], SUB_LIST).into_iter().position(|(_, v)| val_bytes(&v) == a[1]);
-            Ok(pos.map_or(Resp::Nil, |p| int(p as i64)))
+            let (mut rank, mut count, mut maxlen) = (1i64, None::<i64>, 0i64);
+            let mut i = 2;
+            while i < n {
+                let opt = String::from_utf8_lossy(&a[i]).to_ascii_uppercase();
+                let v = a.get(i + 1).ok_or_else(|| err("syntax error"))?;
+                let v = parse_i64(v).ok_or_else(not_int)?;
+                match opt.as_str() {
+                    "RANK" if v == 0 => return Err(err("RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list")),
+                    "RANK" if v == i64::MIN => return Err(err("value is out of range, value must between -9223372036854775807 and 9223372036854775807")),
+                    "RANK" => rank = v,
+                    "COUNT" if v < 0 => return Err(err("COUNT can't be negative")),
+                    "COUNT" => count = Some(v),
+                    "MAXLEN" if v < 0 => return Err(err("MAXLEN can't be negative")),
+                    "MAXLEN" => maxlen = v,
+                    _ => return Err(err("syntax error")),
+                }
+                i += 2;
+            }
+            let Some((m, _)) = cx.coll(&a[0], T_LIST)? else {
+                return Ok(if count.is_some() { arr(vec![]) } else { Resp::Nil });
+            };
+            let len = m.len as i64;
+            let mut elems = cx.elements(&a[0], SUB_LIST);
+            if rank < 0 {
+                elems.reverse();
+            }
+            let want = match count {
+                Some(0) => usize::MAX,
+                Some(c) => c as usize,
+                None => 1,
+            };
+            let (mut skip, mut found) = (rank.unsigned_abs() - 1, Vec::new());
+            for (idx, (_, v)) in elems.iter().enumerate() {
+                if maxlen != 0 && idx as i64 >= maxlen {
+                    break;
+                }
+                if val_bytes(v) == a[1] {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    found.push(if rank < 0 { len - 1 - idx as i64 } else { idx as i64 });
+                    if found.len() >= want {
+                        break;
+                    }
+                }
+            }
+            Ok(match count {
+                Some(_) => arr(found.into_iter().map(int).collect()),
+                None => found.first().map_or(Resp::Nil, |&p| int(p)),
+            })
         }
         "RPOPLPUSH" | "LMOVE" => {
             let (from_left, to_left) = if name == "RPOPLPUSH" {
@@ -1576,6 +1629,11 @@ fn exec_inner(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
             };
             if name == "SPOP" && count.is_some_and(|c| c < 0) {
                 return Err(err("value is out of range, must be positive"));
+            }
+            // Redis rejects i64::MIN (it cannot be negated); a huge negative
+            // count would otherwise build an unbounded reply and abort.
+            if count.is_some_and(|c| c == i64::MIN || c < -(MAX_RANDOM_PICKS as i64)) {
+                return Err(err("value is out of range, value must between -9223372036854775807 and 9223372036854775807"));
             }
             let Some((mut m, ttl)) = cx.coll(&a[0], T_SET)? else {
                 return Ok(if count.is_some() { arr(vec![]) } else { Resp::Nil });
@@ -1815,11 +1873,24 @@ fn exec_inner(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
             let r = if name == "ZRANK" { rank } else { m.len as i64 - 1 - rank };
             Ok(if with { arr(vec![int(r), bulk(fmt_f64(score).into_bytes())]) } else { int(r) })
         }
-        "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" => zrange(cx, name, a),
-        "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" => {
+        "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "ZREVRANGEBYLEX" => {
+            zrange(cx, name, a)
+        }
+        "ZLEXCOUNT" => {
             need(n == 3)?;
+            let (lo, hi) = (lex_bound(&a[1])?, lex_bound(&a[2])?);
+            if cx.coll(&a[0], T_ZSET)?.is_none() {
+                return Ok(int(0));
+            }
+            Ok(int(zby_lex(cx, &a[0], &lo, &hi, false, 0, usize::MAX).len() as i64))
+        }
+        "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZREMRANGEBYLEX" => {
+            need(n == 3)?;
+            let lex = if name == "ZREMRANGEBYLEX" { Some((lex_bound(&a[1])?, lex_bound(&a[2])?)) } else { None };
             let Some((mut m, ttl)) = cx.coll(&a[0], T_ZSET)? else { return Ok(int(0)) };
-            let victims: Vec<(f64, Vec<u8>)> = if name == "ZREMRANGEBYSCORE" {
+            let victims: Vec<(f64, Vec<u8>)> = if let Some((lo, hi)) = lex {
+                zby_lex(cx, &a[0], &lo, &hi, false, 0, usize::MAX)
+            } else if name == "ZREMRANGEBYSCORE" {
                 zby_score(cx, &a[0], score_bound(&a[1])?, score_bound(&a[2])?, false, 0, usize::MAX)
             } else {
                 let (s, e) = (parse_i64(&a[1]).ok_or_else(not_int)?, parse_i64(&a[2]).ok_or_else(not_int)?);
@@ -1885,18 +1956,19 @@ fn abs_deadline(unit: &str, v: i64, now: u64) -> Option<u64> {
 /// Like `abs_deadline` but allows non-positive values (EXPIRE with a past
 /// deadline deletes the key). Clamps at 0.
 fn abs_deadline_signed(unit: &str, v: i64, now: u64) -> Option<u64> {
-    let ms: i128 = match unit {
-        "EX" => now as i128 + (v as i128) * 1000,
-        "PX" => now as i128 + v as i128,
-        "EXAT" => (v as i128) * 1000,
-        "PXAT" => v as i128,
+    // Overflow in either direction is an error, as in Redis (`EXPIRE k
+    // -9223372036854775808` must not silently delete the key).
+    let ms = match unit {
+        "EX" | "EXAT" => v.checked_mul(1000)?,
+        "PX" | "PXAT" => v,
         _ => return None,
     };
-    if ms > i64::MAX as i128 {
-        return None;
-    }
+    let ms = if matches!(unit, "EX" | "PX") { ms.checked_add(i64::try_from(now).ok()?)? } else { ms };
     Some(ms.max(0) as u64)
 }
+
+/// Most picks one `SRANDMEMBER key -count` may return.
+const MAX_RANDOM_PICKS: u64 = 1 << 24;
 
 fn set_add(cx: &mut Ctx, key: &[u8], m: &mut Meta, member: &[u8]) -> bool {
     let mk = ekey(key, SUB_SET, member);
@@ -2050,11 +2122,72 @@ fn zby_rank(cx: &mut Ctx, key: &[u8], offset: usize, count: usize, rev: bool) ->
     out
 }
 
+/// One end of a lex range: `-` / `+` (unbounded) or `[x` / `(x`.
+enum LexBound {
+    Min,
+    Max,
+    Incl(Vec<u8>),
+    Excl(Vec<u8>),
+}
+
+fn lex_bound(a: &[u8]) -> R<LexBound> {
+    match a.first() {
+        Some(b'-') if a.len() == 1 => Ok(LexBound::Min),
+        Some(b'+') if a.len() == 1 => Ok(LexBound::Max),
+        Some(b'[') => Ok(LexBound::Incl(a[1..].to_vec())),
+        Some(b'(') => Ok(LexBound::Excl(a[1..].to_vec())),
+        _ => Err(err("min or max not valid string range item")),
+    }
+}
+
+fn lex_above(m: &[u8], lo: &LexBound) -> bool {
+    match lo {
+        LexBound::Min => true,
+        LexBound::Max => false,
+        LexBound::Incl(x) => m >= x.as_slice(),
+        LexBound::Excl(x) => m > x.as_slice(),
+    }
+}
+
+fn lex_below(m: &[u8], hi: &LexBound) -> bool {
+    match hi {
+        LexBound::Min => false,
+        LexBound::Max => true,
+        LexBound::Incl(x) => m <= x.as_slice(),
+        LexBound::Excl(x) => m < x.as_slice(),
+    }
+}
+
+/// Members within a lex range (Redis requires equal scores for lex ranges
+/// to be meaningful; members are then in byte order within the index).
+fn zby_lex(cx: &mut Ctx, key: &[u8], lo: &LexBound, hi: &LexBound, rev: bool, offset: usize, count: usize) -> Vec<(f64, Vec<u8>)> {
+    let (s, e) = erange(key, SUB_ZSCORE);
+    let plen = s.len();
+    let mut out = Vec::new();
+    let mut skipped = 0;
+    if count == 0 {
+        return out;
+    }
+    cx.each(&s.clone(), s, e, rev, |k, _| {
+        let m = &k[plen + 8..];
+        if lex_above(m, lo) && lex_below(m, hi) {
+            if skipped < offset {
+                skipped += 1;
+            } else {
+                out.push((score_from(&k[plen..plen + 8]), m.to_vec()));
+            }
+        }
+        out.len() < count
+    });
+    out
+}
+
 fn zrange(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
     if a.len() < 3 {
         return Err(wrong_args(name));
     }
     let (mut byscore, mut rev, mut with) = (name.contains("BYSCORE"), name.starts_with("ZREV"), false);
+    let mut bylex = name.contains("BYLEX");
     let mut limit: Option<(i64, i64)> = None;
     let mut i = 3;
     while i < a.len() {
@@ -2062,7 +2195,7 @@ fn zrange(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
             "WITHSCORES" => with = true,
             "BYSCORE" if name == "ZRANGE" => byscore = true,
             "REV" if name == "ZRANGE" => rev = true,
-            "BYLEX" => return Err(err("BYLEX is not supported")),
+            "BYLEX" if name == "ZRANGE" => bylex = true,
             "LIMIT" => {
                 let o = a.get(i + 1).and_then(|v| parse_i64(v)).ok_or_else(|| err("syntax error"))?;
                 let c = a.get(i + 2).and_then(|v| parse_i64(v)).ok_or_else(|| err("syntax error"))?;
@@ -2073,15 +2206,32 @@ fn zrange(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
         }
         i += 1;
     }
+    if byscore && bylex {
+        return Err(err("syntax error"));
+    }
+    if bylex && with {
+        return Err(err("syntax error, WITHSCORES not supported in combination with BYLEX"));
+    }
+    let (off, cnt) = match limit {
+        Some((o, c)) => (o.max(0) as usize, if c < 0 { usize::MAX } else { c as usize }),
+        None => (0, usize::MAX),
+    };
+    let lex = if bylex {
+        // REV takes max first, like BYSCORE.
+        let (b1, b2) = (lex_bound(&a[1])?, lex_bound(&a[2])?);
+        Some(if rev { (b2, b1) } else { (b1, b2) })
+    } else {
+        None
+    };
     let Some((m, _)) = cx.coll(&a[0], T_ZSET)? else { return Ok(arr(vec![])) };
-    let items = if byscore {
+    let items = if limit.is_some_and(|(o, _)| o < 0) && (bylex || byscore) {
+        Vec::new() // Redis: a negative LIMIT offset matches nothing
+    } else if let Some((lo, hi)) = lex {
+        zby_lex(cx, &a[0], &lo, &hi, rev, off, cnt)
+    } else if byscore {
         // ZREVRANGEBYSCORE / ZRANGE .. BYSCORE REV take max first.
         let (b1, b2) = (score_bound(&a[1])?, score_bound(&a[2])?);
         let (lo, hi) = if rev { (b2, b1) } else { (b1, b2) };
-        let (off, cnt) = match limit {
-            Some((o, c)) => (o.max(0) as usize, if c < 0 { usize::MAX } else { c as usize }),
-            None => (0, usize::MAX),
-        };
         zby_score(cx, &a[0], lo, hi, rev, off, cnt)
     } else {
         if limit.is_some() {

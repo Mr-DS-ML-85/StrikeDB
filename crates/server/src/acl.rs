@@ -680,11 +680,11 @@ pub fn command_categories(cmd: &str) -> &'static [PermCategory] {
         "HGET" | "HMGET" | "HEXISTS" | "HLEN" | "HGETALL" | "HKEYS" | "HVALS" | "HSTRLEN" | "LLEN" | "LINDEX"
         | "LRANGE" | "LPOS" | "SISMEMBER" | "SMISMEMBER" | "SCARD" | "SMEMBERS" | "SRANDMEMBER" | "SINTER"
         | "SUNION" | "SDIFF" | "ZSCORE" | "ZMSCORE" | "ZCARD" | "ZCOUNT" | "ZRANK" | "ZREVRANK" | "ZRANGE"
-        | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" => &[Read],
+        | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "ZREVRANGEBYLEX" | "ZLEXCOUNT" => &[Read],
         "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX"
         | "LPOP" | "RPOP" | "BLPOP" | "BRPOP" | "LSET" | "LTRIM" | "LREM" | "LINSERT" | "RPOPLPUSH" | "LMOVE"
         | "SADD" | "SREM" | "SPOP" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "SMOVE" | "ZADD" | "ZREM"
-        | "ZINCRBY" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZPOPMIN" | "ZPOPMAX" => &[Write],
+        | "ZINCRBY" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZREMRANGEBYLEX" | "ZPOPMIN" | "ZPOPMAX" => &[Write],
         "FLUSHALL" | "FLUSHDB" | "CONFIG" | "CHECKPOINT" | "MEMTRACK" | "SHUTDOWN" | "ACL" | "VSNAPSHOT"
         | "GPU.LOAD" | "GPU.UNLOAD" | "GPU.MODE" | "GPU.SWEEP" | "CACHE.CLEAR" | "CACHE.BUGS" | "CACHE.TRACES" => &[Admin, Dangerous],
         "GPU.INFO" | "ROLE" => &[Admin, Read],
