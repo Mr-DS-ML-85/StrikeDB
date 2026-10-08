@@ -23,6 +23,7 @@
 mod acl;
 mod pubsub;
 mod keyspace;
+mod replication;
 
 /// Keep the allocator's books for this process.
 ///
@@ -87,6 +88,12 @@ struct Db {
     scan_cursors: Mutex<HashMap<u64, Vec<u8>>>,
     /// Redis keyspace executor (strings, TTL, hash/list/set/zset, MULTI).
     ks: keyspace::Keyspace,
+    /// Primary side: connected replicas.
+    repl_hub: Arc<replication::Hub>,
+    /// Replica side: who we follow and how far we've applied.
+    replica: replication::ReplicaState,
+    /// Replica: replicated agent-memory writes arrived; mirrors need a reload.
+    mem_dirty: std::sync::atomic::AtomicBool,
 }
 
 /// SCAN cursor ids → resume key. Cursors are server-side so a scan costs
@@ -171,6 +178,14 @@ fn main() -> std::io::Result<()> {
 
     let crdts = load_crdts(&engine);
     let ks = keyspace::Keyspace::open(Arc::clone(&engine));
+    // Replication hooks run on the commit thread, in stream order.
+    let repl_hub = Arc::new(replication::Hub::default());
+    {
+        let h = Arc::clone(&repl_hub);
+        engine.subscribe(Arc::new(move |m: &storage::Mutation| h.on_commit(m)));
+        let h = Arc::clone(&repl_hub);
+        engine.subscribe_flush(Arc::new(move || h.on_flush()));
+    }
     let db = Arc::new(Db {
         engine,
         reactive,
@@ -189,7 +204,30 @@ fn main() -> std::io::Result<()> {
         pubsub: pubsub::Broker::default(),
         scan_cursors: Mutex::new(HashMap::new()),
         ks,
+        repl_hub,
+        replica: replication::ReplicaState::default(),
+        mem_dirty: std::sync::atomic::AtomicBool::new(false),
     });
+    // Replica: rebuild agent-memory mirrors shortly after replicated memory
+    // writes (their mirrors span several key families; a debounced reload is
+    // simpler and exact).
+    {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if db.mem_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                db.rag.memory().reload();
+                db.rag.invalidate_query_cache();
+            }
+        });
+    }
+    if let Ok(target) = std::env::var("DBSTRIKE_REPLICAOF") {
+        // "host:port" — start as a replica.
+        if let Some((h, p)) = target.rsplit_once(':') {
+            let r = replication::replicaof(&db, &[h.as_bytes().to_vec(), p.as_bytes().to_vec()]);
+            eprintln!("[REPL] DBSTRIKE_REPLICAOF={target}: {r:?}");
+        }
+    }
     // Automatic checkpoint: the WAL used to grow without bound unless an
     // operator ran CHECKPOINT (246 MB after one benchmark session). Now that
     // a checkpoint no longer blocks writers, compact once the live WAL passes
@@ -402,6 +440,7 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
         // Commands from a SUBSCRIBE onward (pipelined commands after it must
         // be processed in subscribe mode, not silently dropped).
         let mut subscribe_after_batch: Option<Vec<Vec<Vec<u8>>>> = None;
+        let mut replsync_after_batch = false;
         let mut i = 0usize;
         while i < cmds.len() {
             let name = String::from_utf8_lossy(&cmds[i][0]).to_uppercase();
@@ -513,6 +552,26 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
                     i += 1;
                     continue;
                 }
+            }
+
+            // ── Replication ───────────────────────────────────────────
+            if db.replica.is_replica() && replication::is_write_command(&name) {
+                if multi.is_some() {
+                    multi_err = true;
+                }
+                write_resp_buf_as(&mut out, &err("READONLY You can't write against a read only replica."), resp3_conn)?;
+                i += 1;
+                continue;
+            }
+            if name == "REPLICAOF" || name == "SLAVEOF" {
+                let r = replication::replicaof(&db, args);
+                write_resp_buf_as(&mut out, &r, resp3_conn)?;
+                i += 1;
+                continue;
+            }
+            if name == "REPLSYNC" {
+                replsync_after_batch = true;
+                break;
             }
 
             // ── Transactions ──────────────────────────────────────────
@@ -835,6 +894,11 @@ fn handle(stream: TcpStream, db: Arc<Db>, log_file: &Option<std::sync::Arc<std::
         if quit {
             return Ok(());
         }
+        if replsync_after_batch {
+            // This connection now carries the replication stream.
+            let s = stream.lock().unwrap().try_clone()?;
+            return replication::serve_replica(&db, s, conn_id);
+        }
         if let Some(sub_cmds) = subscribe_after_batch {
             let ctx = SubCtx { conn_id, resp3: resp3_conn, user: current_user.clone() };
             match subscribe_mode(&db, &stream, &ctx, sub_cmds, &mut buf)? {
@@ -1056,7 +1120,7 @@ fn err(msg: &str) -> Resp {
     // Callers may pass a message that already carries a Redis error code
     // (`NOAUTH ...`, `ERR ...`); prefixing again produced `-ERR ERR ...` /
     // `-ERR NOAUTH ...`, which clients match on and mis-classify.
-    const CODES: &[&str] = &["ERR", "NOAUTH", "NOPERM", "NOPROTO", "WRONGPASS", "WRONGTYPE", "EXECABORT", "NOSCRIPT", "BUSYKEY"];
+    const CODES: &[&str] = &["ERR", "NOAUTH", "NOPERM", "NOPROTO", "WRONGPASS", "WRONGTYPE", "EXECABORT", "NOSCRIPT", "BUSYKEY", "READONLY"];
     let first = msg.split(' ').next().unwrap_or("");
     if CODES.contains(&first) {
         Resp::Error(msg.to_string())
@@ -1690,6 +1754,52 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                 Resp::Simple("OK".into())
             } else {
                 err("CONFIG subcommand must be GET or SET")
+            }
+        }
+        "ROLE" => match db.replica.master() {
+            Some((h, p)) => Resp::Array(vec![
+                Resp::Bulk(b"slave".to_vec()),
+                Resp::Bulk(h.into_bytes()),
+                Resp::Int(p as i64),
+                Resp::Bulk(if db.replica.link_up() { b"connected".to_vec() } else { b"connect".to_vec() }),
+                Resp::Int(db.replica.applied() as i64),
+            ]),
+            None => Resp::Array(vec![
+                Resp::Bulk(b"master".to_vec()),
+                Resp::Int(db.engine.snapshot() as i64),
+                Resp::Array(
+                    db.repl_hub
+                        .describe()
+                        .into_iter()
+                        .map(|(addr, acked)| {
+                            let (ip, port) = addr.rsplit_once(':').unwrap_or((addr.as_str(), "0"));
+                            Resp::Array(vec![
+                                Resp::Bulk(ip.as_bytes().to_vec()),
+                                Resp::Bulk(port.as_bytes().to_vec()),
+                                Resp::Bulk(acked.to_string().into_bytes()),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ]),
+        },
+        // WAIT numreplicas timeout_ms -> replicas that have applied every
+        // write committed before this call (they ack the primary ts).
+        "WAIT" => {
+            let (Some(n), Some(t)) = (
+                args.first().and_then(|a| std::str::from_utf8(a).ok()?.parse::<usize>().ok()),
+                args.get(1).and_then(|a| std::str::from_utf8(a).ok()?.parse::<u64>().ok()),
+            ) else {
+                return err("WAIT requires numreplicas timeout");
+            };
+            let target = db.engine.snapshot();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(t);
+            loop {
+                let got = db.repl_hub.acked_at_least(target);
+                if got >= n || (t > 0 && std::time::Instant::now() >= deadline) {
+                    return Resp::Int(got as i64);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         // Blocking pops. Connections are thread-per-client, so waiting here
@@ -4140,12 +4250,29 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                  # Clients\r\nconnected_clients_total_seen:{}\r\n\r\n\
                  # Persistence\r\naof_enabled:1\r\nwal_bytes:{}\r\n\r\n\
                  # Keyspace\r\ndb0:keys={},expires={},avg_ttl=0\r\n\r\n\
+                 # Replication\r\n{}\r\n\
                  # DB-Strike\r\nsnapshot:{}\r\ncdc_events:{}\r\nengine:unified-mvcc-wal\r\n",
                 std::process::id(),
                 NEXT_CONN_ID.load(std::sync::atomic::Ordering::Relaxed) - 1,
                 db.engine.wal_bytes(),
                 db.engine.kv_count(),
                 db.ks.expiry.len(),
+                match db.replica.master() {
+                    Some((h, p)) => format!(
+                        "role:slave\r\nmaster_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:{}\r\nmaster_last_io_seconds_ago:{}\r\nslave_repl_offset:{}\r\nslave_read_only:1",
+                        if db.replica.link_up() { "up" } else { "down" },
+                        db.replica.last_io_secs() as i64,
+                        db.replica.applied()
+                    ),
+                    None => {
+                        let reps = db.repl_hub.describe();
+                        let mut s = format!("role:master\r\nconnected_slaves:{}\r\nmaster_repl_offset:{}", reps.len(), db.engine.snapshot());
+                        for (i, (addr, acked)) in reps.iter().enumerate() {
+                            s.push_str(&format!("\r\nslave{i}:addr={addr},state=online,offset={acked}"));
+                        }
+                        s
+                    }
+                },
                 db.engine.snapshot(),
                 db.reactive.cdc_len_peek()
             );

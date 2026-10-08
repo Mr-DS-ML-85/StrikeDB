@@ -257,7 +257,19 @@ impl Memory {
         // answered in its place). The reserved prefix gives memory its own
         // graph, its own dim, and keeps VLISTNS clean.
         let vectors = VectorIndex::open_ns(Arc::clone(&engine), "__ltm__".to_string());
-        // resume id counter + live count + salience cache from persisted LTM
+        let (max, count, sal_cache) = Self::scan_ltm(&engine);
+        Self {
+            engine,
+            vectors,
+            next_id: std::sync::atomic::AtomicU64::new(max + 1),
+            ltm_count: std::sync::atomic::AtomicU64::new(count),
+            ep_seq: std::sync::atomic::AtomicU64::new(0),
+            salience_cache: std::sync::RwLock::new(sal_cache),
+        }
+    }
+
+    /// Resume id counter + live count + salience cache from persisted LTM.
+    fn scan_ltm(engine: &Engine) -> (u64, u64, HashMap<u64, f32>) {
         let mut max = 0u64;
         let mut count = 0u64;
         let mut sal_cache: HashMap<u64, f32> = HashMap::new();
@@ -277,14 +289,17 @@ impl Memory {
                 }
             }
         }
-        Self {
-            engine,
-            vectors,
-            next_id: std::sync::atomic::AtomicU64::new(max + 1),
-            ltm_count: std::sync::atomic::AtomicU64::new(count),
-            ep_seq: std::sync::atomic::AtomicU64::new(0),
-            salience_cache: std::sync::RwLock::new(sal_cache),
-        }
+        (max, count, sal_cache)
+    }
+
+    /// Rebuild every RAM mirror (ids, count, salience, semantic graph) from
+    /// the substrate — a replica after a full sync or new replicated writes.
+    pub fn reload(&self) {
+        let (max, count, sal) = Self::scan_ltm(&self.engine);
+        self.next_id.store(max + 1, std::sync::atomic::Ordering::SeqCst);
+        self.ltm_count.store(count, std::sync::atomic::Ordering::SeqCst);
+        *self.salience_cache.write().unwrap() = sal;
+        self.vectors.reload();
     }
 
     fn alloc_id(&self) -> u64 {

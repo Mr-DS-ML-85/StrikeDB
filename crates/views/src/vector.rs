@@ -5379,6 +5379,27 @@ impl VectorIndex {
         *self.gpu_idx.write().unwrap() = None;
     }
 
+    /// Rebuild the in-RAM graph from the durable `vec:` keys (a replica after
+    /// a full sync or on promotion).
+    pub fn reload(&self) {
+        let fresh = VectorIndex::open_ns(Arc::clone(&self.engine), self.prefix.clone());
+        *self.hnsw.write().unwrap() = fresh.hnsw.into_inner().unwrap_or_else(|p| p.into_inner());
+        *self.sparse.write().unwrap() = fresh.sparse.into_inner().unwrap_or_else(|p| p.into_inner());
+        *self.gpu_idx.write().unwrap() = None;
+    }
+
+    /// Remove `id` from the in-RAM graph only (its durable key was already
+    /// deleted elsewhere, e.g. by a replicated tombstone).
+    pub fn forget_graph_only(&self, id: u64) {
+        let mut g = self.hnsw.write().unwrap();
+        if let Some(&idx) = g.id_to_idx.get(&id) {
+            g.nodes[idx].deleted = true;
+        }
+        g.id_to_idx.remove(&id);
+        drop(g);
+        self.sparse.write().unwrap().remove(id);
+    }
+
     /// Upload vectors + flat CSR graph to GPU for APGC-style GPU search.
     /// Uses VUGVA-style unified memory: GPU reads from RAM directly.
     /// No cuMemcpyHtoD — CUDA page migrator handles data transfer.

@@ -360,7 +360,6 @@ impl Keyspace {
 
     /// Note keys written by an external path (replication) so the RAM
     /// mirrors stay in step.
-    #[allow(dead_code)] // used by replication
     pub fn observe(&self, key: &[u8], value: &Value) {
         if let Some(user) = key.strip_prefix(b"exp:") {
             match value {

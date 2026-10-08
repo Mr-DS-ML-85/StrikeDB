@@ -39,6 +39,9 @@ unrelated instance may run at `:6380` from `/run/media/irfan/models/StrikeDB`.
 | FLUSHALL | ✅ real wipe w/ zero-copy backup `<wal>.bak-<ms>` + `.snap` twin; undo documented; serialized on flusher thread; resets Memory mirrors + RAG query cache |
 | HELLO | ✅ served pre-auth; RESP2 flat array / RESP3 `%` map negotiation; `_` nulls per-connection after proto-3; embedded AUTH honored |
 | Durability proofs | ✅ `make prove-it` — 39 checks / 6 phases, exit 0 = all held |
+| Redis keyspace | ✅ strings + TTL (lazy+active, durable), hash/list/set/zset, BLPOP/BRPOP, MULTI/EXEC/WATCH (one commit-path op: atomic+durable), SCAN cursor. `tests/redis_diff.py` = 0 diffs vs real redis-server over 48k random cmds (sequential + pipelined); `tests/test_keyspace.py` 40/40 |
+| Replication | ✅ async primary→replica: `REPLICAOF host port` / `DBSTRIKE_REPLICAOF=host:port`, full sync + live stream (FLUSHALL in order), read-only replicas, `WAIT`, `ROLE`, INFO replication, resync on reconnect, `REPLICAOF NO ONE` promotion. `DBSTRIKE_MASTERAUTH`/`DBSTRIKE_MASTERUSER` for an auth-enabled primary. `tests/test_replication.py` 33/33 |
+| Checkpoints | ✅ non-blocking (WAL rotation to `<wal>.ckpt` + pinned snapshot streamed shard by shard); auto when WAL > `DBSTRIKE_CHECKPOINT_MB` (256) |
 | GPU APGC build | ✅ ~1.4–3× faster than CPU build (recall-restored config), NVRTC runtime compile, zero CUDA deps |
 | GPU batch search | ✅ 1.93× CPU (was 0.79× before f32-scoring kernel fix); single queries always CPU (routing by shape) |
 
@@ -128,8 +131,8 @@ undoable offline; `GETAT` and the 2-arg range form `SCAN start end` (alias `SCAN
 
 1. **WAL isolation**: ALWAYS set `DBSTRIKE_WAL=<path>` per server run. Default
    is `dbstrike.wal` in cwd — shared across everything.
-2. **Cleanup includes `.snap`**: `rm -f dbstrike.wal dbstrike.wal.snap
-   dbstrike.wal.bak-*`. Deleting only the WAL resurrects the checkpoint world
+2. **Cleanup includes `.snap` and `.ckpt`**: `rm -f dbstrike.wal dbstrike.wal.snap
+   dbstrike.wal.ckpt dbstrike.wal.bak-*`. Deleting only the WAL resurrects the checkpoint world
    on next boot (caused an entire day of phantom state: ids at 52, dbsize
    200588, ghost namespaces).
 3. **Kill strays by port→pid**, never pkill: `ss -tlnp | grep <port> | grep -oE

@@ -123,6 +123,15 @@ pub struct Mutation {
 }
 
 impl Mutation {
+    /// Wire/disk encoding (replication stream, snapshot records).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.encode()
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Mutation> {
+        Mutation::decode(b)
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.ts.to_le_bytes());
@@ -361,7 +370,9 @@ fn apply_refs_to_shards(core: &FlushCore, muts: &[&Mutation]) {
             continue;
         }
         let mut data = core.shards[i].write().unwrap();
-        let pin = core.pin_ts.load(Ordering::SeqCst);
+        // Keep whatever version the OLDEST open snapshot (a checkpoint, a
+        // replica sync, a transaction) still needs.
+        let pin = core.active.lock().unwrap().keys().next().copied().unwrap_or(0);
         let mut delta = 0i64;
         let mut dead: Vec<(Key, u64)> = Vec::new();
         for m in items {
@@ -535,9 +546,9 @@ struct FlushCore {
     /// Newest tombstone ts whose chain was physically removed: a point read
     /// of a missing key at a snapshot below this cannot be answered exactly.
     gc_horizon: AtomicU64,
-    /// Snapshot ts an in-progress checkpoint is reading (0 = none): version
-    /// pruning keeps whatever that snapshot needs.
-    pin_ts: AtomicU64,
+    /// Callbacks run right after a FLUSHALL wipe, on the commit thread, in
+    /// order with the mutation stream (replication needs the exact point).
+    flush_subscribers: RwLock<Vec<Arc<dyn Fn() + Send + Sync>>>,
     /// Highest commit ts written to the WAL so far (the rotation boundary of
     /// a non-blocking checkpoint).
     last_appended: AtomicU64,
@@ -707,7 +718,7 @@ impl Engine {
             active: Mutex::new(BTreeMap::new()),
             graveyard: Mutex::new(Vec::new()),
             gc_horizon: AtomicU64::new(gc_horizon),
-            pin_ts: AtomicU64::new(0),
+            flush_subscribers: RwLock::new(Vec::new()),
             last_appended: AtomicU64::new(max_ts),
         });
 
@@ -795,6 +806,49 @@ impl Engine {
             }
         }
         n
+    }
+
+    /// Register a callback run right after every FLUSHALL wipe, in stream
+    /// order with commit subscribers.
+    pub fn subscribe_flush(&self, cb: Arc<dyn Fn() + Send + Sync>) {
+        self.core.flush_subscribers.write().unwrap().push(cb);
+    }
+
+    /// Visit every live key as of the current snapshot, shard by shard (each
+    /// shard's read lock is held only while copying it). The snapshot is
+    /// pinned for the duration, and its ts is returned BEFORE visiting via
+    /// `on_start`, so a caller that subscribed to commits beforehand can
+    /// forward exactly the commits newer than the dump.
+    pub fn dump(&self, on_start: impl FnOnce(u64), mut f: impl FnMut(Mutation)) {
+        let snap = {
+            let mut a = self.core.active.lock().unwrap();
+            let s = self.snapshot();
+            *a.entry(s).or_insert(0) += 1;
+            s
+        };
+        on_start(snap);
+        for sh in &self.core.shards {
+            let page: Vec<Mutation> = {
+                let data = sh.read().unwrap();
+                data.iter()
+                    .filter_map(|(k, c)| {
+                        let v = c.visible(snap)?;
+                        let ts = c.versions.iter().rev().find(|x| x.ts <= snap).map_or(0, |x| x.ts);
+                        Some(Mutation { key: k.clone(), value: v.clone(), ts })
+                    })
+                    .collect()
+            };
+            for m in page {
+                f(m);
+            }
+        }
+        let mut a = self.core.active.lock().unwrap();
+        if let Some(c) = a.get_mut(&snap) {
+            *c -= 1;
+            if *c == 0 {
+                a.remove(&snap);
+            }
+        }
     }
 
     /// Register a commit subscriber (reactive sync / CDC).
@@ -1327,10 +1381,12 @@ fn spawn_flusher(core: Arc<FlushCore>, wal_path: PathBuf) -> JoinHandle<()> {
         if wipe_ran {
             if let Some(bak) = batch.iter().find_map(|pw| pw.flush_all.clone()) {
                 match Self::perform_flush_all(&core, &wal_path, &bak) {
-                    Ok(()) => eprintln!(
-                        "[FLUSH] full wipe OK · WAL+snap backed up at {}",
-                        bak
-                    ),
+                    Ok(()) => {
+                        eprintln!("[FLUSH] full wipe OK · WAL+snap backed up at {}", bak);
+                        for f in core.flush_subscribers.read().unwrap().iter() {
+                            f();
+                        }
+                    }
                     Err(e) => flush_all_err = Some(e.to_string()),
                 }
             }
@@ -1465,9 +1521,8 @@ fn perform_flush_all(core: &FlushCore, wal_path: &Path, bak: &str) -> io::Result
         //   1. Under the WAL lock: rename the live WAL to `<wal>.ckpt` and
         //      open a fresh one. S = highest ts in the rotated segment; every
         //      later commit has a larger ts and lands in the new WAL.
-        //   2. Pin S: register it as an open snapshot (tombstone GC keeps
-        //      what S needs) and as `pin_ts` (version pruning keeps the
-        //      version S reads).
+        //   2. Pin S: register it as an open snapshot, so tombstone GC and
+        //      version pruning both keep what S needs.
         //   3. Stream the state visible at S into `<snap>.tmp`, one shard at
         //      a time, fsync, atomically rename over `<snap>`.
         //   4. Delete `<wal>.ckpt` — the snapshot now covers it.
@@ -1499,7 +1554,6 @@ fn perform_flush_all(core: &FlushCore, wal_path: &Path, bak: &str) -> io::Result
             let mut a = self.core.active.lock().unwrap();
             *a.entry(snap_ts).or_insert(0) += 1;
         }
-        self.core.pin_ts.store(snap_ts, Ordering::SeqCst);
         let result = (|| -> io::Result<(u64, u64)> {
             // Everything up to S was appended; wait until it is also applied.
             while self.core.visible_ts.load(Ordering::SeqCst) < snap_ts {
@@ -1512,7 +1566,6 @@ fn perform_flush_all(core: &FlushCore, wal_path: &Path, bak: &str) -> io::Result
             let bytes = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
             Ok((n, bytes))
         })();
-        self.core.pin_ts.store(0, Ordering::SeqCst);
         {
             let mut a = self.core.active.lock().unwrap();
             if let Some(c) = a.get_mut(&snap_ts) {

@@ -687,7 +687,8 @@ pub fn command_categories(cmd: &str) -> &'static [PermCategory] {
         | "ZINCRBY" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZPOPMIN" | "ZPOPMAX" => &[Write],
         "FLUSHALL" | "FLUSHDB" | "CONFIG" | "CHECKPOINT" | "MEMTRACK" | "SHUTDOWN" | "ACL" | "VSNAPSHOT"
         | "GPU.LOAD" | "GPU.UNLOAD" | "GPU.MODE" | "GPU.SWEEP" | "CACHE.CLEAR" | "CACHE.BUGS" | "CACHE.TRACES" => &[Admin, Dangerous],
-        "GPU.INFO" => &[Admin, Read],
+        "GPU.INFO" | "ROLE" => &[Admin, Read],
+        "WAIT" => &[Connection],
         // VBULKLOAD reads an arbitrary server-side file path.
         "VBULKLOAD" | "VBULKLOADNS" => &[Vector, Write, Dangerous],
         "VSEARCH" | "VSEARCHNS" | "VSEARCHA" | "VSEARCHANS" | "VSEARCH.MANY" | "VSEARCH.MANYNS" | "VGETPAYLOAD"
