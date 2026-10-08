@@ -56,10 +56,13 @@ def _start_server(wal_path=None, fresh=True):
     global _server_proc
     wal = wal_path or os.path.join("/tmp", f"dbstrike_suite_{PORT}.wal")
     if fresh:
-        try:
-            os.remove(wal)
-        except OSError:
-            pass
+        # Remove the checkpoint twin too: deleting only the WAL resurrects the
+        # last CHECKPOINT's world on the next boot (status.md rule 2).
+        for f in (wal, wal + ".snap"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
     _server_proc = subprocess.Popen(
         [os.path.abspath(BIN), f"{HOST}:{PORT}"],
         env={**os.environ, "DBSTRIKE_WAL": wal},
@@ -896,14 +899,26 @@ def test_large_scale_vector():
     # Keep the last 200 for ground-truth recall check.
     kept = {}
     print(f"  ingesting {N:,} × {DIM}-d vectors ...")
+    # Earlier sections leave a 16-d default index behind, and the server now
+    # (correctly) rejects mismatched-dim VADDs — start this section clean.
+    c.cmd("FLUSHALL")
     t0 = time.perf_counter()
+    acked = 0
+    first_err = None
     for i in range(N):
         v = randvec()
         if N - i <= 200:
             kept[400000 + i] = v
-        c.cmd("VADD", 400000 + i, *v)
+        r = c.cmd("VADD", 400000 + i, *v)
+        if r == "OK":
+            acked += 1
+        elif first_err is None:
+            first_err = r
     dt = time.perf_counter() - t0
     print(f"  ingest: {N/dt:,.0f} vec/s ({dt:.1f}s total)")
+    # Throughput alone "passed" at 2,145 vec/s while every insert was being
+    # silently dropped; count the successful replies too.
+    check(f"{N:,}-vector ingest: every VADD acked", acked == N, f"acked={acked:,} first_err={first_err!r}")
     check(f"{N:,}-vector ingest > 300 vec/s", N/dt > 300, f"{N/dt:,.0f}/s")
 
     # Recall sanity: for 50 random vectors from the kept set, verify their id
@@ -1408,9 +1423,10 @@ def test_end_to_end_commands():
     _start_server(wal, fresh=False)
     c2 = Resp()
 
-    # ctr: INCRBY 7 -> 7, INCR -> 8, FLUSHDB is a no-op, INCRBY 8 -> 16.
+    # ctr: INCRBY 7 -> 7, INCR -> 8, FLUSHDB wipes the store (documented:
+    # "FLUSHALL/FLUSHDB (full wipe ...)"), then INCRBY 8 -> 8.
     check("durable KV survives restart", c2.cmd("GET", "user:1") == b"ada")
-    check("durable counter survives restart", c2.cmd("GET", "ctr") == b"16",
+    check("durable counter survives restart", c2.cmd("GET", "ctr") == b"8",
           f"got={c2.cmd('GET','ctr')!r}")
     check("durable VADD vector index survives restart",
           isinstance(c2.cmd("VSEARCH", "3", "1.0", "0.0", "0.0"), list))

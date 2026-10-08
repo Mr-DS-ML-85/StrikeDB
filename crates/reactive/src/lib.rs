@@ -18,11 +18,16 @@ pub struct CdcEvent {
     pub ts: u64,
 }
 
+/// Max CDC events kept in memory; the oldest quarter is dropped when full.
+const CDC_LOG_CAP: usize = 1 << 20;
+
 /// Reactive hub: routes committed mutations to topic subscribers by key prefix.
 pub struct Reactive {
     seq: AtomicU64,
-    // prefix -> list of senders
-    subs: RwLock<HashMap<Vec<u8>, Vec<Sender<CdcEvent>>>>,
+    // prefix -> list of (subscription id, sender). The id lets a dead
+    // sender be removed precisely (std `Sender` has no identity/liveness API).
+    subs: RwLock<HashMap<Vec<u8>, Vec<(u64, Sender<CdcEvent>)>>>,
+    next_sub: AtomicU64,
     // full ordered CDC log (in-memory ring; production would tier to storage)
     log: Mutex<Vec<CdcEvent>>,
     // Set once a subscriber or CDC reader actually consumes the stream, letting
@@ -38,6 +43,7 @@ impl Reactive {
         let hub = Arc::new(Self {
             seq: AtomicU64::new(0),
             subs: RwLock::new(HashMap::new()),
+            next_sub: AtomicU64::new(1),
             log: Mutex::new(Vec::new()),
             enabled: AtomicBool::new(false),
         });
@@ -59,15 +65,37 @@ impl Reactive {
             value: m.value.clone(),
             ts: m.ts,
         };
-        self.log.lock().unwrap().push(ev.clone());
+        {
+            // Bounded ring: once a reader enabled the hub, every commit was
+            // appended forever (an unbounded leak on a busy server).
+            let mut log = self.log.lock().unwrap();
+            if log.len() >= CDC_LOG_CAP {
+                log.drain(..CDC_LOG_CAP / 4);
+            }
+            log.push(ev.clone());
+        }
 
-        let subs = self.subs.read().unwrap();
-        for (prefix, senders) in subs.iter() {
-            if m.key.starts_with(prefix) {
-                for s in senders {
-                    let _ = s.send(ev.clone()); // dropped receivers are pruned lazily
+        let mut dead: Vec<u64> = Vec::new();
+        {
+            let subs = self.subs.read().unwrap();
+            for (prefix, senders) in subs.iter() {
+                if m.key.starts_with(prefix) {
+                    for (id, s) in senders {
+                        if s.send(ev.clone()).is_err() {
+                            dead.push(*id);
+                        }
+                    }
                 }
             }
+        }
+        if !dead.is_empty() {
+            // Prune senders whose receiver is gone (the comment used to say
+            // "pruned lazily", but nothing ever removed them).
+            let mut subs = self.subs.write().unwrap();
+            for senders in subs.values_mut() {
+                senders.retain(|(id, _)| !dead.contains(id));
+            }
+            subs.retain(|_, v| !v.is_empty());
         }
     }
 
@@ -80,7 +108,7 @@ impl Reactive {
             .unwrap()
             .entry(prefix.to_vec())
             .or_default()
-            .push(tx);
+            .push((self.next_sub.fetch_add(1, Ordering::Relaxed), tx));
         rx
     }
 
@@ -97,8 +125,9 @@ impl Reactive {
         self.enabled.store(true, Ordering::Relaxed);
         let (tx, rx) = channel();
         let mut subs = self.subs.write().unwrap();
+        let id = self.next_sub.fetch_add(1, Ordering::Relaxed);
         for p in prefixes {
-            subs.entry(p.clone()).or_default().push(tx.clone());
+            subs.entry(p.clone()).or_default().push((id, tx.clone()));
         }
         rx
     }
@@ -113,6 +142,13 @@ impl Reactive {
             .filter(|e| e.seq > since_seq)
             .cloned()
             .collect()
+    }
+
+    /// CDC log length WITHOUT enabling the hub (for INFO). `cdc_len` turns
+    /// the hub on permanently, so calling it from a monitoring probe made
+    /// every later commit pay the CDC clone + log push.
+    pub fn cdc_len_peek(&self) -> usize {
+        self.log.lock().unwrap().len()
     }
 
     pub fn cdc_len(&self) -> usize {

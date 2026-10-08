@@ -215,6 +215,10 @@ pub struct RecallHit {
     pub meta: Meta,
 }
 
+/// Minimum `1 - cosine_dist/2` for an ANN candidate to count as a semantic
+/// hit (0.5 ⇔ cosine 0).
+const MIN_SEMANTIC_SIM: f32 = 0.5;
+
 /// The agent memory engine.
 pub struct Memory {
     engine: Arc<Engine>,
@@ -374,6 +378,12 @@ impl Memory {
         valid_to: u64,
         owner: &str,
     ) -> std::io::Result<u64> {
+        // Validate the embedding BEFORE any write. The text/meta records are
+        // separate puts, so a vector rejected later would strand a half-
+        // written memory; and a NaN or wrong-dim vector stored here used to
+        // be returned as a hit for every later query.
+        self.check_embedding(&vector)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let id = self.alloc_id();
         let ts = self.engine.now();
         let vf = if valid_from == 0 { ts } else { valid_from };
@@ -401,6 +411,15 @@ impl Memory {
         // populate salience cache so recall scoring is zero-substrate-read
         self.salience_cache.write().unwrap().insert(id, salience);
         Ok(id)
+    }
+
+    /// Validate an embedding (ingest or query) against the LTM index: finite
+    /// components and the index's native dimensionality.
+    pub fn check_embedding(&self, v: &[f32]) -> Result<(), String> {
+        if v.iter().any(|x| !x.is_finite()) {
+            return Err("embedding contains NaN or infinity".into());
+        }
+        self.vectors.check_dim(v.len())
     }
 
     /// Invalidate a fact "as of" a world-time. Used to supersede without
@@ -646,6 +665,13 @@ impl Memory {
         let mut fused: HashMap<u64, (f32, &'static str)> = HashMap::new();
         for (id, dist) in self.vectors.search(query_vec, fetch) {
             let sim = 1.0 - dist / 2.0;
+            // Relevance floor: sim <= 0.5 means cosine <= 0 — orthogonal or
+            // opposite (and every match of a zero query vector). Those are not
+            // evidence of relevance; admitting them made a query that matched
+            // nothing still "find" every document by rank alone.
+            if !(sim > MIN_SEMANTIC_SIM) {
+                continue;
+            }
             let score = sim * (0.5 + 0.5 * sal_of(id));
             fused.insert(id, (score, "semantic"));
         }

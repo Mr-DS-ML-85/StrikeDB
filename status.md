@@ -119,7 +119,7 @@ Rule: extend reply shapes ONLY by appending NEW opt-in flags. Positional
 parsers must never see a stride change. Guarded by prove-it phase 6.
 
 Other stable behaviors: `FLUSHALL` = rename wal+snap to `.bak-<ms>` → wipe →
-undoable offline; `GETAT`/`SCAN` read raw engine keys (no kv: prefix);
+undoable offline; `GETAT` and the 2-arg range form `SCAN start end` (alias `SCANRANGE`) read raw engine keys (no kv: prefix), while `SCAN cursor [MATCH] [COUNT]` is the Redis cursor scan over user keys;
 `vec:` keys store ids as 8-byte big-endian binary, values as string-float lists.
 
 ---

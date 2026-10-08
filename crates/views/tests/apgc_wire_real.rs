@@ -43,7 +43,7 @@ fn overlap_recall(vi: &VectorIndex, data: &[f32], dim: usize, k: usize) -> f32 {
                 (i, 1.0 - dot)
             })
             .collect();
-        truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        truth.sort_by(|a, b| a.1.total_cmp(&b.1));
         let truth_ids: Vec<u64> = truth.iter().take(k).map(|(id, _)| *id).collect();
         let got: Vec<u64> = vi.search_ef(q, k, 128).into_iter().map(|(id, _)| id).collect();
         hits += got.iter().filter(|g| truth_ids.contains(g)).count();

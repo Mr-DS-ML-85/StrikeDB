@@ -254,7 +254,7 @@ impl MixedPrecisionBuilder {
                 .filter(|&j| j != i)
                 .map(|j| (Self::distance(&vectors[i], &vectors[j], PrecisionLevel::Fp32), j))
                 .collect();
-            candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
             graph.edges[i] = candidates.into_iter().take(k)
                 .map(|(dist, j)| Edge { from: i, to: j, distance: dist, precision: PrecisionLevel::Fp32 })
                 .collect();
@@ -267,7 +267,7 @@ impl MixedPrecisionBuilder {
                 .filter(|&j| j != i)
                 .map(|j| (Self::distance(&vectors[i], &vectors[j], prec), j))
                 .collect();
-            candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
             graph.edges[i] = candidates.into_iter().take(k)
                 .map(|(dist, j)| Edge { from: i, to: j, distance: dist, precision: prec })
                 .collect();

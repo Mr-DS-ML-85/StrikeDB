@@ -2223,7 +2223,7 @@ fn s19b_adaptive_vs_fixed(path: &str) {
             for j in 0..dim { dot += q[j] * v[j]; }
             scored.push((i, (1.0 - dot).max(0.0).min(2.0)));
         }
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         gt.push(scored.iter().take(10).map(|(id, _)| *id).collect());
     }
 
@@ -2326,7 +2326,7 @@ fn s21_real_ingest(path: &str) {
             for j in 0..dim { dot += q[j] * v[j]; }
             scored.push((i, (1.0 - dot).max(0.0).min(2.0)));
         }
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         gt.push(scored.iter().take(10).map(|(id, _)| *id).collect());
     }
     let mut hits = 0usize;
@@ -2768,7 +2768,7 @@ fn s_gpu_bench(path: &str) {
             }
             scored.push((i as u64, (1.0 - dot).max(0.0).min(2.0)));
         }
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         gt.push(scored.iter().take(128).map(|(id, _)| *id).collect());
     }
     println!("  ground truth in {:.1}s", t_gt.elapsed().as_secs_f64());
@@ -2939,7 +2939,7 @@ fn s22_parallel_ingest(path: &str) {
             for j in 0..dim { dot += q[j] * v[j]; }
             scored.push((i, (1.0 - dot).max(0.0).min(2.0)));
         }
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         gt.push(scored.iter().take(10).map(|(id, _)| *id).collect());
     }
     let mut hits = 0usize;
@@ -3001,7 +3001,7 @@ fn s23_tiered(path: &str) {
             for j in 0..dim { dot += q[j] * v[j]; }
             scored.push((i, (1.0 - dot).max(0.0).min(2.0)));
         }
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         gt.push(scored.iter().take(10).map(|(id, _)| *id).collect());
     }
     let mut hits = 0usize;
@@ -3063,7 +3063,7 @@ fn s24_learned_ef(path: &str) {
                 for j in 0..dim { dot += qv[j] * v[j]; }
                 scored.push((i, (1.0 - dot).max(0.0).min(2.0)));
             }
-            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            scored.sort_by(|a, b| a.1.total_cmp(&b.1));
 gt.push(scored.iter().take(128).map(|(id, _)| *id).collect());
         }
         gt
@@ -3185,7 +3185,7 @@ fn s25_filtered(path: &str) {
             for j in 0..dim { dot += qv[j] * v[j]; }
             scored.push((i, (1.0 - dot).max(0.0).min(2.0)));
         }
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         scored.iter().take(k).map(|(id, _)| *id).collect()
     };
 
@@ -3284,7 +3284,7 @@ fn s26_hybrid(path: &str) {
     for i in 0..n {
         let row = &norm[i * dim..(i + 1) * dim];
         let mut idxs: Vec<(usize, f32)> = row.iter().enumerate().map(|(j, &v)| (j, v.abs())).collect();
-        idxs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        idxs.sort_by(|a, b| b.1.total_cmp(&a.1));
         let bow: Vec<(u32, f32)> = idxs.iter().take(w).map(|(j, v)| (*j as u32, *v)).collect();
         sparse_docs.push(bow);
     }
@@ -3450,7 +3450,7 @@ fn s27_resp_unified(path: &str) {
     let q = norm[123 * dim..124 * dim].to_vec();
     // sparse side for hybrid: top-8 dims by |value|
     let mut idxs: Vec<(usize, f32)> = q.iter().enumerate().map(|(j, &v)| (j, v.abs())).collect();
-    idxs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    idxs.sort_by(|a, b| b.1.total_cmp(&a.1));
     let sparse_args: Vec<Vec<u8>> = idxs.iter().take(8).flat_map(|(j, v)| {
         vec![(*j as u32).to_string().into_bytes(), format!("{v}").into_bytes()]
     }).collect();
@@ -3544,7 +3544,7 @@ fn s28_qdrant_faceoff(_path: &str) {
             for j in 0..dim { d += q[j] * data[base + j]; }
             scored.push((d, i));
         }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         truth.push(scored.iter().take(k).map(|(_, id)| *id).collect());
     }
 
@@ -3602,7 +3602,7 @@ fn s28_qdrant_faceoff(_path: &str) {
             let _ = vidx.search(&q, k);
             samples.push(t.elapsed().as_secs_f64() * 1e6);
         }
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples.sort_by(|a, b| a.total_cmp(b));
         let p99 = samples[(samples.len() * 99 / 100).min(samples.len() - 1)];
 
         let qps_start = Instant::now();
@@ -3688,7 +3688,7 @@ fn s29_parallel_ingest(_path: &str) {
                     (s, i as u64)
                 })
                 .collect();
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
             scored.iter().take(k).map(|&(_, id)| id).collect()
         })
         .collect();

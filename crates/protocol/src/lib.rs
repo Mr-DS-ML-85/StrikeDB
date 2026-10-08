@@ -16,17 +16,28 @@ pub enum Resp {
     /// RESP3 map (`%`) — flat k1 v1 k2 v2 ... Used only for HELLO when the
     /// client negotiates protocol 3; everything else stays RESP2.
     Map(Vec<Resp>),
+    /// Out-of-band push (pub/sub messages, subscribe acks): RESP3 `>` on a
+    /// connection that negotiated proto 3, a plain `*` array on RESP2.
+    Push(Vec<Resp>),
 }
 
 impl Resp {
     /// Encode to wire bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        self.encode_into(&mut out);
+        self.encode_into(&mut out, false);
         out
     }
 
-    fn encode_into(&self, out: &mut Vec<u8>) {
+    /// Encode for a connection that negotiated `resp3`: nulls at ANY depth
+    /// (e.g. the misses inside an MGET array) become `_`, not `$-1`.
+    pub fn encode_as(&self, resp3: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out, resp3);
+        out
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>, resp3: bool) {
         match self {
             Resp::Simple(s) => {
                 out.push(b'+');
@@ -50,6 +61,7 @@ impl Resp {
                 out.extend_from_slice(b);
                 out.extend_from_slice(b"\r\n");
             }
+            Resp::Nil if resp3 => out.extend_from_slice(b"_\r\n"),
             Resp::Nil => {
                 out.extend_from_slice(b"$-1\r\n");
             }
@@ -58,7 +70,7 @@ impl Resp {
                 out.extend_from_slice(items.len().to_string().as_bytes());
                 out.extend_from_slice(b"\r\n");
                 for it in items {
-                    it.encode_into(out);
+                    it.encode_into(out, resp3);
                 }
             }
             // RESP3 map type (`%`). Used ONLY by the HELLO handshake when the
@@ -67,16 +79,60 @@ impl Resp {
             // which is legal because RESP2 frames (+ - : $ *) are a strict
             // subset of RESP3, so a client that switched parsers still reads
             // every other reply we emit. `items` is flat: k1 v1 k2 v2 ...
+            Resp::Push(items) => {
+                out.push(if resp3 { b'>' } else { b'*' });
+                out.extend_from_slice(items.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                for it in items {
+                    it.encode_into(out, resp3);
+                }
+            }
             Resp::Map(items) => {
                 let pairs = items.len() / 2;
                 out.push(b'%');
                 out.extend_from_slice(pairs.to_string().as_bytes());
                 out.extend_from_slice(b"\r\n");
                 for it in items {
-                    it.encode_into(out);
+                    it.encode_into(out, resp3);
                 }
             }
         }
+    }
+}
+
+/// Largest bulk string accepted from a client (Redis `proto-max-bulk-len`).
+pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+/// Largest multibulk argument count accepted from a client.
+pub const MAX_ARGS: usize = 1024 * 1024;
+/// Longest header / inline line accepted before the terminating `\n`.
+const MAX_LINE: usize = 64 * 1024;
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+/// Index of the `\n` ending the line that starts at `from`, or `None` if it
+/// has not arrived yet. A line that grows past `MAX_LINE` without a newline is
+/// a protocol error, so a client cannot make us buffer an unbounded header.
+fn find_line_end(buf: &[u8], from: usize) -> io::Result<Option<usize>> {
+    match buf[from..].iter().position(|&b| b == b'\n') {
+        Some(i) => Ok(Some(from + i)),
+        None if buf.len() - from > MAX_LINE => Err(invalid("too big inline request")),
+        None => Ok(None),
+    }
+}
+
+/// Parse a `*`/`$` length header (sans prefix). `-1` means null → `None`.
+fn parse_len(hdr: &[u8], what: &str) -> io::Result<Option<usize>> {
+    let hdr = if hdr.last() == Some(&b'\r') { &hdr[..hdr.len() - 1] } else { hdr };
+    let n: i64 = std::str::from_utf8(hdr)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| invalid(what))?;
+    match n {
+        -1 => Ok(None),
+        n if n < 0 => Err(invalid(what)),
+        n => usize::try_from(n).map(Some).map_err(|_| invalid(what)),
     }
 }
 
@@ -94,50 +150,62 @@ pub fn try_parse(buf: &[u8]) -> io::Result<Option<(Vec<Vec<u8>>, usize)>> {
         return Ok(None);
     }
     // RESP array form: `*N\r\n$L1\r\nBULK1\r\n$L2\r\nBULK2\r\n...`
+    //
+    // Every count and length below comes straight off the wire from an
+    // unauthenticated client, and the release profile is `panic = "abort"`,
+    // so a single overflow or over-allocation here would take down the whole
+    // process. All sizes are bounded and all arithmetic is checked.
     if buf[0] == b'*' {
-        // find '\n' of the array header
-        let nl = match buf.iter().position(|&b| b == b'\n') {
+        let nl = match find_line_end(buf, 0)? {
             Some(i) => i,
             None => return Ok(None), // need more
         };
-        let hdr = &buf[1..nl];
-        // strip trailing \r if present
-        let hdr = if hdr.last() == Some(&b'\r') { &hdr[..hdr.len() - 1] } else { hdr };
-        let count: usize = std::str::from_utf8(hdr)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad array header"))?;
+        let count = parse_len(&buf[1..nl], "bad array header")?;
         let mut pos = nl + 1;
-        let mut args = Vec::with_capacity(count);
+        // `*-1` / `*0` are legal null/empty arrays: consume and ignore.
+        let count = match count {
+            None => return Ok(Some((Vec::new(), pos))),
+            Some(c) if c > MAX_ARGS => {
+                return Err(invalid("invalid multibulk length"));
+            }
+            Some(c) => c,
+        };
+        // Never trust `count` for the allocation: each arg needs at least
+        // 4 bytes (`$0\r\n` + CRLF), so the buffer bounds the useful capacity.
+        let mut args = Vec::with_capacity(count.min(buf.len() / 4 + 1));
         for _ in 0..count {
             if pos >= buf.len() {
                 return Ok(None);
             }
             if buf[pos] != b'$' {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected bulk string"));
+                return Err(invalid("expected bulk string"));
             }
-            let bnl = match buf[pos..].iter().position(|&b| b == b'\n') {
-                Some(i) => pos + i,
+            let bnl = match find_line_end(buf, pos)? {
+                Some(i) => i,
                 None => return Ok(None),
             };
-            let bhdr = &buf[pos + 1..bnl];
-            let bhdr = if bhdr.last() == Some(&b'\r') { &bhdr[..bhdr.len() - 1] } else { bhdr };
-            let len: usize = std::str::from_utf8(bhdr)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad bulk len"))?;
+            let len = match parse_len(&buf[pos + 1..bnl], "bad bulk len")? {
+                Some(l) if l <= MAX_BULK_LEN => l,
+                _ => return Err(invalid("invalid bulk length")),
+            };
             pos = bnl + 1;
-            // Need `len` bytes + trailing \r\n
-            if pos + len + 2 > buf.len() {
+            // Need `len` bytes + trailing \r\n. `len` is bounded above, so
+            // this cannot overflow, but stay checked anyway.
+            let end = pos.checked_add(len).and_then(|e| e.checked_add(2))
+                .ok_or_else(|| invalid("invalid bulk length"))?;
+            if end > buf.len() {
                 return Ok(None);
             }
+            if &buf[pos + len..end] != b"\r\n" {
+                return Err(invalid("bulk string not terminated by CRLF"));
+            }
             args.push(buf[pos..pos + len].to_vec());
-            pos += len + 2;
+            pos = end;
         }
         Ok(Some((args, pos)))
     } else {
         // Inline: read up to `\n`, split on spaces.
-        let nl = match buf.iter().position(|&b| b == b'\n') {
+        let nl = match find_line_end(buf, 0)? {
             Some(i) => i,
             None => return Ok(None),
         };
@@ -164,12 +232,7 @@ pub fn write_resp_buf<W: Write>(w: &mut W, resp: &Resp) -> io::Result<()> {
 /// RESP3 parsers (e.g. redis-py >= 8) have no `$-1` case and block forever
 /// trying to read `-1` bulk bytes. Everything else encodes identically.
 pub fn write_resp_buf_as<W: Write>(w: &mut W, resp: &Resp, resp3: bool) -> io::Result<()> {
-    if resp3 {
-        if matches!(resp, Resp::Nil) {
-            return w.write_all(b"_\r\n");
-        }
-    }
-    w.write_all(&resp.encode())
+    w.write_all(&resp.encode_as(resp3))
 }
 
 /// Parse one client command from a buffered reader.
@@ -191,11 +254,12 @@ pub fn read_command<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<Vec<u8>
 
     if first[0] == b'*' {
         // RESP array of bulk strings
-        let count: usize = std::str::from_utf8(&first[1..])
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad array header"))?;
-        let mut args = Vec::with_capacity(count);
+        let count = match parse_len(&first[1..], "bad array header")? {
+            None => return Ok(Some(Vec::new())),
+            Some(c) if c > MAX_ARGS => return Err(invalid("invalid multibulk length")),
+            Some(c) => c,
+        };
+        let mut args = Vec::with_capacity(count.min(1024));
         for _ in 0..count {
             let mut hdr = Vec::new();
             reader.read_until(b'\n', &mut hdr)?;
@@ -205,10 +269,10 @@ pub fn read_command<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<Vec<u8>
             if hdr.first() != Some(&b'$') {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "expected bulk string"));
             }
-            let len: usize = std::str::from_utf8(&hdr[1..])
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad bulk len"))?;
+            let len = match parse_len(&hdr[1..], "bad bulk len")? {
+                Some(l) if l <= MAX_BULK_LEN => l,
+                _ => return Err(invalid("invalid bulk length")),
+            };
             let mut buf = vec![0u8; len + 2]; // include trailing \r\n
             reader.read_exact(&mut buf)?;
             buf.truncate(len);
@@ -236,6 +300,42 @@ pub fn write_resp<W: Write>(w: &mut W, resp: &Resp) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    /// Hostile headers that used to abort the server (capacity overflow /
+    /// usize wraparound with `panic = "abort"`) must be protocol errors.
+    #[test]
+    fn hostile_lengths_are_errors_not_panics() {
+        for frame in [
+            &b"*99999999999999\r\n"[..],
+            b"*1\r\n$18446744073709551615\r\n",
+            b"*1\r\n$18446744073709551610\r\nab",
+            b"*1\r\n$-5\r\n",
+            b"*1\r\n$999999999999\r\n",
+        ] {
+            assert!(try_parse(frame).is_err(), "{:?}", String::from_utf8_lossy(frame));
+        }
+    }
+
+    #[test]
+    fn null_array_and_crlf_check() {
+        assert_eq!(try_parse(b"*-1\r\n").unwrap(), Some((Vec::new(), 5)));
+        assert!(try_parse(b"*1\r\n$2\r\nabXY").is_err());
+        assert_eq!(try_parse(b"*1\r\n$2\r\nab").unwrap(), None);
+    }
+
+    #[test]
+    fn unterminated_header_is_bounded() {
+        let mut big = b"*1\r\n$".to_vec();
+        big.extend(std::iter::repeat(b'1').take(MAX_LINE + 10));
+        assert!(try_parse(&big).is_err());
+    }
+
+    #[test]
+    fn resp3_nested_nulls() {
+        let r = Resp::Array(vec![Resp::Bulk(b"a".to_vec()), Resp::Nil]);
+        assert_eq!(r.encode_as(true), b"*2\r\n$1\r\na\r\n_\r\n".to_vec());
+        assert_eq!(r.encode_as(false), b"*2\r\n$1\r\na\r\n$-1\r\n".to_vec());
+    }
 
     /// A VADDBATCH-sized frame (64 vectors × 384 dims ≈ 447 KB, 24642 bulk
     /// args) delivered the way a real socket delivers it: in 32 KB chunks, the

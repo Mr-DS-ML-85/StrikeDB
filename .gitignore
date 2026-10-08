@@ -18,3 +18,8 @@ bench-out/
 **/*.wal.bak-*
 .prove-it/
 .aider*
+
+# CorpusTier spill files (written to the cwd when no spill dir is set)
+**/dbstrike-corpus-spill-*.bin
+# WAL corruption quarantine files
+**/*.wal.corrupt-*

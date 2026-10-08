@@ -81,7 +81,7 @@ fn measure_recall(name: &str, data: &Dataset) {
                 for d in 0..dim { dot += q[d] * data.vectors[j][d]; }
                 (1.0 - dot, j)
             }).collect();
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.sort_by(|a, b| a.0.total_cmp(&b.0));
         dists.iter().take(10).map(|(_, j)| *j).collect()
     }).collect();
     let gt_time = t0.elapsed().as_secs_f64();
@@ -112,7 +112,7 @@ fn measure_recall(name: &str, data: &Dataset) {
                 .map(|j| {
                     (apgc::precision::MixedPrecisionBuilder::distance(q, &data.vectors[j], *prec), j)
                 }).collect();
-            dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            dists.sort_by(|a, b| a.0.total_cmp(&b.0));
             let result_set: std::collections::HashSet<usize> = dists.iter().take(10).map(|(_, j)| *j).collect();
             hits += ground_truth[qi].iter().filter(|id| result_set.contains(id)).count();
         }
@@ -139,7 +139,7 @@ fn measure_recall(name: &str, data: &Dataset) {
                 let prec = graph.precision_map[j];
                 (apgc::precision::MixedPrecisionBuilder::distance(q, &data.vectors[j], prec), j)
             }).collect();
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.sort_by(|a, b| a.0.total_cmp(&b.0));
         let result_set: std::collections::HashSet<usize> = dists.iter().take(10).map(|(_, j)| *j).collect();
         hits += ground_truth[qi].iter().filter(|id| result_set.contains(id)).count();
     }
