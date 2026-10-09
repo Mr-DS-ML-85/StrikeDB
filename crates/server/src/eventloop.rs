@@ -704,11 +704,13 @@ impl Worker {
     }
 }
 
-/// How long a pool thread waits on an owned connection for the client's
-/// next command before handing it back to the loop (per poll, in ms), and
-/// how many such waits it makes.
-const OWNED_WAIT_MS: i32 = 1;
-const OWNED_WAITS: usize = 2;
+/// A pool thread waits on an owned connection for the client's next
+/// command in polls of 1, 2, 4, ... ms (about 63 ms in all) before handing
+/// it back to the loop, checking between polls whether other batches need
+/// the thread. Deep-pipeline clients (redis-benchmark -P1024) take over
+/// 10 ms to send their next pipeline; handing those back each time cost a
+/// fifth of the throughput. A parked thread costs no CPU.
+const OWNED_WAITS: u32 = 6;
 /// Reads that may go by without completing a command before hand-back.
 const OWNED_READS: usize = 8;
 
@@ -771,17 +773,34 @@ fn run_owned(
             }
             let mut p = PollFd { fd: s.as_raw_fd(), events: POLLIN, revents: 0 };
             // SAFETY: one valid pollfd.
-            if unsafe { poll(&mut p, 1, OWNED_WAIT_MS) } == 0 {
+            if unsafe { poll(&mut p, 1, 1 << waits) } == 0 {
                 waits += 1;
                 continue;
             }
             reads += 1;
-            let mut tmp = [0u8; 16 * 1024];
-            match s.read(&mut tmp) {
-                Ok(0) => eof = true,
-                Ok(n) => rbuf.extend_from_slice(&tmp[..n]),
-                Err(e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) => {}
-                Err(_) => eof = true,
+            // Drain everything the client has sent before parsing: a deep
+            // pipeline cut into socket-read-sized pieces became several
+            // batches, each waiting out its own group-commit fsync.
+            let mut tmp = [0u8; 64 * 1024];
+            loop {
+                match s.read(&mut tmp) {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        rbuf.extend_from_slice(&tmp[..n]);
+                        if n < tmp.len() || rbuf.len() > QUERY_BUFFER_LIMIT {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        eof = true;
+                        break;
+                    }
+                }
             }
         };
         if cmds.is_empty() {
