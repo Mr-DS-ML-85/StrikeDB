@@ -79,6 +79,13 @@ impl Router {
         Some(ns.entry(name.to_string()).or_insert_with(|| Arc::new(opened)).clone())
     }
 
+    /// Rebuild every vector graph from the substrate (replica full sync /
+    /// promotion). Namespaces reopen lazily from their persisted keys.
+    pub fn reload(&self) {
+        self.vectors_default.reload();
+        self.vectors_ns.write().unwrap().clear();
+    }
+
     /// Enumerate all open vector indexes as `(name, index)` pairs, default
     /// namespace first. Read-only snapshot for diagnostics (GPU.INFO).
     pub fn vector_indexes(&self) -> Vec<(String, Arc<VectorIndex>)> {

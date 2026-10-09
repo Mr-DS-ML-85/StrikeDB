@@ -12,6 +12,8 @@ pub enum Resp {
     Int(i64),
     Bulk(Vec<u8>),
     Nil,
+    /// Null array: `*-1` on RESP2 (BLPOP/XREAD timeouts), `_` on RESP3.
+    NilArray,
     Array(Vec<Resp>),
     /// RESP3 map (`%`) — flat k1 v1 k2 v2 ... Used only for HELLO when the
     /// client negotiates protocol 3; everything else stays RESP2.
@@ -65,6 +67,8 @@ impl Resp {
             Resp::Nil => {
                 out.extend_from_slice(b"$-1\r\n");
             }
+            Resp::NilArray if resp3 => out.extend_from_slice(b"_\r\n"),
+            Resp::NilArray => out.extend_from_slice(b"*-1\r\n"),
             Resp::Array(items) => {
                 out.push(b'*');
                 out.extend_from_slice(items.len().to_string().as_bytes());

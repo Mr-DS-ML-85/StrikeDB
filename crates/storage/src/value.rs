@@ -21,6 +21,11 @@ pub enum Value {
     Row(BTreeMap<String, Vec<u8>>),
     /// Tombstone marker (a delete at some version).
     Tombstone,
+    /// Header of a Redis collection (hash/list/set/zset) stored under its
+    /// user key; the elements live under their own keys. Opaque here — the
+    /// keyspace layer owns the encoding. Distinct from `Bytes` so string
+    /// commands report WRONGTYPE instead of reading the header as a value.
+    Meta(Vec<u8>),
 }
 
 const T_BYTES: u8 = 1;
@@ -29,6 +34,7 @@ const T_VECTOR: u8 = 3;
 const T_ROW: u8 = 4;
 const T_TOMB: u8 = 5;
 const T_FLOAT: u8 = 6;
+const T_META: u8 = 7;
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -76,6 +82,11 @@ impl Value {
                 }
             }
             Value::Tombstone => out.push(T_TOMB),
+            Value::Meta(b) => {
+                out.push(T_META);
+                put_u32(&mut out, b.len() as u32);
+                out.extend_from_slice(b);
+            }
         }
         out
     }
@@ -127,6 +138,10 @@ impl Value {
                 Some(Value::Row(map))
             }
             T_TOMB => Some(Value::Tombstone),
+            T_META => {
+                let n = get_u32(buf, &mut pos)? as usize;
+                Some(Value::Meta(buf.get(pos..pos + n)?.to_vec()))
+            }
             _ => None,
         }
     }
@@ -143,6 +158,7 @@ mod tests {
             Value::Int(-42),
             Value::Vector(vec![1.0, 2.5, -3.0]),
             Value::Tombstone,
+            Value::Meta(vec![1, 2, 3]),
         ];
         for v in vals {
             assert_eq!(Value::decode(&v.encode()).unwrap(), v);
