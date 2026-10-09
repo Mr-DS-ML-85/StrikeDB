@@ -608,7 +608,7 @@ fn process_batch(db: &Arc<Db>, st: &mut ConnState, mut cmds: Vec<Vec<Vec<u8>>>, 
                     } else {
                         st.multi_err = true;
                         Some(err(&format!(
-                            "Command '{}' cannot be queued: only keyspace commands (strings, keys, TTL, hash, list, set, zset) are transactional",
+                            "Command '{}' cannot be queued: only keyspace commands (strings, keys, TTL, hash, list, set, zset, stream) are transactional",
                             name.to_lowercase()
                         )))
                     }
@@ -1202,7 +1202,7 @@ fn err(msg: &str) -> Resp {
     // Callers may pass a message that already carries a Redis error code
     // (`NOAUTH ...`, `ERR ...`); prefixing again produced `-ERR ERR ...` /
     // `-ERR NOAUTH ...`, which clients match on and mis-classify.
-    const CODES: &[&str] = &["ERR", "NOAUTH", "NOPERM", "NOPROTO", "WRONGPASS", "WRONGTYPE", "EXECABORT", "NOSCRIPT", "BUSYKEY", "READONLY"];
+    const CODES: &[&str] = &["ERR", "NOAUTH", "NOPERM", "NOPROTO", "WRONGPASS", "WRONGTYPE", "EXECABORT", "NOSCRIPT", "BUSYKEY", "READONLY", "NOGROUP", "BUSYGROUP"];
     let first = msg.split(' ').next().unwrap_or("");
     if CODES.contains(&first) {
         Resp::Error(msg.to_string())
@@ -1664,11 +1664,76 @@ fn redact_cmd(name: &str, args: &[Vec<u8>]) -> String {
     }
 }
 
+/// `XREAD`/`XREADGROUP ... BLOCK ms`: run the command without BLOCK until
+/// it returns data or the timeout passes (`BLOCK 0` = forever). Like BLPOP
+/// this parks the connection's (pool) thread; it re-runs the command only
+/// when a watched stream's last ID moves, so a waiting consumer group does
+/// not write (consumer seen-time) every poll. `None` = not a blocking call.
+fn stream_block(db: &Db, name: &str, args: &[Vec<u8>]) -> Option<Resp> {
+    if name != "XREAD" && name != "XREADGROUP" {
+        return None;
+    }
+    let (mut i, mut block, mut streams) = (0, None, None);
+    while i < args.len() {
+        match String::from_utf8_lossy(&args[i]).to_ascii_uppercase().as_str() {
+            "GROUP" => i += 3,
+            "COUNT" => i += 2,
+            "NOACK" => i += 1,
+            "BLOCK" => {
+                block = Some(i);
+                i += 2;
+            }
+            "STREAMS" => {
+                streams = Some(i + 1);
+                break;
+            }
+            _ => return None, // let the executor report the syntax error
+        }
+    }
+    let (b, s) = (block?, streams?);
+    let ms = std::str::from_utf8(args.get(b + 1)?).ok()?.parse::<i64>().ok().filter(|&m| m >= 0)?;
+    let rest = args.len() - s;
+    if rest == 0 || rest % 2 != 0 {
+        return None;
+    }
+    let keys: Vec<Vec<u8>> = args[s..s + rest / 2].to_vec();
+    let mut call: Vec<Vec<u8>> = args[..b].iter().chain(&args[b + 2..]).cloned().collect();
+    if name == "XREAD" {
+        // `$` means "entries added after I started waiting": pin it now.
+        let last = db.ks.stream_last_ids(&keys);
+        let ids_at = call.len() - rest / 2;
+        for (j, l) in last.into_iter().enumerate() {
+            if call[ids_at + j] == b"$" {
+                call[ids_at + j] = l;
+            }
+        }
+    }
+    let deadline = (ms > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+    let mut seen = Vec::new();
+    loop {
+        let now_ids = db.ks.stream_last_ids(&keys);
+        if now_ids != seen {
+            match db.ks.run(name, &call) {
+                Resp::NilArray => {}
+                r => return Some(r),
+            }
+            seen = now_ids;
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Some(Resp::NilArray);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
     // Redis keyspace commands (strings, TTL, hash/list/set/zset) run in the
     // transactional executor; the hottest shapes keep zero-overhead paths.
     if keyspace::is_keyspace_cmd(name) {
         if let Some(r) = fast_keyspace(db, name, args) {
+            return r;
+        }
+        if let Some(r) = stream_block(db, name, args) {
             return r;
         }
         return db.ks.run(name, args);
@@ -1906,7 +1971,7 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
                     }
                 }
                 if timeout > 0.0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                    return Resp::Nil;
+                    return Resp::NilArray; // Redis: null array on timeout
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }

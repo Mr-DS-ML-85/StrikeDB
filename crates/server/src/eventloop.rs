@@ -841,6 +841,7 @@ fn batch_inline(db: &Db, st: &ConnState, cmds: &[Vec<Vec<u8>>]) -> bool {
             // promotion rebuilds every derived index
             | "REPLICAOF" | "SLAVEOF" => return false,
             "HELLO" if c.iter().any(|a| a.eq_ignore_ascii_case(b"AUTH")) => return false,
+            "XREAD" | "XREADGROUP" if c.iter().any(|a| a.eq_ignore_ascii_case(b"BLOCK")) => return false,
             "ACL" if !c.get(1).is_some_and(|s| {
                 let s = String::from_utf8_lossy(s).to_ascii_uppercase();
                 matches!(s.as_str(), "WHOAMI" | "LIST" | "GETUSER")

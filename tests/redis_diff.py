@@ -40,6 +40,28 @@ T=[
  lambda: f"EXPIRE {k()} 100", lambda: f"TTL {k()}", lambda: f"PERSIST {k()}", lambda: f"SET {k()} {v()} EX 100",
  lambda: f"PEXPIRE {k()} {random.randint(200, 10**6) * 1000} {random.choice(['','NX','XX','GT','LT'])}", lambda: f"SET {k()} {v()} KEEPTTL",
 ]
+# Streams (explicit IDs only: `*` depends on the wall clock).
+G=["g1","g2"]; CN=["c1","c2"]
+def xid(): return random.choice([f"{random.randint(0,20)}-{random.randint(0,3)}", f"{random.randint(0,20)}", f"{random.randint(0,20)}-*", "0-0"])
+def xb(): return random.choice(["-","+",f"{random.randint(0,20)}",f"{random.randint(0,20)}-{random.randint(0,3)}",f"({random.randint(0,20)}"])
+T+=[
+ lambda: f"XADD {k()} {xid()} {m()} {v()}", lambda: f"XADD {k()} {xid()} {m()} {v()} {m()} {v()}",
+ lambda: f"XADD {k()} MAXLEN {random.randint(0,4)} {xid()} {m()} {v()}", lambda: f"XADD {k()} NOMKSTREAM {xid()} {m()} {v()}",
+ lambda: f"XADD {k()} MINID {xid()} {xid()} {m()} {v()}",
+ lambda: f"XLEN {k()}", lambda: f"XRANGE {k()} {xb()} {xb()}", lambda: f"XRANGE {k()} - + COUNT {random.randint(-1,3)}",
+ lambda: f"XREVRANGE {k()} {xb()} {xb()}", lambda: f"XDEL {k()} {xid()} {xid()}",
+ lambda: f"XTRIM {k()} MAXLEN {random.randint(0,4)}", lambda: f"XTRIM {k()} MINID {xid()}",
+ lambda: f"XREAD COUNT {random.randint(1,3)} STREAMS {k()} {k()} {xid()} {xid()}", lambda: f"XREAD STREAMS {k()} {random.choice(['$','0','5'])}",
+ lambda: f"XGROUP CREATE {k()} {random.choice(G)} {random.choice(['$','0','3-0'])} {random.choice(['','MKSTREAM'])}",
+ lambda: f"XGROUP DESTROY {k()} {random.choice(G)}", lambda: f"XGROUP SETID {k()} {random.choice(G)} {random.choice(['$','0','3-0'])}",
+ lambda: f"XGROUP CREATECONSUMER {k()} {random.choice(G)} {random.choice(CN)}", lambda: f"XGROUP DELCONSUMER {k()} {random.choice(G)} {random.choice(CN)}",
+ lambda: f"XREADGROUP GROUP {random.choice(G)} {random.choice(CN)} COUNT {random.randint(1,3)} STREAMS {k()} {random.choice(['>','>','0'])}",
+ lambda: f"XREADGROUP GROUP {random.choice(G)} {random.choice(CN)} NOACK STREAMS {k()} >",
+ lambda: f"XACK {k()} {random.choice(G)} {xid()} {xid()}", lambda: f"XPENDING {k()} {random.choice(G)}",
+ lambda: f"XCLAIM {k()} {random.choice(G)} {random.choice(CN)} 0 {xid()} {random.choice(['','JUSTID','FORCE'])}",
+ lambda: f"XAUTOCLAIM {k()} {random.choice(G)} {random.choice(CN)} 0 {xb()} COUNT {random.randint(1,3)}",
+ lambda: f"XINFO STREAM {k()}", lambda: f"XINFO GROUPS {k()}", lambda: f"XSETID {k()} {xid()}",
+]
 
 def generate(seed, n):
     random.seed(seed)

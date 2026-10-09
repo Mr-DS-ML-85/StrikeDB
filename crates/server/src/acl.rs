@@ -680,7 +680,9 @@ pub fn command_categories(cmd: &str) -> &'static [PermCategory] {
         "HGET" | "HMGET" | "HEXISTS" | "HLEN" | "HGETALL" | "HKEYS" | "HVALS" | "HSTRLEN" | "LLEN" | "LINDEX"
         | "LRANGE" | "LPOS" | "SISMEMBER" | "SMISMEMBER" | "SCARD" | "SMEMBERS" | "SRANDMEMBER" | "SINTER"
         | "SUNION" | "SDIFF" | "ZSCORE" | "ZMSCORE" | "ZCARD" | "ZCOUNT" | "ZRANK" | "ZREVRANK" | "ZRANGE"
-        | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "ZREVRANGEBYLEX" | "ZLEXCOUNT" => &[Read],
+        | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "ZREVRANGEBYLEX" | "ZLEXCOUNT"
+        | "XLEN" | "XRANGE" | "XREVRANGE" | "XREAD" | "XPENDING" | "XINFO" => &[Read],
+        "XADD" | "XDEL" | "XTRIM" | "XREADGROUP" | "XGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM" | "XSETID" => &[Write],
         "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX"
         | "LPOP" | "RPOP" | "BLPOP" | "BRPOP" | "LSET" | "LTRIM" | "LREM" | "LINSERT" | "RPOPLPUSH" | "LMOVE"
         | "SADD" | "SREM" | "SPOP" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "SMOVE" | "ZADD" | "ZREM"
@@ -729,7 +731,17 @@ pub fn command_keys<'a>(cmd: &str, args: &'a [Vec<u8>]) -> Vec<&'a [u8]> {
         "BLPOP" | "BRPOP" => args.iter().take(args.len().saturating_sub(1)).map(|a| a.as_slice()).collect(),
         "SETEX" | "PSETEX" | "GETEX" | "SETRANGE" | "INCRBYFLOAT" | "EXPIREAT" | "PEXPIREAT" | "EXPIRETIME"
         | "PEXPIRETIME" => args.first().map(|a| vec![a.as_slice()]).unwrap_or_default(),
-        // Every hash/list/set/zset command takes its key first.
+        // Stream keys follow STREAMS (first half of what remains).
+        "XREAD" | "XREADGROUP" => match args.iter().position(|a| a.eq_ignore_ascii_case(b"STREAMS")) {
+            Some(p) => {
+                let rest = &args[p + 1..];
+                rest[..rest.len() / 2].iter().map(|a| a.as_slice()).collect()
+            }
+            None => Vec::new(),
+        },
+        // Subcommand first, then the key.
+        "XGROUP" | "XINFO" => args.get(1).map(|a| vec![a.as_slice()]).unwrap_or_default(),
+        // Every hash/list/set/zset/stream command takes its key first.
         c if crate::keyspace::is_keyspace_cmd(c) && !matches!(c, "PING" | "ECHO" | "TIME") => {
             args.first().map(|a| vec![a.as_slice()]).unwrap_or_default()
         }

@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use storage::{Engine, Store, Value};
 
+mod stream;
+
 pub const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 
 fn err(msg: &str) -> Resp {
@@ -177,11 +179,14 @@ struct Meta {
     head: i64,
     tail: i64,
     ver: u64,
+    /// Streams only: entries-added, max-deleted ID (ms, seq). Kept in the
+    /// header so XADD writes one key fewer.
+    ext: [u64; 3],
 }
 
 impl Meta {
     fn new(ty: u8) -> Self {
-        Meta { ty, len: 0, head: 0, tail: 0, ver: 0 }
+        Meta { ty, len: 0, head: 0, tail: 0, ver: 0, ext: [0; 3] }
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -191,15 +196,21 @@ impl Meta {
         v.extend_from_slice(&self.head.to_le_bytes());
         v.extend_from_slice(&self.tail.to_le_bytes());
         v.extend_from_slice(&self.ver.to_le_bytes());
+        if self.ty == stream::T_STREAM {
+            for x in self.ext {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+        }
         v
     }
 
     fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() != 33 {
+        if b.len() != 33 && b.len() != 57 {
             return None;
         }
         let u = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        Some(Meta { ty: b[0], len: u(1), head: u(9) as i64, tail: u(17) as i64, ver: u(25) })
+        let ext = if b.len() == 57 { [u(33), u(41), u(49)] } else { [0; 3] };
+        Some(Meta { ty: b[0], len: u(1), head: u(9) as i64, tail: u(17) as i64, ver: u(25), ext })
     }
 
     fn type_name(&self) -> &'static str {
@@ -208,6 +219,7 @@ impl Meta {
             T_LIST => "list",
             T_SET => "set",
             T_ZSET => "zset",
+            stream::T_STREAM => "stream",
             _ => "unknown",
         }
     }
@@ -219,6 +231,7 @@ fn type_subs(ty: u8) -> &'static [u8] {
         T_LIST => &[SUB_LIST],
         T_SET => &[SUB_SET, SUB_SETPOS],
         T_ZSET => &[SUB_ZMEM, SUB_ZSCORE],
+        stream::T_STREAM => &[stream::SUB_XENT, stream::SUB_XGRP, stream::SUB_XPEL, stream::SUB_XCON],
         _ => &[],
     }
 }
@@ -400,6 +413,14 @@ impl Keyspace {
         })
     }
 
+    /// Current last-generated ID of each stream key (`0-0` if absent), for
+    /// resolving `XREAD BLOCK ... $` before the server starts waiting.
+    pub fn stream_last_ids(&self, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut tx = self.engine.begin();
+        let mut cx = Ctx { tx: &mut tx, now: now_ms(), exp: Vec::new(), created: false, readonly: true };
+        keys.iter().map(|k| stream::last_id(&mut cx, k)).collect()
+    }
+
     /// Run a pipelined sequence of WRITE commands: each executes on the
     /// commit path in order (exactly as `run` would), but all share one
     /// submission and therefore one group fsync.
@@ -552,7 +573,7 @@ pub fn is_keyspace_cmd(name: &str) -> bool {
             | "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZPOPMIN" | "ZPOPMAX" | "ZRANGEBYLEX"
             | "ZREVRANGEBYLEX" | "ZLEXCOUNT" | "ZREMRANGEBYLEX"
             | "PING" | "ECHO" | "TIME"
-    )
+    ) || stream::is_stream_cmd(name)
 }
 
 /// Commands that never write (used to skip read-only replica checks etc.).
@@ -567,6 +588,7 @@ pub fn is_keyspace_write(name: &str) -> bool {
                 | "ZCOUNT" | "ZRANK" | "ZREVRANK" | "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE"
                 | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "ZREVRANGEBYLEX" | "ZLEXCOUNT" | "PING" | "ECHO" | "TIME"
         )
+        && !stream::is_stream_read(name)
 }
 
 // ── Execution context ──────────────────────────────────────────────────────
@@ -1928,6 +1950,7 @@ fn exec_inner(cx: &mut Ctx, name: &str, a: &[Vec<u8>]) -> R<Resp> {
             }
             Ok(arr(out))
         }
+        other if stream::is_stream_cmd(other) => stream::exec(cx, other, a),
         other => Err(err(&format!("unknown command '{other}'"))),
     }
 }
@@ -2275,7 +2298,7 @@ mod tests {
 
     #[test]
     fn meta_roundtrip() {
-        let m = Meta { ty: T_LIST, len: 3, head: -2, tail: 1, ver: 9 };
+        let m = Meta { ty: T_LIST, len: 3, head: -2, tail: 1, ver: 9, ext: [0; 3] };
         let d = Meta::decode(&m.encode()).unwrap();
         assert_eq!((d.ty, d.len, d.head, d.tail, d.ver), (T_LIST, 3, -2, 1, 9));
     }
