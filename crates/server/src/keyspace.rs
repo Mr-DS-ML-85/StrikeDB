@@ -421,40 +421,48 @@ impl Keyspace {
         keys.iter().map(|k| stream::last_id(&mut cx, k)).collect()
     }
 
-    /// Run a pipelined sequence of WRITE commands: each executes on the
-    /// commit path in order (exactly as `run` would), but all share one
-    /// submission and therefore one group fsync.
+    /// Run a pipelined sequence of WRITE commands as ONE commit: a single
+    /// commit-path operation, timestamp, WAL frame and fsync for the whole
+    /// run. Each command still sees the ones before it, and a command that
+    /// fails rolls back only its own writes (savepoint), exactly as if it
+    /// had run alone. Overwrites within the run collapse to one version: 256
+    /// pipelined HSETs of one field were 256 commits, 256 WAL records and
+    /// 256 version-chain pushes; now they are one of each.
     pub fn run_writes(&self, cmds: &[(String, Vec<Vec<u8>>)]) -> Vec<Resp> {
-        let slots: Vec<Arc<std::sync::Mutex<Option<Outcome>>>> =
-            cmds.iter().map(|_| Arc::new(std::sync::Mutex::new(None))).collect();
-        let ops: Vec<storage::OpFn> = cmds
-            .iter()
-            .cloned()
-            .zip(slots.iter().cloned())
-            .map(|((name, args), slot)| {
-                Box::new(move |st: &mut dyn Store| {
-                    let mut cx = Ctx { tx: st, now: now_ms(), exp: Vec::new(), created: false, readonly: false };
-                    let reply = exec(&mut cx, &name, &args);
-                    if matches!(reply, Resp::Error(_)) {
-                        cx.tx.discard();
-                        cx.exp.clear();
-                    }
-                    *slot.lock().unwrap() = Some(Outcome { reply, exp: cx.exp, created: cx.created });
-                }) as storage::OpFn
-            })
-            .collect();
-        if let Err(e) = self.engine.submit_ops(ops) {
-            let e = err(&e.to_string());
-            return cmds.iter().map(|_| e.clone()).collect();
-        }
-        slots
-            .into_iter()
-            .map(|s| match s.lock().unwrap().take() {
-                Some(o) => {
-                    self.after_commit(&o.exp, o.created);
-                    o.reply
+        let slot: Arc<std::sync::Mutex<Vec<Outcome>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = Arc::clone(&slot);
+        let cmds = cmds.to_vec();
+        let n = cmds.len();
+        let res = self.engine.submit_op(Box::new(move |st: &mut dyn Store| {
+            let now = now_ms();
+            let mut outcomes = Vec::with_capacity(cmds.len());
+            for (name, args) in &cmds {
+                let sp = st.savepoint();
+                let mut cx = Ctx { tx: st, now, exp: Vec::new(), created: false, readonly: false };
+                let reply = exec(&mut cx, name, args);
+                let (exp, created) = (cx.exp, cx.created);
+                if matches!(reply, Resp::Error(_)) {
+                    st.rollback_to(sp); // a failed command writes nothing
+                    outcomes.push(Outcome { reply, exp: Vec::new(), created: false });
+                } else {
+                    outcomes.push(Outcome { reply, exp, created });
                 }
-                None => err("operation did not run"),
+            }
+            *out.lock().unwrap() = outcomes;
+        }));
+        if let Err(e) = res {
+            let e = err(&e.to_string());
+            return (0..n).map(|_| e.clone()).collect();
+        }
+        let outcomes = std::mem::take(&mut *slot.lock().unwrap());
+        if outcomes.len() != n {
+            return (0..n).map(|_| err("operation did not run")).collect();
+        }
+        outcomes
+            .into_iter()
+            .map(|o| {
+                self.after_commit(&o.exp, o.created);
+                o.reply
             })
             .collect()
     }
@@ -496,7 +504,15 @@ impl Keyspace {
             let mut out = Vec::with_capacity(cmds.len());
             for c in &cmds {
                 let name = String::from_utf8_lossy(&c[0]).to_ascii_uppercase();
-                out.push(exec(&mut cx, &name, &c[1..]));
+                // A command that fails inside EXEC writes nothing (Redis runs
+                // the rest); undo any partial writes it made before failing.
+                let (sp, exp_len) = (cx.tx.savepoint(), cx.exp.len());
+                let r = exec(&mut cx, &name, &c[1..]);
+                if matches!(r, Resp::Error(_)) {
+                    cx.tx.rollback_to(sp);
+                    cx.exp.truncate(exp_len);
+                }
+                out.push(r);
             }
             Outcome { reply: Resp::Array(out), exp: cx.exp, created: cx.created }
         });

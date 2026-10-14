@@ -72,10 +72,17 @@ impl Chain {
     }
 
     /// Insert a committed version, keeping `versions` sorted by ts (records
-    /// can arrive out of order on WAL replay). Prunes the oldest version past
-    /// `MAX_VERSIONS_PER_KEY`, except one an in-progress checkpoint at `pin`
-    /// still needs (the chain may grow briefly instead).
-    fn push(&mut self, ts: u64, value: Value, pin: u64) {
+    /// can arrive out of order on WAL replay). Past `MAX_VERSIONS_PER_KEY`
+    /// it prunes every version except the newest MAX and those an open
+    /// snapshot in `active` (sorted) still reads.
+    ///
+    /// This used to remove only from the front and stop at the first version
+    /// the OLDEST snapshot needed: while a checkpoint was pinned, every
+    /// overwrite of a hot key was kept, and once it unpinned the backlog was
+    /// trimmed one `remove(0)` at a time, O(n²) on the commit thread. A
+    /// sub-second checkpoint under an HSET load cost tens of seconds of
+    /// throughput that way.
+    fn push(&mut self, ts: u64, value: Value, active: &[u64]) {
         if self.first_ts == 0 && self.pruned_ts == 0 && self.versions.is_empty() {
             self.first_ts = ts;
         }
@@ -87,15 +94,24 @@ impl Chain {
         let pos = self.versions.partition_point(|v| v.ts <= ts);
         self.versions.insert(pos, Version { ts, value });
         self.latest_ts = self.latest_ts.max(ts);
-        while self.versions.len() > MAX_VERSIONS_PER_KEY {
-            let needed_by_pin = pin != 0
-                && self.versions[0].ts <= pin
-                && self.versions[1].ts > pin;
-            if needed_by_pin {
-                break;
+        let n = self.versions.len();
+        if n > MAX_VERSIONS_PER_KEY {
+            // Version i serves snapshots in [ts_i, ts_{i+1}).
+            let needed = |lo: u64, hi: u64| {
+                let p = active.partition_point(|&s| s < lo);
+                p < active.len() && active[p] < hi
+            };
+            let mut w = 0;
+            for i in 0..n {
+                let keep = i >= n - MAX_VERSIONS_PER_KEY || needed(self.versions[i].ts, self.versions[i + 1].ts);
+                if keep {
+                    self.versions.swap(w, i);
+                    w += 1;
+                } else {
+                    self.pruned_ts = self.pruned_ts.max(self.versions[i].ts);
+                }
             }
-            let gone = self.versions.remove(0);
-            self.pruned_ts = self.pruned_ts.max(gone.ts);
+            self.versions.truncate(w);
         }
     }
 
@@ -302,7 +318,7 @@ fn as_counter(v: Option<&Value>) -> Result<i64, String> {
 /// in the same flush batch, which are newer than any snapshot still pending).
 fn resolve(core: &FlushCore, pw: &PendingWrite, overlay: &BTreeMap<Key, Value>) -> Resolved {
     if let Some(op) = pw.op.lock().unwrap().take() {
-        let mut st = OpStore { core, overlay, writes: BTreeMap::new() };
+        let mut st = OpStore { core, overlay, writes: BTreeMap::new(), undo: Vec::new(), savepoints: 0 };
         op(&mut st);
         let muts = st.writes.into_iter().map(|(key, value)| Mutation { key, value, ts: pw.ts }).collect();
         return Resolved::Apply(Some(muts), None);
@@ -352,6 +368,9 @@ impl Resolved {
 /// sweet spot up to ~64 cores.
 pub const SHARD_COUNT: usize = 32;
 
+/// Keys a checkpoint copies per shard-lock acquisition.
+const CKPT_CHUNK: usize = 4096;
+
 /// Sentinel op-error string for an OCC conflict (never a user-visible message).
 const CONFLICT: &str = "\0conflict";
 
@@ -370,15 +389,16 @@ fn apply_refs_to_shards(core: &FlushCore, muts: &[&Mutation]) {
             continue;
         }
         let mut data = core.shards[i].write().unwrap();
-        // Keep whatever version the OLDEST open snapshot (a checkpoint, a
-        // replica sync, a transaction) still needs.
-        let pin = core.active.lock().unwrap().keys().next().copied().unwrap_or(0);
+        // Keep whatever versions the open snapshots (a checkpoint, a replica
+        // sync, a transaction) still read. Read under the shard lock, so a
+        // snapshot registered later reads a ts this push already covers.
+        let active: Vec<u64> = core.active.lock().unwrap().keys().copied().collect();
         let mut delta = 0i64;
         let mut dead: Vec<(Key, u64)> = Vec::new();
         for m in items {
             let chain = data.entry(m.key.clone()).or_default();
             let before = chain.latest().is_some();
-            chain.push(m.ts, m.value.clone(), pin);
+            chain.push(m.ts, m.value.clone(), &active);
             if m.key.starts_with(b"kv:") {
                 delta += chain.latest().is_some() as i64 - before as i64;
             }
@@ -637,7 +657,7 @@ impl Engine {
                         // The checkpoint compacted away this key's history:
                         // reads before this version can't be answered.
                         chain.pruned_ts = chain.pruned_ts.max(m.ts.saturating_sub(1).max(1));
-                        chain.push(m.ts, m.value, 0);
+                        chain.push(m.ts, m.value, &[]);
                     }
                 }
                 Err(e) => {
@@ -664,7 +684,7 @@ impl Engine {
                 for m in decode_records(&rec) {
                     max_ts = max_ts.max(m.ts);
                     let s = shard_of(&m.key);
-                    shard_data[s].entry(m.key).or_default().push(m.ts, m.value, 0);
+                    shard_data[s].entry(m.key).or_default().push(m.ts, m.value, &[]);
                 }
             })?;
         }
@@ -676,7 +696,7 @@ impl Engine {
             for m in decode_records(&rec) {
                 max_ts = max_ts.max(m.ts);
                 let s = shard_of(&m.key);
-                shard_data[s].entry(m.key).or_default().push(m.ts, m.value, 0);
+                shard_data[s].entry(m.key).or_default().push(m.ts, m.value, &[]);
             }
         })?;
 
@@ -1589,18 +1609,46 @@ fn perform_flush_all(core: &FlushCore, wal_path: &Path, bak: &str) -> io::Result
     /// shard's read lock only while copying that shard. The state at a
     /// pinned snapshot is immutable, so the counting pass and the writing
     /// pass agree.
+    /// Visit every entry of `shard` holding its read lock for at most
+    /// `CKPT_CHUNK` keys at a time.
+    fn walk_chunks(shard: &RwLock<BTreeMap<Key, Chain>>, mut f: impl FnMut(&Key, &Chain)) {
+        let mut after: Option<Key> = None;
+        loop {
+            let data = shard.read().unwrap();
+            let it: Box<dyn Iterator<Item = (&Key, &Chain)>> = match &after {
+                Some(k) => Box::new(data.range::<Key, _>((std::ops::Bound::Excluded(k.clone()), std::ops::Bound::Unbounded))),
+                None => Box::new(data.iter()),
+            };
+            let mut last = None;
+            for (k, c) in it.take(CKPT_CHUNK) {
+                f(k, c);
+                last = Some(k);
+            }
+            match last {
+                Some(k) => after = Some(k.clone()),
+                None => return,
+            }
+        }
+    }
+
     fn write_snapshot_at(&self, snap_path: &Path, snap: u64) -> io::Result<u64> {
         let tmp_path: PathBuf = {
             let mut s = snap_path.as_os_str().to_owned();
             s.push(".tmp");
             PathBuf::from(s)
         };
-        let count: u64 = self
-            .core
-            .shards
-            .iter()
-            .map(|sh| sh.read().unwrap().values().filter(|c| c.visible(snap).is_some()).count() as u64)
-            .sum();
+        // Both passes walk each shard in chunks of CKPT_CHUNK keys, taking
+        // the shard lock per chunk: holding it for a whole shard (~100k keys
+        // at 3M) stalled the commit thread's writes to that shard for tens
+        // of ms each, and cut durable HSET throughput ~3x while a
+        // checkpoint ran. The pinned snapshot makes the chunked walk see a
+        // consistent state anyway.
+        let mut count = 0u64;
+        for sh in &self.core.shards {
+            Self::walk_chunks(sh, |_, c| {
+                count += c.visible(snap).is_some() as u64;
+            });
+        }
         let f = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp_path)?;
         let mut w = io::BufWriter::with_capacity(1 << 20, f);
         let mut crc = crate::crc::Crc32Hasher::default();
@@ -1611,20 +1659,34 @@ fn perform_flush_all(core: &FlushCore, wal_path: &Path, bak: &str) -> io::Result
         emit(&mut w, &count.to_le_bytes())?;
         let mut written = 0u64;
         for sh in &self.core.shards {
-            let page: Vec<Vec<u8>> = {
-                let data = sh.read().unwrap();
-                data.iter()
-                    .filter_map(|(k, c)| {
-                        let v = c.visible(snap)?;
-                        let ts = c.versions.iter().rev().find(|x| x.ts <= snap).map_or(0, |x| x.ts);
-                        Some(Mutation { key: k.clone(), value: v.clone(), ts }.encode())
-                    })
-                    .collect()
-            };
-            for rec in page {
-                emit(&mut w, &(rec.len() as u32).to_le_bytes())?;
-                emit(&mut w, &rec)?;
-                written += 1;
+            let mut after: Option<Key> = None;
+            loop {
+                let (page, last) = {
+                    let data = sh.read().unwrap();
+                    let it: Box<dyn Iterator<Item = (&Key, &Chain)>> = match &after {
+                        Some(k) => Box::new(data.range::<Key, _>((std::ops::Bound::Excluded(k.clone()), std::ops::Bound::Unbounded))),
+                        None => Box::new(data.iter()),
+                    };
+                    let mut page = Vec::with_capacity(CKPT_CHUNK);
+                    let mut last = None;
+                    for (k, c) in it.take(CKPT_CHUNK) {
+                        last = Some(k.clone());
+                        if let Some(v) = c.visible(snap) {
+                            let ts = c.versions.iter().rev().find(|x| x.ts <= snap).map_or(0, |x| x.ts);
+                            page.push(Mutation { key: k.clone(), value: v.clone(), ts }.encode());
+                        }
+                    }
+                    (page, last)
+                };
+                for rec in page {
+                    emit(&mut w, &(rec.len() as u32).to_le_bytes())?;
+                    emit(&mut w, &rec)?;
+                    written += 1;
+                }
+                match last {
+                    Some(k) => after = Some(k),
+                    None => break,
+                }
             }
         }
         if written != count {
@@ -1644,6 +1706,11 @@ fn perform_flush_all(core: &FlushCore, wal_path: &Path, bak: &str) -> io::Result
     /// checkpoint (snapshot + truncate) is worth its cost.
     pub fn wal_bytes(&self) -> u64 {
         self.core.wal.lock().unwrap().len()
+    }
+
+    /// Size of the last checkpoint snapshot on disk (0 if none).
+    pub fn snapshot_bytes(&self) -> u64 {
+        std::fs::metadata(snap_path_for(&self.wal_path)).map_or(0, |m| m.len())
     }
 
     /// Atomic batch write: all `kvs` are made visible under ONE commit timestamp
@@ -1756,6 +1823,21 @@ pub trait Store {
     fn has_writes(&self) -> bool;
     /// Drop every buffered write (e.g. the command failed).
     fn discard(&mut self);
+    /// Mark the current write position, so one command of a batch that
+    /// fails can be undone (`rollback_to`) without dropping the writes of
+    /// the commands before it. Default: no nesting (rollback = discard).
+    fn savepoint(&mut self) -> usize {
+        0
+    }
+    fn rollback_to(&mut self, _sp: usize) {
+        self.discard();
+    }
+    /// Keys written by earlier commits of the current flush batch (applied
+    /// and announced to subscribers only after this op). Empty off the
+    /// commit path.
+    fn batch_keys(&self) -> Vec<Key> {
+        Vec::new()
+    }
 }
 
 /// An operation run on the commit path.
@@ -1767,6 +1849,20 @@ pub struct OpStore<'a> {
     core: &'a FlushCore,
     overlay: &'a BTreeMap<Key, Value>,
     writes: BTreeMap<Key, Value>,
+    /// Previous entry in `writes` for every put/delete since the oldest
+    /// open savepoint (`None` = key was not written). Empty unless a
+    /// savepoint is open, so single-command ops pay nothing.
+    undo: Vec<(Key, Option<Value>)>,
+    savepoints: usize,
+}
+
+impl OpStore<'_> {
+    fn record(&mut self, key: &Key) {
+        if self.savepoints > 0 {
+            let prev = self.writes.get(key).cloned();
+            self.undo.push((key.clone(), prev));
+        }
+    }
 }
 
 fn live(v: &Value) -> Option<Value> {
@@ -1786,10 +1882,12 @@ impl Store for OpStore<'_> {
     }
 
     fn put(&mut self, key: Key, value: Value) {
+        self.record(&key);
         self.writes.insert(key, value);
     }
 
     fn delete(&mut self, key: Key) {
+        self.record(&key);
         self.writes.insert(key, Value::Tombstone);
     }
 
@@ -1864,6 +1962,26 @@ impl Store for OpStore<'_> {
 
     fn discard(&mut self) {
         self.writes.clear();
+        self.undo.clear();
+    }
+
+    fn batch_keys(&self) -> Vec<Key> {
+        self.overlay.keys().cloned().collect()
+    }
+
+    fn savepoint(&mut self) -> usize {
+        self.savepoints += 1;
+        self.undo.len()
+    }
+
+    fn rollback_to(&mut self, sp: usize) {
+        while self.undo.len() > sp {
+            let (k, prev) = self.undo.pop().unwrap();
+            match prev {
+                Some(v) => self.writes.insert(k, v),
+                None => self.writes.remove(&k),
+            };
+        }
     }
 }
 
@@ -2408,6 +2526,27 @@ mod tests {
             chain.versions.len() <= MAX_VERSIONS_PER_KEY,
             "chain should be pruned; got {} versions", chain.versions.len()
         );
+    }
+
+    /// An open snapshot must keep exactly the version it reads, without
+    /// keeping every later overwrite (which grew hot-key chains without
+    /// bound during a checkpoint, then cost O(n²) to trim).
+    #[test]
+    fn pinned_snapshot_prunes_unneeded_versions() {
+        let e = Engine::open(tmp("prune_pin.wal")).unwrap();
+        e.put(b"hot".to_vec(), Value::Int(-1)).unwrap();
+        let tx = e.begin(); // registers its snapshot, like a checkpoint pin
+        for i in 0..5000i64 {
+            e.put(b"hot".to_vec(), Value::Int(i)).unwrap();
+        }
+        {
+            let d = e.core.shards[shard_of(b"hot")].read().unwrap();
+            let n = d.get(b"hot".as_slice()).unwrap().versions.len();
+            assert!(n <= MAX_VERSIONS_PER_KEY + 1, "pinned chain kept {n} versions");
+        }
+        let mut tx = tx;
+        assert_eq!(tx.get(b"hot"), Some(Value::Int(-1)), "the pinned read must survive pruning");
+        assert_eq!(e.get(b"hot"), Some(Value::Int(4999)));
     }
 
     #[test]

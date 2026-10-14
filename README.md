@@ -288,6 +288,54 @@ one snapshot, one consistency guarantee.
 
 ---
 
+## 🌿 Version control for your data — Git semantics, Redis protocol
+
+Commit, branch, diff, merge and time-travel the keyspace, the way Dolt does for
+SQL. The unit of change and of merge conflicts is a **key**, of any type:
+strings, hashes, lists, sets, sorted sets, streams, and their TTLs.
+
+```
+VC.INIT                              # root commit of the current data (branch "main")
+VC.STATUS                            # branch, HEAD, uncommitted keys (added/modified/deleted)
+VC.COMMIT "message" [AUTHOR who] [ALLOWEMPTY]
+VC.LOG [rev] [COUNT n]               VC.HISTORY key [COUNT n]
+VC.BRANCH [name [rev]] | VC.BRANCH DELETE name
+VC.TAG [name [rev]]    | VC.TAG DELETE name
+VC.CHECKOUT branch [FORCE]           # rewrites only the keys that differ
+VC.DIFF [rev [rev]]                  # working copy vs HEAD, vs rev, or rev vs rev
+VC.GET rev key   VC.KEYS rev [pattern]   # read any commit without a checkout
+VC.MERGE rev [STRATEGY OURS|THEIRS] [DRYRUN] [MESSAGE m]
+VC.REVERT rev   VC.RESET rev [HARD|SOFT]   VC.RESTORE rev key [key ...]
+```
+
+Revisions: `HEAD`, a branch, a tag, a commit id or a unique prefix of 4+
+hex digits, each with `~N` / `^` (first parent).
+
+- **Merges are three-way at key level.** A key changed on only one side is
+  taken. The same change on both sides is fine. Different changes conflict:
+  the merge reports them and changes nothing. Re-run with `STRATEGY OURS` or
+  `THEIRS` to settle them, or use `DRYRUN` to preview. A branch that is
+  strictly ahead fast-forwards.
+- **Cost is proportional to the change, not the database.** Each commit
+  stores its changeset plus a per-key history. Diffs, checkouts and merges
+  only touch keys that changed between the two revisions. What to commit
+  comes from the commit stream (a dirty-key set), so `VC.COMMIT` doesn't
+  scan the keyspace.
+- **Every `VC.*` command is one atomic operation on the commit path,**
+  serialized with all writes. It is durable, replicated, and survives
+  `kill -9`.
+- **Limits:**
+  - There is one working copy (like a git working tree), so `VC.CHECKOUT`
+    switches the whole server.
+  - Only the Redis keyspace is versioned. Vectors, tables and agent memory
+    are not.
+  - History is never garbage-collected.
+  - A commit with hundreds of thousands of changed keys holds the commit
+    thread for a second or two.
+  - `FLUSHALL` removes the repository too.
+
+---
+
 ## 🐞 MITM Cache Debugger — catch caching bugs instantly
 
 The "vector index is a cache with no invalidation strategy" problem, solved at the
