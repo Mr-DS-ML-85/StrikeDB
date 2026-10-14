@@ -489,7 +489,10 @@ pub fn rebuild_derived(db: &Arc<Db>) {
 /// Commands a replica refuses (it only changes through the stream).
 pub fn is_write_command(name: &str) -> bool {
     use crate::acl::{command_categories, PermCategory};
-    if matches!(name, "FLUSHALL" | "FLUSHDB" | "VSNAPSHOT" | "BLPOP" | "BRPOP") {
+    if matches!(
+        name,
+        "FLUSHALL" | "FLUSHDB" | "VSNAPSHOT" | "BLPOP" | "BRPOP" | "VC.INIT" | "VC.CHECKOUT" | "VC.MERGE" | "VC.RESET" | "VC.REVERT"
+    ) {
         return true;
     }
     command_categories(name).contains(&PermCategory::Write)

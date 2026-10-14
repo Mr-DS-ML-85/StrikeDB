@@ -24,6 +24,7 @@ mod acl;
 mod pubsub;
 mod keyspace;
 mod replication;
+mod vcs;
 #[cfg(target_os = "linux")]
 mod eventloop;
 
@@ -96,6 +97,8 @@ struct Db {
     replica: replication::ReplicaState,
     /// Replica: replicated agent-memory writes arrived; mirrors need a reload.
     mem_dirty: std::sync::atomic::AtomicBool,
+    /// Git-style version control of the keyspace (`VC.*`).
+    vcs: Arc<vcs::Vcs>,
 }
 
 /// SCAN cursor ids → resume key. Cursors are server-side so a scan costs
@@ -189,6 +192,14 @@ fn main() -> std::io::Result<()> {
         let h = Arc::clone(&repl_hub);
         engine.subscribe_flush(Arc::new(move || h.on_flush()));
     }
+    // Version control: dirty-key tracking from the commit stream.
+    let vcs = vcs::Vcs::open(&engine);
+    {
+        let v = Arc::clone(&vcs);
+        engine.subscribe(Arc::new(move |m: &storage::Mutation| v.on_commit(m)));
+        let v = Arc::clone(&vcs);
+        engine.subscribe_flush(Arc::new(move || v.on_flush()));
+    }
     let db = Arc::new(Db {
         engine,
         reactive,
@@ -210,6 +221,7 @@ fn main() -> std::io::Result<()> {
         repl_hub,
         replica: replication::ReplicaState::default(),
         mem_dirty: std::sync::atomic::AtomicBool::new(false),
+        vcs,
     });
     // Replica: rebuild agent-memory mirrors shortly after replicated memory
     // writes (their mirrors span several key families; a debounced reload is
@@ -1735,6 +1747,9 @@ fn stream_block(db: &Db, name: &str, args: &[Vec<u8>]) -> Option<Resp> {
 fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
     // Redis keyspace commands (strings, TTL, hash/list/set/zset) run in the
     // transactional executor; the hottest shapes keep zero-overhead paths.
+    if vcs::is_vcs_cmd(name) {
+        return vcs::command(db, name, args);
+    }
     if keyspace::is_keyspace_cmd(name) {
         if let Some(r) = fast_keyspace(db, name, args) {
             return r;

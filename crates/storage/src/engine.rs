@@ -1832,6 +1832,12 @@ pub trait Store {
     fn rollback_to(&mut self, _sp: usize) {
         self.discard();
     }
+    /// Keys written by earlier commits of the current flush batch (applied
+    /// and announced to subscribers only after this op). Empty off the
+    /// commit path.
+    fn batch_keys(&self) -> Vec<Key> {
+        Vec::new()
+    }
 }
 
 /// An operation run on the commit path.
@@ -1957,6 +1963,10 @@ impl Store for OpStore<'_> {
     fn discard(&mut self) {
         self.writes.clear();
         self.undo.clear();
+    }
+
+    fn batch_keys(&self) -> Vec<Key> {
+        self.overlay.keys().cloned().collect()
     }
 
     fn savepoint(&mut self) -> usize {

@@ -683,6 +683,10 @@ pub fn command_categories(cmd: &str) -> &'static [PermCategory] {
         | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "ZREVRANGEBYLEX" | "ZLEXCOUNT"
         | "XLEN" | "XRANGE" | "XREVRANGE" | "XREAD" | "XPENDING" | "XINFO" => &[Read],
         "XADD" | "XDEL" | "XTRIM" | "XREADGROUP" | "XGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM" | "XSETID" => &[Write],
+        "VC.STATUS" | "VC.LOG" | "VC.DIFF" | "VC.GET" | "VC.KEYS" | "VC.HISTORY" => &[Read],
+        "VC.COMMIT" | "VC.BRANCH" | "VC.TAG" | "VC.RESTORE" => &[Write],
+        // Rewrite any key in the keyspace, whatever a user's key patterns.
+        "VC.INIT" | "VC.CHECKOUT" | "VC.MERGE" | "VC.RESET" | "VC.REVERT" => &[Admin, Dangerous],
         "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX"
         | "LPOP" | "RPOP" | "BLPOP" | "BRPOP" | "LSET" | "LTRIM" | "LREM" | "LINSERT" | "RPOPLPUSH" | "LMOVE"
         | "SADD" | "SREM" | "SPOP" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "SMOVE" | "ZADD" | "ZREM"
@@ -741,6 +745,10 @@ pub fn command_keys<'a>(cmd: &str, args: &'a [Vec<u8>]) -> Vec<&'a [u8]> {
         },
         // Subcommand first, then the key.
         "XGROUP" | "XINFO" => args.get(1).map(|a| vec![a.as_slice()]).unwrap_or_default(),
+        // Revision first, then key(s).
+        "VC.GET" => args.get(1).map(|a| vec![a.as_slice()]).unwrap_or_default(),
+        "VC.RESTORE" => args.iter().skip(1).map(|a| a.as_slice()).collect(),
+        "VC.HISTORY" => args.first().map(|a| vec![a.as_slice()]).unwrap_or_default(),
         // Every hash/list/set/zset/stream command takes its key first.
         c if crate::keyspace::is_keyspace_cmd(c) && !matches!(c, "PING" | "ECHO" | "TIME") => {
             args.first().map(|a| vec![a.as_slice()]).unwrap_or_default()
