@@ -232,18 +232,24 @@ fn main() -> std::io::Result<()> {
         }
     }
     // Automatic checkpoint: the WAL used to grow without bound unless an
-    // operator ran CHECKPOINT (246 MB after one benchmark session). Now that
-    // a checkpoint no longer blocks writers, compact once the live WAL passes
-    // DBSTRIKE_CHECKPOINT_MB (default 256; 0 disables).
+    // operator ran CHECKPOINT (246 MB after one benchmark session). Compact
+    // once the live WAL passes BOTH DBSTRIKE_CHECKPOINT_MB (default 256; 0
+    // disables) and DBSTRIKE_CHECKPOINT_PCT percent of the last snapshot
+    // (default 100, like Redis's auto-aof-rewrite-percentage). The size
+    // floor alone rewrote a large dataset's whole snapshot every 256 MB of
+    // overwrites: a few seconds apart under a hot-key HSET load.
     {
         let db = Arc::clone(&db);
         let mb: u64 = std::env::var("DBSTRIKE_CHECKPOINT_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+        let pct: u64 = std::env::var("DBSTRIKE_CHECKPOINT_PCT").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
         if mb > 0 {
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(5));
-                if db.engine.wal_bytes() > mb * 1024 * 1024 {
+                let floor = (mb * 1024 * 1024).max(db.engine.snapshot_bytes().saturating_mul(pct) / 100);
+                if db.engine.wal_bytes() > floor {
+                    let t0 = std::time::Instant::now();
                     match db.engine.checkpoint() {
-                        Ok((n, bytes)) => eprintln!("[CHECKPOINT] auto: {n} keys, {bytes} bytes"),
+                        Ok((n, bytes)) => eprintln!("[CHECKPOINT] auto: {n} keys, {bytes} bytes in {} ms", t0.elapsed().as_millis()),
                         Err(e) => eprintln!("[CHECKPOINT] auto failed: {e}"),
                     }
                 }
