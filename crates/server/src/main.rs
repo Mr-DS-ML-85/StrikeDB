@@ -3470,16 +3470,25 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
             }
             Resp::Array(out)
         }
-        // MEM.FORGET id  -> OK
+        // MEM.FORGET id                -> OK   (legacy, unscoped)
+        // MEM.FORGET AGENT name id     -> OK   (owner-checked: denied unless
+        //                                       `name` owns the fact)
         "MEM.FORGET" => {
-            if args.len() != 1 {
-                return err("MEM.FORGET requires id");
+            let scoped = args.len() >= 2 && args[0].eq_ignore_ascii_case(b"AGENT");
+            let (agent, rest) = parse_agent_scope(args);
+            if rest.len() != 1 {
+                return err("MEM.FORGET requires [AGENT name] id");
             }
-            let id: u64 = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let id: u64 = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("id is not a u64"),
             };
-            match db.rag.memory().ltm_forget(id) {
+            let res = if scoped {
+                db.rag.memory().ltm_forget_scoped(id, &agent)
+            } else {
+                db.rag.memory().ltm_forget(id)
+            };
+            match res {
                 Ok(_) => Resp::Simple("OK".into()),
                 Err(e) => err(&e.to_string()),
             }
@@ -4203,21 +4212,37 @@ fn dispatch(db: &Db, name: &str, args: &[Vec<u8>]) -> Resp {
         }
         // MEM.COUNT  -> :n   (live long-term memory count)
         "MEM.COUNT" => Resp::Int(db.rag.memory().ltm_count() as i64),
-        // MEM.GET id  -> array of (text, source, salience) or nil
+        // MEM.GET [AGENT name] id [WITHMETA]
+        //   default  -> array of (text, source, salience) or nil — FROZEN
+        //   WITHMETA -> + (created_ts, valid_from, valid_to)
+        //   AGENT    -> nil unless `name` owns the fact (legacy owner-less
+        //               records stay visible, matching MEM.RECALL)
         "MEM.GET" => {
-            if args.len() != 1 {
-                return err("MEM.GET requires id");
+            let scoped = args.len() >= 2 && args[0].eq_ignore_ascii_case(b"AGENT");
+            let (agent, rest) = parse_agent_scope(args);
+            let with_meta = rest.len() == 2 && rest[1].eq_ignore_ascii_case(b"WITHMETA");
+            if rest.len() != 1 && !with_meta {
+                return err("MEM.GET requires [AGENT name] id [WITHMETA]");
             }
-            let id: u64 = match std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse().ok()) {
+            let id: u64 = match std::str::from_utf8(&rest[0]).ok().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return err("id is not a u64"),
             };
-            match db.rag.memory().ltm_get(id) {
-                Some(rec) => Resp::Array(vec![
-                    Resp::Bulk(rec.text.into_bytes()),
-                    Resp::Bulk(rec.meta.source.into_bytes()),
-                    Resp::Bulk(format!("{:.6}", rec.meta.salience).into_bytes()),
-                ]),
+            match db.rag.memory().ltm_get_light(id) {
+                Some((_, meta)) if scoped && !meta.owner.is_empty() && meta.owner != agent => Resp::Nil,
+                Some((text, meta)) => {
+                    let mut out = vec![
+                        Resp::Bulk(text.into_bytes()),
+                        Resp::Bulk(meta.source.into_bytes()),
+                        Resp::Bulk(format!("{:.6}", meta.salience).into_bytes()),
+                    ];
+                    if with_meta {
+                        out.push(Resp::Int(meta.created_ts as i64));
+                        out.push(Resp::Int(meta.valid_from as i64));
+                        out.push(Resp::Int(meta.valid_to as i64));
+                    }
+                    Resp::Array(out)
+                }
                 None => Resp::Nil,
             }
         }

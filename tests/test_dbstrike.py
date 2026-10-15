@@ -557,6 +557,21 @@ def test_temporal():
     ids_none = [int(got_none[i]) for i in range(0, len(got_none), 4)]
     check("as-of 5000 excludes invalidated CEO fact", id2 not in ids_none,
           f"ids={ids_none}")
+
+    # Owner-scoped MEM.GET / MEM.FORGET (opt-in AGENT forms; bare forms frozen)
+    va = embed("alice private diary", dim=16)
+    own = c.cmd("MEM.REMEMBER", "AGENT", "alice", "alice private diary", "t", 0.5, *va)
+    got = c.cmd("MEM.GET", "AGENT", "alice", own, "WITHMETA")
+    check("MEM.GET AGENT owner WITHMETA -> 6 fields",
+          isinstance(got, list) and len(got) == 6 and got[0] == b"alice private diary", f"got={got}")
+    check("MEM.GET AGENT other -> nil", c.cmd("MEM.GET", "AGENT", "bob", own) is None)
+    check("MEM.GET bare stays 3 fields", len(c.cmd("MEM.GET", own)) == 3)
+    denied = c.cmd("MEM.FORGET", "AGENT", "bob", own)
+    check("MEM.FORGET AGENT other -> denied", isinstance(denied, Exception) or "denied" in str(denied),
+          f"got={denied!r}")
+    check("fact survives denied forget", c.cmd("MEM.GET", own) is not None)
+    check("MEM.FORGET AGENT owner -> OK", c.cmd("MEM.FORGET", "AGENT", "alice", own) == "OK")
+    check("fact gone after owner forget", c.cmd("MEM.GET", own) is None)
     c.close()
 
 # ---------------------------------------------------------------------------

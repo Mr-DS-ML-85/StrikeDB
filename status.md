@@ -60,6 +60,18 @@ opt-in → `69a3078` GPU fixes (this doc's parent).
 
 ---
 
+## 1b. Scoped-recall starvation fix (2026-10-15, memgent integration)
+
+`recall_at` used to filter by owner and bi-temporal window AFTER a global
+top-(3·k) cut, so a scope whose memories sat behind a few thousand closer
+memories of other scopes (or behind its own superseded facts) got ZERO hits.
+Memory now keeps an in-RAM `RecIndex` (id → salience, owner, valid window)
+plus one normalized-vector arena per owner: filtering happens during
+candidate generation, scopes ≤ `DBSTRIKE_MEM_EXACT_MAX` (50k) vectors are
+searched exactly (perfect recall), larger ones via a widened filtered ANN
+pass. Gate: `scoped_recall_is_not_starved_by_other_scopes`. Cost: LTM vectors
+are held twice in RAM (HNSW mirror + scope arena).
+
 ## 2. ⚠️ OPEN BUGS (prioritized)
 
 ### ~~BUG-1~~ ✅ FIXED (d389d43) — APGC fallback lacked global bridge routing
@@ -117,6 +129,8 @@ opt-in → `69a3078` GPU fixes (this doc's parent).
 | `MEM.RECALL [AGENT n] k q f…` | 4 fields/hit: `id score source text` | trailing `WITHMETA` → 7 (+created_ts valid_from valid_to) |
 | `MEM.RECALL.AS_OF [AGENT n] k q t f…` | same 4-field | same WITHMETA |
 | `HELLO` | RESP2 array (proto=2) | proto-3 arg → `%` map + `_` nulls on that connection |
+| `MEM.GET id` | 3 fields: `text source salience` | `AGENT name` prefix → nil unless `name` owns it (legacy owner-less visible); trailing `WITHMETA` → 6 (+created_ts valid_from valid_to) |
+| `MEM.FORGET id` | unscoped delete (legacy) | `AGENT name` prefix → owner-checked, denied for other scopes |
 
 Rule: extend reply shapes ONLY by appending NEW opt-in flags. Positional
 parsers must never see a stride change. Guarded by prove-it phase 6.

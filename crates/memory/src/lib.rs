@@ -232,13 +232,142 @@ pub struct Memory {
     /// (EP-1): two `episode()` calls in the same millisecond can no longer
     /// generate identical keys and silently overwrite each other.
     ep_seq: std::sync::atomic::AtomicU64,
-    /// In-memory salience mirror: id → salience. Recall's scoring loop needs
-    /// per-doc salience for every candidate that matched any keyword — that
-    /// was fetching `Meta` from the substrate per candidate (3 engine.get()
-    /// calls each). Caching salience makes scoring zero-substrate-read; the
-    /// full Meta (source, lineage) is only fetched for the FINAL top-k that
-    /// gets returned. Drops recall latency ~10× at N=2k+ memories.
-    salience_cache: std::sync::RwLock<HashMap<u64, f32>>,
+    /// In-memory record index: id → (salience, owner, validity window), plus
+    /// one normalized-vector arena per owner. Recall scores candidates with
+    /// zero substrate reads AND applies the owner scope + bi-temporal window
+    /// BEFORE the top-k cut (see [`RecIndex`]). Full Meta (source, lineage)
+    /// is fetched only for the final top-k that gets returned.
+    idx: std::sync::RwLock<RecIndex>,
+}
+
+/// Per-record facts recall needs while scoring, kept in RAM.
+#[derive(Clone, Copy, Debug)]
+struct RecInfo {
+    sal: f32,
+    owner: u32,
+    valid_from: u64,
+    valid_to: u64,
+}
+
+impl RecInfo {
+    fn valid_at(&self, at: u64) -> bool {
+        (self.valid_from == 0 || self.valid_from <= at) && (self.valid_to == 0 || self.valid_to > at)
+    }
+}
+
+/// Normalized vectors of ONE owner, flat, for exact per-scope search.
+#[derive(Default)]
+struct ScopeArena {
+    ids: Vec<u64>,
+    pos: HashMap<u64, usize>,
+    vecs: Vec<f32>,
+    dim: usize,
+}
+
+impl ScopeArena {
+    fn push(&mut self, id: u64, v: &[f32]) {
+        if v.is_empty() || (self.dim != 0 && v.len() != self.dim) || self.pos.contains_key(&id) {
+            return;
+        }
+        self.dim = v.len();
+        let mut n = v.to_vec();
+        normalize(&mut n);
+        self.pos.insert(id, self.ids.len());
+        self.ids.push(id);
+        self.vecs.extend_from_slice(&n);
+    }
+    fn remove(&mut self, id: u64) {
+        let Some(i) = self.pos.remove(&id) else { return };
+        let last = self.ids.len() - 1;
+        if i != last {
+            let moved = self.ids[last];
+            self.ids[i] = moved;
+            self.pos.insert(moved, i);
+            let d = self.dim;
+            let (head, tail) = self.vecs.split_at_mut(last * d);
+            head[i * d..(i + 1) * d].copy_from_slice(&tail[..d]);
+        }
+        self.ids.pop();
+        self.vecs.truncate(last * self.dim);
+    }
+}
+
+/// Why this exists — the scoped-recall starvation bug: owner and validity
+/// filtering used to run AFTER a global top-(3·k) cut over every agent's
+/// memories, so a user whose memories sat behind a few thousand closer
+/// memories of OTHER users (or behind their own superseded facts) got zero
+/// hits. Filtering now happens during candidate generation; scopes of up to
+/// `exact_max` vectors are searched exactly (perfect recall, and faster than
+/// a graph walk at agent-memory sizes), bigger ones via a widened ANN pass.
+#[derive(Default)]
+struct RecIndex {
+    owners: Vec<String>,
+    owner_ids: HashMap<String, u32>,
+    recs: HashMap<u64, RecInfo>,
+    arenas: HashMap<u32, ScopeArena>,
+}
+
+impl RecIndex {
+    fn intern(&mut self, owner: &str) -> u32 {
+        if let Some(&i) = self.owner_ids.get(owner) {
+            return i;
+        }
+        let i = self.owners.len() as u32;
+        self.owners.push(owner.to_string());
+        self.owner_ids.insert(owner.to_string(), i);
+        i
+    }
+    fn insert(&mut self, id: u64, meta: &Meta, vector: Option<&[f32]>) {
+        let owner = self.intern(&meta.owner);
+        self.recs.insert(
+            id,
+            RecInfo { sal: meta.salience, owner, valid_from: meta.valid_from, valid_to: meta.valid_to },
+        );
+        if let Some(v) = vector {
+            self.arenas.entry(owner).or_default().push(id, v);
+        }
+    }
+    fn remove(&mut self, id: u64) {
+        if let Some(info) = self.recs.remove(&id) {
+            if let Some(a) = self.arenas.get_mut(&info.owner) {
+                a.remove(id);
+            }
+        }
+    }
+}
+
+fn normalize(v: &mut [f32]) {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 {
+        let inv = 1.0 / n;
+        v.iter_mut().for_each(|x| *x *= inv);
+    }
+}
+
+/// 8-lane dot product; with target-cpu=native this lowers to packed FMA.
+#[inline]
+fn dot8(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (x, y) in ca.zip(cb) {
+        for l in 0..8 {
+            acc[l] += x[l] * y[l];
+        }
+    }
+    let mut s: f32 = acc.iter().sum();
+    for (x, y) in ra.iter().zip(rb) {
+        s += x * y;
+    }
+    s
+}
+
+/// Scope size up to which recall scores every vector exactly.
+fn exact_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DBSTRIKE_MEM_EXACT_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(50_000)
+    })
 }
 
 impl Memory {
@@ -257,22 +386,22 @@ impl Memory {
         // answered in its place). The reserved prefix gives memory its own
         // graph, its own dim, and keeps VLISTNS clean.
         let vectors = VectorIndex::open_ns(Arc::clone(&engine), "__ltm__".to_string());
-        let (max, count, sal_cache) = Self::scan_ltm(&engine);
+        let (max, count, idx) = Self::scan_ltm(&engine, &vectors);
         Self {
             engine,
             vectors,
             next_id: std::sync::atomic::AtomicU64::new(max + 1),
             ltm_count: std::sync::atomic::AtomicU64::new(count),
             ep_seq: std::sync::atomic::AtomicU64::new(0),
-            salience_cache: std::sync::RwLock::new(sal_cache),
+            idx: std::sync::RwLock::new(idx),
         }
     }
 
     /// Resume id counter + live count + salience cache from persisted LTM.
-    fn scan_ltm(engine: &Engine) -> (u64, u64, HashMap<u64, f32>) {
+    fn scan_ltm(engine: &Engine, vectors: &VectorIndex) -> (u64, u64, RecIndex) {
         let mut max = 0u64;
         let mut count = 0u64;
-        let mut sal_cache: HashMap<u64, f32> = HashMap::new();
+        let mut idx = RecIndex::default();
         let snap = engine.snapshot();
         for (k, _) in engine.scan_prefix(b"mem:ltm:", snap) {
             if k.len() >= 8 {
@@ -284,22 +413,23 @@ impl Memory {
                 // Repopulate salience so recall stays hot after restart.
                 if let Some(Value::Bytes(mb)) = engine.get(&meta_key(id)) {
                     if let Some(m) = decode_meta(&mb) {
-                        sal_cache.insert(id, m.salience);
+                        let v = vectors.get_vector(id);
+                        idx.insert(id, &m, v.as_deref());
                     }
                 }
             }
         }
-        (max, count, sal_cache)
+        (max, count, idx)
     }
 
     /// Rebuild every RAM mirror (ids, count, salience, semantic graph) from
     /// the substrate — a replica after a full sync or new replicated writes.
     pub fn reload(&self) {
-        let (max, count, sal) = Self::scan_ltm(&self.engine);
+        self.vectors.reload();
+        let (max, count, idx) = Self::scan_ltm(&self.engine, &self.vectors);
         self.next_id.store(max + 1, std::sync::atomic::Ordering::SeqCst);
         self.ltm_count.store(count, std::sync::atomic::Ordering::SeqCst);
-        *self.salience_cache.write().unwrap() = sal;
-        self.vectors.reload();
+        *self.idx.write().unwrap() = idx;
     }
 
     fn alloc_id(&self) -> u64 {
@@ -317,7 +447,7 @@ impl Memory {
         self.next_id.store(1, std::sync::atomic::Ordering::SeqCst);
         self.ep_seq.store(0, std::sync::atomic::Ordering::SeqCst);
         self.ltm_count.store(0, std::sync::atomic::Ordering::SeqCst);
-        self.salience_cache.write().unwrap().clear();
+        *self.idx.write().unwrap() = RecIndex::default();
         self.vectors.reset_ram();
     }
 
@@ -404,18 +534,16 @@ impl Memory {
         let vf = if valid_from == 0 { ts } else { valid_from };
         self.engine
             .put(ltm_key(id), Value::Bytes(text.as_bytes().to_vec()))?;
-        self.engine.put(
-            meta_key(id),
-            Value::Bytes(encode_meta(&Meta {
-                source: source.to_string(),
-                created_ts: ts,
-                salience,
-                lineage: lineage.to_string(),
-                valid_from: vf,
-                valid_to,
-                owner: owner.to_string(),
-            })),
-        )?;
+        let meta = Meta {
+            source: source.to_string(),
+            created_ts: ts,
+            salience,
+            lineage: lineage.to_string(),
+            valid_from: vf,
+            valid_to,
+            owner: owner.to_string(),
+        };
+        self.engine.put(meta_key(id), Value::Bytes(encode_meta(&meta)))?;
         self.vectors.insert(id, vector.clone())?;
         // keyword index
         for tok in tokenize(text) {
@@ -423,8 +551,8 @@ impl Memory {
         }
         self.ltm_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // populate salience cache so recall scoring is zero-substrate-read
-        self.salience_cache.write().unwrap().insert(id, salience);
+        // index the record so recall scoring + filtering is zero-substrate-read
+        self.idx.write().unwrap().insert(id, &meta, Some(&vector));
         Ok(id)
     }
 
@@ -446,6 +574,7 @@ impl Memory {
             m.valid_to = invalid_at;
             self.engine
                 .put(meta_key(id), Value::Bytes(encode_meta(&m)))?;
+            self.set_valid_to(id, invalid_at);
         }
         Ok(())
     }
@@ -485,7 +614,29 @@ impl Memory {
         m.valid_to = invalid_at;
         self.engine
             .put(meta_key(id), Value::Bytes(encode_meta(&m)))?;
+        self.set_valid_to(id, invalid_at);
         Ok(())
+    }
+
+    fn set_valid_to(&self, id: u64, at: u64) {
+        if let Some(r) = self.idx.write().unwrap().recs.get_mut(&id) {
+            r.valid_to = at;
+        }
+    }
+
+    /// Owner-scoped forget: like [`Self::ltm_forget`] but denied unless
+    /// `requester` owns the fact — the wire form for `MEM.FORGET AGENT n id`.
+    pub fn ltm_forget_scoped(&self, id: u64, requester: &str) -> std::io::Result<()> {
+        let rec = self.ltm_get_light(id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("ERR no such fact {id}"))
+        })?;
+        if rec.1.owner != requester {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("ERR fact {id} owned by '{}' — requester '{}' denied", rec.1.owner, requester),
+            ));
+        }
+        self.ltm_forget(id)
     }
 
     pub fn ltm_get(&self, id: u64) -> Option<LtmRecord> {
@@ -519,7 +670,7 @@ impl Memory {
                 std::sync::atomic::Ordering::SeqCst,
                 |n| if n == 0 { None } else { Some(n - 1) },
             );
-            self.salience_cache.write().unwrap().remove(&id);
+            self.idx.write().unwrap().remove(id);
         }
         Ok(())
     }
@@ -670,25 +821,86 @@ impl Memory {
         at: u64,
     ) -> Vec<RecallHit> {
         let fetch = k * 3;
-        // Fast salience lookup (RwLock<read>, held briefly).
-        let sal_cache = self.salience_cache.read().unwrap();
-        let sal_of = |id: u64| -> f32 {
-            *sal_cache.get(&id).unwrap_or(&0.5)
+        // One read lock for the whole scoring phase: salience, owner and the
+        // bi-temporal window of every candidate come from RAM, and records
+        // the requester cannot see are dropped BEFORE the top-k cut.
+        let idx = self.idx.read().unwrap();
+        let scope_id = idx.owner_ids.get(scope).copied();
+        let legacy_id = idx.owner_ids.get("").copied();
+        let visible = |id: u64| -> Option<f32> {
+            let r = idx.recs.get(&id)?;
+            let owned = Some(r.owner) == scope_id || Some(r.owner) == legacy_id;
+            (owned && r.valid_at(at)).then_some(r.sal)
         };
 
-        // 1) semantic ANN
+        // 1) semantic: exact over the requester's own arena(s) when small
+        //    enough, else a widened ANN pass filtered by `visible`.
         let mut fused: HashMap<u64, (f32, &'static str)> = HashMap::new();
-        for (id, dist) in self.vectors.search(query_vec, fetch) {
-            let sim = 1.0 - dist / 2.0;
-            // Relevance floor: sim <= 0.5 means cosine <= 0 — orthogonal or
-            // opposite (and every match of a zero query vector). Those are not
-            // evidence of relevance; admitting them made a query that matched
-            // nothing still "find" every document by rank alone.
+        let arenas: Vec<&ScopeArena> = [scope_id, legacy_id]
+            .into_iter()
+            .flatten()
+            .filter_map(|o| idx.arenas.get(&o))
+            .collect();
+        let scoped_n: usize = arenas.iter().map(|a| a.ids.len()).sum();
+        // Relevance floor: sim <= 0.5 means cosine <= 0 — orthogonal or
+        // opposite (and every match of a zero query vector). Those are not
+        // evidence of relevance; admitting them made a query that matched
+        // nothing still "find" every document by rank alone.
+        let mut admit = |id: u64, sim: f32, fused: &mut HashMap<u64, (f32, &'static str)>| {
             if !(sim > MIN_SEMANTIC_SIM) {
-                continue;
+                return;
             }
-            let score = sim * (0.5 + 0.5 * sal_of(id));
-            fused.insert(id, (score, "semantic"));
+            if let Some(sal) = visible(id) {
+                fused.insert(id, (sim * (0.5 + 0.5 * sal), "semantic"));
+            }
+        };
+        if scoped_n > 0 && scoped_n <= exact_max() {
+            let mut q = query_vec.to_vec();
+            normalize(&mut q);
+            // min-heap of the best `fetch` VISIBLE candidates (validity is
+            // checked before a candidate can take a slot)
+            #[derive(PartialEq)]
+            struct C(f32, u64);
+            impl Eq for C {}
+            impl PartialOrd for C {
+                fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                    Some(self.cmp(o))
+                }
+            }
+            impl Ord for C {
+                fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                    o.0.total_cmp(&self.0)
+                }
+            }
+            let mut best: std::collections::BinaryHeap<C> = std::collections::BinaryHeap::with_capacity(fetch + 1);
+            for a in &arenas {
+                if a.dim != q.len() {
+                    continue;
+                }
+                for (i, id) in a.ids.iter().enumerate() {
+                    let cos = dot8(&q, &a.vecs[i * a.dim..(i + 1) * a.dim]);
+                    if cos <= 0.0 || (best.len() == fetch && best.peek().is_some_and(|w| cos <= w.0)) {
+                        continue;
+                    }
+                    if visible(*id).is_none() {
+                        continue;
+                    }
+                    best.push(C(cos, *id));
+                    if best.len() > fetch {
+                        best.pop();
+                    }
+                }
+            }
+            for C(cos, id) in best {
+                admit(id, (1.0 + cos) / 2.0, &mut fused);
+            }
+        } else if scoped_n > 0 {
+            let total = idx.recs.len().max(1);
+            let widen = (total / scoped_n).clamp(1, 64);
+            let want = (fetch * widen).clamp(fetch, 4096);
+            for (id, dist) in self.vectors.search_ef(query_vec, want, want.max(128)) {
+                admit(id, 1.0 - dist / 2.0, &mut fused);
+            }
         }
 
         // 2) keyword BM25 postings — accumulate scores WITHOUT substrate reads
@@ -712,7 +924,8 @@ impl Memory {
             for (kk, _) in matches {
                 if kk.len() >= 8 {
                     let id = u64::from_be_bytes(kk[kk.len() - 8..].try_into().unwrap());
-                    let add = contrib_per_doc * 0.8 * (0.5 + 0.5 * sal_of(id));
+                    let Some(sal) = visible(id) else { continue };
+                    let add = contrib_per_doc * 0.8 * (0.5 + 0.5 * sal);
                     fused
                         .entry(id)
                         .and_modify(|e| e.0 += add)
@@ -720,7 +933,7 @@ impl Memory {
                 }
             }
         }
-        drop(sal_cache);
+        drop(idx);
 
         // 3) Streaming top-k via a small max-heap (O(N log k), no full sort).
         // Capacity is the overfetch width (3×k): owner filtering happens at
@@ -796,7 +1009,9 @@ impl Memory {
             let new_sal = rec.meta.salience;
             self.engine
                 .put(meta_key(id), Value::Bytes(encode_meta(&rec.meta)))?;
-            self.salience_cache.write().unwrap().insert(id, new_sal);
+            if let Some(r) = self.idx.write().unwrap().recs.get_mut(&id) {
+                r.sal = new_sal;
+            }
         }
         Ok(())
     }
@@ -1306,6 +1521,41 @@ mod tests {
         assert_eq!(meta.lineage, "op:rotate");
         assert_eq!(meta.valid_from, 7);
         assert_eq!(meta.owner, "");
+    }
+
+    /// Scoped recall must not be starved by OTHER scopes. Owner filtering
+    /// used to run after a global top-(3·k) cut, so once a few thousand
+    /// memories from other users sat closer to the query, a user with only
+    /// three memories got zero hits back — every per-user benchmark
+    /// (LoCoMo, LongMemEval, multi-tenant agents) silently lost recall.
+    #[test]
+    fn scoped_recall_is_not_starved_by_other_scopes() {
+        let m = Memory::open(eng());
+        let q = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        for i in 0..3000 {
+            let mut v = q.clone();
+            v[1] = 0.01 * (i % 7) as f32; // all very close to the query
+            m.ltm_store(&format!("crowd memory {i}"), v, "t", 0.9, "x", "crowd").unwrap();
+        }
+        let mut alice = Vec::new();
+        for i in 0..3 {
+            // cos ≈ 0.7 with the query: relevant, but far behind the crowd
+            let v = vec![1.0f32, 1.0, 0.1 * i as f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+            alice.push(m.ltm_store(&format!("alice private note {i}"), v, "t", 0.5, "x", "alice").unwrap());
+        }
+        let hits = m.recall_scoped("alice", "unrelated words", &q, 3);
+        let got: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        for id in &alice {
+            assert!(got.contains(id), "alice's memory {id} starved out; got {got:?}");
+        }
+        // superseded facts must not starve current ones either
+        for i in 0..500 {
+            let id = m.ltm_store(&format!("old fact {i}"), q.clone(), "t", 0.9, "x", "bob").unwrap();
+            m.ltm_invalidate_scoped(id, 1, "bob").unwrap();
+        }
+        let cur = m.ltm_store("current fact", vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "t", 0.5, "x", "bob").unwrap();
+        let hits = m.recall_scoped("bob", "zzz", &q, 1);
+        assert_eq!(hits.first().map(|h| h.id), Some(cur), "current fact starved by superseded ones");
     }
 
     #[test]
